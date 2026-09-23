@@ -69,6 +69,7 @@ public:
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
+          secondary_cache_device_(options.context_cache.secondary_cache_device.value_or(-1)),
           resources_(max_concurrency_, options.context_cache.max_private_continuations.value(),
                      options.context_cache.max_shared_prefixes.value(),
                      options.context_cache.enabled,
@@ -421,8 +422,8 @@ private:
         record_program_timing(timing, measurement.exposed);
     }
 
-    void record_detail(std::uint64_t RuntimeHostWorkStats::*elapsed_member,
-                       std::uint64_t RuntimeHostWorkStats::*invocation_member,
+    void record_detail(std::uint64_t RuntimeHostWorkStats::* elapsed_member,
+                       std::uint64_t RuntimeHostWorkStats::* invocation_member,
                        Clock::time_point started) noexcept {
         RuntimeHostWorkStats& stats = cumulative_stats_.host_work;
         stats.*elapsed_member += elapsed_ns(started, Clock::now());
@@ -431,8 +432,8 @@ private:
 
     class DetailScope {
     public:
-        DetailScope(EngineCore& owner, std::uint64_t RuntimeHostWorkStats::*elapsed_member,
-                    std::uint64_t RuntimeHostWorkStats::*invocation_member,
+        DetailScope(EngineCore& owner, std::uint64_t RuntimeHostWorkStats::* elapsed_member,
+                    std::uint64_t RuntimeHostWorkStats::* invocation_member,
                     nvtx::Name range_name) noexcept
             : owner_(owner), elapsed_member_(elapsed_member), invocation_member_(invocation_member),
               started_(Clock::now()) {
@@ -449,8 +450,8 @@ private:
 
     private:
         EngineCore& owner_;
-        std::uint64_t RuntimeHostWorkStats::*elapsed_member_;
-        std::uint64_t RuntimeHostWorkStats::*invocation_member_;
+        std::uint64_t RuntimeHostWorkStats::* elapsed_member_;
+        std::uint64_t RuntimeHostWorkStats::* invocation_member_;
         Clock::time_point started_;
         std::optional<nvtx::ScopedRange> range_;
     };
@@ -524,6 +525,13 @@ private:
         detail_range.emplace(nvtx::Name::StatsPublication, nvtx::Category::Control);
         RuntimeStats snapshot = cumulative_stats_;
         resources_.populate_runtime_stats(*instance_.program, snapshot);
+        snapshot.secondary_cache_device = secondary_cache_device_;
+        if (secondary_cache_device_ >= 0) {
+            snapshot.secondary_state_occupied_slots =
+                std::exchange(snapshot.host_state_occupied_slots, 0);
+            snapshot.secondary_kv_occupied_bytes =
+                std::exchange(snapshot.host_kv_occupied_bytes, 0);
+        }
         {
             std::lock_guard lock(queue_mutex_);
             snapshot.waiting_requests = static_cast<std::uint32_t>(pending_.size());
@@ -1097,9 +1105,9 @@ private:
                     throw std::logic_error("pending row has an invalid licensed extent");
                 }
                 const std::uint32_t count = static_cast<std::uint32_t>(raw_count);
-                const auto row_tokens     = pending.tokens().subspan(row * pending.row_stride(),
-                                                                     static_cast<std::size_t>(count));
-                generated_sizes[row]      = request->generated.size();
+                const auto row_tokens = pending.tokens().subspan(row * pending.row_stride(),
+                                                                 static_cast<std::size_t>(count));
+                generated_sizes[row]  = request->generated.size();
                 if (cancelled[row]) {
                     (void)request->output.preview_terminal(FinishReason::Cancelled);
                     decisions[row] = CommitDecision{
@@ -2043,6 +2051,7 @@ private:
     const std::uint32_t max_concurrency_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
+    const int secondary_cache_device_;
     ResourceManagement resources_;
 
     mutable std::mutex execution_mutex_;

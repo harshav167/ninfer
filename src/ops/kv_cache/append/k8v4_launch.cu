@@ -12,27 +12,29 @@ namespace {
 
 constexpr int kBlock = 256;
 
-template <typename Geometry, typename CacheView, typename Metadata>
+template <typename Geometry, bool Tiered, typename CacheView, typename Metadata>
 void launch_k8v4_for(const Tensor& k, const Tensor& v, const Tensor& positions, CacheView cache,
                      Metadata metadata, cudaStream_t stream) {
     const auto tokens = static_cast<std::int32_t>(k.ne[2]);
-    auto* cache_k     = static_cast<std::uint8_t*>(cache.k_pages.data);
-    auto* cache_v     = static_cast<std::uint8_t*>(cache.v_pages.data);
-    auto* scale_k     = static_cast<__half*>(cache.k_scale_pages.data);
-    auto* scale_v     = static_cast<std::uint8_t*>(cache.v_scale_pages.data);
+    auto cache_k      = kv_plane_pointer<std::uint8_t, Tiered>(cache.k_pages, cache.staged.k);
+    auto cache_v      = kv_plane_pointer<std::uint8_t, Tiered>(cache.v_pages, cache.staged.v);
+    auto scale_k      = kv_plane_pointer<__half, Tiered>(cache.k_scale_pages, cache.staged.k_scale);
+    auto scale_v =
+        kv_plane_pointer<std::uint8_t, Tiered>(cache.v_scale_pages, cache.staged.v_scale);
     if (tokens >= 128 && Geometry::KVHeads == 2) {
         constexpr int TokensPerTile = 8;
         const int max_tiles         = div_up(tokens + TokensPerTile - 1, TokensPerTile);
         const dim3 grid(static_cast<unsigned>(max_tiles), static_cast<unsigned>(Geometry::KVHeads));
-        kv_cache_append_full_k8v4_page_kernel<Geometry, Metadata><<<grid, kBlock, 0, stream>>>(
-            static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
-            static_cast<const std::int32_t*>(positions.data), metadata, cache_k, cache_v, scale_k,
-            scale_v, tokens);
+        kv_cache_append_full_k8v4_page_kernel<Geometry, Metadata, Tiered>
+            <<<grid, kBlock, 0, stream>>>(static_cast<const __nv_bfloat16*>(k.data),
+                                          static_cast<const __nv_bfloat16*>(v.data),
+                                          static_cast<const std::int32_t*>(positions.data),
+                                          metadata, cache_k, cache_v, scale_k, scale_v, tokens);
     } else {
         constexpr int FillWarps       = kBlock / 32;
         const std::int64_t fill_units = static_cast<std::int64_t>(tokens) * Geometry::KVHeads;
         const int grid = static_cast<int>(div_up(fill_units, static_cast<std::int64_t>(FillWarps)));
-        kv_cache_append_full_k8v4_kernel<Geometry, Metadata><<<grid, kBlock, 0, stream>>>(
+        kv_cache_append_full_k8v4_kernel<Geometry, Metadata, Tiered><<<grid, kBlock, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(k.data), static_cast<const __nv_bfloat16*>(v.data),
             static_cast<const std::int32_t*>(positions.data), metadata, cache_k, cache_v, scale_k,
             scale_v, tokens);
@@ -43,11 +45,18 @@ void launch_k8v4_for(const Tensor& k, const Tensor& v, const Tensor& positions, 
 template <typename CacheView, typename Metadata>
 void dispatch_k8v4(const Tensor& k, const Tensor& v, const Tensor& positions, CacheView cache,
                    Metadata metadata, cudaStream_t stream) {
+    const auto launch = [&]<typename Geometry>() {
+        if (cache.staged.enabled()) {
+            launch_k8v4_for<Geometry, true>(k, v, positions, cache, metadata, stream);
+        } else {
+            launch_k8v4_for<Geometry, false>(k, v, positions, cache, metadata, stream);
+        }
+    };
     if (k.ne[1] == KVCacheAppendD256Kv4::KVHeads) {
-        launch_k8v4_for<KVCacheAppendD256Kv4>(k, v, positions, cache, metadata, stream);
-        return;
+        launch.template operator()<KVCacheAppendD256Kv4>();
+    } else {
+        launch.template operator()<KVCacheAppendD256Kv2>();
     }
-    launch_k8v4_for<KVCacheAppendD256Kv2>(k, v, positions, cache, metadata, stream);
 }
 
 } // namespace

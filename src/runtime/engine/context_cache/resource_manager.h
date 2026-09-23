@@ -1104,6 +1104,8 @@ public:
         out.device_main_kv_occupied_pages    = usage.device_main_kv_pages;
         out.device_backend_kv_occupied_pages = usage.device_backend_kv_pages;
         out.host_kv_occupied_bytes           = usage.host_kv_bytes;
+        out.active_kv_read_bytes             = usage.active_kv_read_bytes;
+        out.active_kv_write_bytes            = usage.active_kv_write_bytes;
         std::uint64_t shared_references      = 0;
         for (std::uint32_t lane = 0; lane < lane_count_; ++lane) {
             if (active_[lane].occupied) {
@@ -1407,7 +1409,7 @@ private:
         const auto append       = [&](const PrefixDemandRecord& demand) {
             if (!demand_matches(demand, key) ||
                 std::find(domains.begin(), domains.begin() + static_cast<std::ptrdiff_t>(count),
-                                demand.domain) != domains.begin() + static_cast<std::ptrdiff_t>(count)) {
+                          demand.domain) != domains.begin() + static_cast<std::ptrdiff_t>(count)) {
                 return;
             }
             domains[count++] = demand.domain;
@@ -1580,18 +1582,18 @@ private:
         for (PrefixIndexEntry& entry : prefix_index_) { entry = {}; }
         std::size_t cursor = 0;
         const auto append  = [&](bool shared, std::uint32_t slot, std::uint64_t owner_id,
-                                std::uint64_t revision, const auto& checkpoint) {
+                                 std::uint64_t revision, const auto& checkpoint) {
             if (cursor >= prefix_index_.size()) {
                 throw std::logic_error("prefix index exceeded fixed capacity");
             }
             prefix_index_[cursor++] = PrefixIndexEntry{
-                 .occupied   = true,
-                 .shared     = shared,
-                 .key        = checkpoint.shortlist_key,
-                 .slot       = slot,
-                 .owner_id   = owner_id,
-                 .revision   = revision,
-                 .checkpoint = checkpoint.ref,
+                .occupied   = true,
+                .shared     = shared,
+                .key        = checkpoint.shortlist_key,
+                .slot       = slot,
+                .owner_id   = owner_id,
+                .revision   = revision,
+                .checkpoint = checkpoint.ref,
             };
         };
         for (std::uint32_t slot = 0; slot < catalog_count_; ++slot) {
@@ -2221,7 +2223,7 @@ private:
             }
         }
         const CatalogEntry& publication = catalog_[choice.publication_slot_];
-        const bool source_cell          = choice.private_source_ &&
+        const bool source_cell = choice.private_source_ &&
                                  choice.publication_slot_ == choice.private_source_->slot &&
                                  choice.source_mode_ == PrivateSourceMode::ConsumeToActive;
         const auto victim =
@@ -3278,7 +3280,7 @@ private:
     void observe_transfer(const ContextTransferObservation& observation) noexcept {
         const double seconds = static_cast<double>(observation.elapsed_ns) * 1.0e-9;
         context_stats_.actual_context_transfer_seconds += seconds;
-        const std::uint64_t bytes = observation.units;
+        const std::uint64_t bytes = observation.work.payload_bytes;
         switch (observation.resource) {
         case ContextResourceClass::State:
             switch (observation.direction) {

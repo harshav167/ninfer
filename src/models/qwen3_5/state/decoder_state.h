@@ -1,10 +1,13 @@
 #pragma once
 
 #include "core/layout.h"
+#include "core/active_kv_stager.h"
 #include "core/paged_kv_cache.h"
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <vector>
 #include <optional>
 
 namespace ninfer::models::qwen3_5 {
@@ -23,6 +26,9 @@ struct DecoderStateSpec {
     std::int32_t kv_table_rows              = 1;
     std::uint32_t text_physical_page_groups = 0;
     std::uint32_t mtp_physical_page_groups  = 0;
+    std::uint32_t text_resident_page_groups = 0;
+    std::optional<int> text_overflow_device;
+    std::uint32_t active_step_capacity = 0;
 };
 
 struct PagedKVCacheLayout {
@@ -32,6 +38,8 @@ struct PagedKVCacheLayout {
     std::uint32_t max_context = 0;
     std::int32_t kv_heads     = 0;
     PagedKVStorageLayout layer_storage;
+    ActiveKVStagingLayout active_staging;
+    std::uint32_t active_step_capacity = 0;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept { return pages.payload_bytes(); }
 };
@@ -81,17 +89,44 @@ public:
     [[nodiscard]] PagedKVCacheView execution_view(const KVExecutionRowLease& row) const;
 
     [[nodiscard]] PagedKVBatchLayerView batch_layer_view(std::uint32_t layer) const;
+    [[nodiscard]] PagedKVBatchLayerView prepare_layer(std::uint32_t layer, const Tensor& positions,
+                                                      const Tensor& valid_columns,
+                                                      const Tensor& table_rows,
+                                                      cudaStream_t stream) const;
+    void complete_layer(std::uint32_t layer, cudaStream_t stream) const;
+
+    [[nodiscard]] std::uint64_t active_read_bytes() const noexcept {
+        return active_stager_ ? active_stager_->read_bytes() : 0;
+    }
+
+    [[nodiscard]] std::uint64_t active_write_bytes() const noexcept {
+        return active_stager_ ? active_stager_->write_bytes() : 0;
+    }
+
+    [[nodiscard]] std::size_t active_staging_bytes() const noexcept {
+        return active_staging_bytes_;
+    }
 
 private:
     friend class PagedKVCacheView;
     [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer, Tensor block_table) const;
 
-    DeviceKVPagePool pages_;
-    KVExecutionTablePool execution_tables_;
+    // Residency may change without changing any logical KV contents or owner.
+    mutable DeviceKVPagePool pages_;
+    mutable KVExecutionTablePool execution_tables_;
     std::uint32_t layers_      = 0;
     std::uint32_t max_context_ = 0;
     std::int32_t kv_heads_     = 0;
     PagedKVStorageLayout layer_storage_;
+    std::size_t active_staging_bytes_   = 0;
+    std::uint32_t active_step_capacity_ = 0;
+    mutable std::optional<PinnedHostBuffer> active_metadata_;
+    mutable std::vector<std::uint8_t> active_marks_;
+    mutable std::vector<std::uint32_t> active_reads_;
+    mutable std::vector<std::uint32_t> active_writes_;
+    mutable std::uint32_t active_next_layer_ = 0;
+    mutable bool active_pipeline_            = false;
+    std::unique_ptr<ActiveKVStager> active_stager_;
 };
 
 struct DecoderStateLayout {

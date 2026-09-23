@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/offload_buffer.h"
 #include "core/paged_kv_cache.h"
 #include "core/transfer_work.h"
 
@@ -71,6 +72,8 @@ public:
 
     [[nodiscard]] std::byte* data() const noexcept { return data_; }
 
+    [[nodiscard]] const OffloadBuffer* backing() const noexcept { return backing_; }
+
     [[nodiscard]] std::uint32_t page_count() const noexcept { return page_count_; }
 
     [[nodiscard]] const HostKVPageLayout& layout() const;
@@ -81,13 +84,16 @@ private:
     friend class HostKVAllocationConstView;
 
     HostKVAllocationView(HostKVAllocationHandle handle, std::byte* data,
-                         const HostKVPageLayout* layout, std::uint32_t page_count) noexcept
-        : handle_(handle), data_(data), layout_(layout), page_count_(page_count) {}
+                         const HostKVPageLayout* layout, std::uint32_t page_count,
+                         const OffloadBuffer* backing = nullptr) noexcept
+        : handle_(handle), data_(data), layout_(layout), page_count_(page_count),
+          backing_(backing) {}
 
     HostKVAllocationHandle handle_;
     std::byte* data_                = nullptr;
     const HostKVPageLayout* layout_ = nullptr;
     std::uint32_t page_count_       = 0;
+    const OffloadBuffer* backing_   = nullptr;
 };
 
 class HostKVAllocationConstView {
@@ -96,11 +102,13 @@ public:
 
     HostKVAllocationConstView(HostKVAllocationView view) noexcept
         : handle_(view.handle_), data_(view.data_), layout_(view.layout_),
-          page_count_(view.page_count_) {}
+          page_count_(view.page_count_), backing_(view.backing_) {}
 
     [[nodiscard]] bool valid() const noexcept;
 
     [[nodiscard]] const std::byte* data() const noexcept { return data_; }
+
+    [[nodiscard]] const OffloadBuffer* backing() const noexcept { return backing_; }
 
     [[nodiscard]] std::uint32_t page_count() const noexcept { return page_count_; }
 
@@ -111,13 +119,16 @@ private:
     friend class HostKVArena;
 
     HostKVAllocationConstView(HostKVAllocationHandle handle, const std::byte* data,
-                              const HostKVPageLayout* layout, std::uint32_t page_count) noexcept
-        : handle_(handle), data_(data), layout_(layout), page_count_(page_count) {}
+                              const HostKVPageLayout* layout, std::uint32_t page_count,
+                              const OffloadBuffer* backing = nullptr) noexcept
+        : handle_(handle), data_(data), layout_(layout), page_count_(page_count),
+          backing_(backing) {}
 
     HostKVAllocationHandle handle_;
     const std::byte* data_          = nullptr;
     const HostKVPageLayout* layout_ = nullptr;
     std::uint32_t page_count_       = 0;
+    const OffloadBuffer* backing_   = nullptr;
 };
 
 class HostKVAllocation {
@@ -194,7 +205,8 @@ private:
 
 class HostKVArena {
 public:
-    HostKVArena(std::size_t capacity_bytes, std::span<const HostKVPageLayout> supported_layouts);
+    HostKVArena(std::size_t capacity_bytes, std::span<const HostKVPageLayout> supported_layouts,
+                std::optional<int> secondary_device = std::nullopt);
 
     HostKVArena(const HostKVArena&)            = delete;
     HostKVArena& operator=(const HostKVArena&) = delete;
@@ -207,6 +219,10 @@ public:
 
     [[nodiscard]] std::size_t free_bytes() const noexcept {
         return capacity_bytes_ - occupied_bytes_;
+    }
+
+    [[nodiscard]] std::size_t staging_bytes() const noexcept {
+        return backing_ ? backing_->staging_bytes() : 0;
     }
 
     [[nodiscard]] const HostKVPageLayout* layout_for(const KVPageGeometry& geometry) const noexcept;
@@ -265,7 +281,7 @@ private:
     [[nodiscard]] std::byte* allocation_data(const Descriptor& descriptor) const noexcept;
     void bump_revision() noexcept;
 
-    std::optional<PinnedHostBuffer> backing_;
+    std::optional<OffloadBuffer> backing_;
     std::size_t capacity_bytes_ = 0;
     std::size_t occupied_bytes_ = 0;
     std::vector<HostKVPageLayout> layouts_;

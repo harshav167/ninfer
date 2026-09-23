@@ -16,6 +16,14 @@ ninfer_add_test(ninfer_tensor_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../t
 ninfer_add_test(ninfer_arena_test        SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_arena.cpp"
   LIBRARIES ninfer_core)
 
+ninfer_add_test(ninfer_offload_buffer_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_offload_buffer.cpp"
+  LIBRARIES ninfer_core)
+set_tests_properties(ninfer_offload_buffer_test PROPERTIES SKIP_RETURN_CODE 77)
+
+ninfer_add_test(ninfer_active_kv_stager_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_active_kv_stager.cpp"
+  LIBRARIES ninfer_core)
+set_tests_properties(ninfer_active_kv_stager_test PROPERTIES SKIP_RETURN_CODE 77)
+
 ninfer_add_test(ninfer_materialization_budget_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_materialization_budget.cpp"
   LIBRARIES ninfer_core)
 

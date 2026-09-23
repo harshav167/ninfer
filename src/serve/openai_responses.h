@@ -4,6 +4,7 @@
 // HTTP transport live in separate translation units; only wire-independent GenerationRequest is
 // passed to GenerationService.
 
+#include "serve/openai_common.h"
 #include "serve/openai_responses_store.h"
 #include "serve/request.h"
 #include "serve/request_json.h"
@@ -35,6 +36,7 @@ struct OpenAIResponsesPromptRequest {
     std::vector<nlohmann::json> input_items;
     std::optional<std::string> instructions;
     std::optional<std::string> previous_response_id;
+    OpenAIPromptCachePolicy cache_policy;
 };
 
 struct OpenAIResponsesCreateRequest {

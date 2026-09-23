@@ -32,6 +32,7 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
 }
 
 std::uint32_t validate_full_cache(const PagedKVLayerView& cache, std::int32_t kv_heads) {
+    validate_staged_kv_planes(cache.staged, cache.storage, kv_heads);
     PagedKVStorageLayout layout{};
     try {
         layout = paged_kv_storage_layout(cache.storage, kFullHeadDim);

@@ -179,6 +179,10 @@ resolve_openai_responses_prompt(const OpenAIResponsesPromptRequest& request,
     resolved.generation.messages.insert(resolved.generation.messages.end(),
                                         std::make_move_iterator(context.begin()),
                                         std::make_move_iterator(context.end()));
+    // Bound markers only after inherited and current turns are composed. Stored
+    // context remains immutable; a delta's marker budget is not a chain budget.
+    apply_openai_prompt_cache_policy(resolved.generation, resolved.generation.messages,
+                                     request.cache_policy);
 
     if (response_id) {
         if (parent_record) {

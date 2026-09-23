@@ -54,6 +54,35 @@ void increment_generation(std::uint32_t& generation) noexcept {
 
 } // namespace
 
+void validate_staged_kv_planes(const PagedKVStagedPlanes& staged, KvCacheStorage storage,
+                               std::int32_t kv_heads) {
+    if (!staged.enabled()) {
+        if (staged.v.data || staged.k_scale.data || staged.v_scale.data) {
+            throw std::invalid_argument("staged KV planes must be complete");
+        }
+        return;
+    }
+    if (storage != KvCacheStorage::Fp8KeyNvfp4Value && storage != KvCacheStorage::Fp8E4M3Row256) {
+        throw std::invalid_argument("staged active KV requires FP8 or K8V4");
+    }
+    const auto pages = staged.k.ne[3];
+    const auto check = [&](const Tensor& t, DType dtype, std::int32_t width) {
+        if (!t.data || t.dtype != dtype || !t.is_contiguous() || pages <= 0 || t.ne[0] != width ||
+            t.ne[1] != kPagedKVPageSize || t.ne[2] != kv_heads || t.ne[3] != pages) {
+            throw std::invalid_argument("staged quantized KV plane geometry is inconsistent");
+        }
+    };
+    check(staged.k, DType::FP8_E4M3FN, 256);
+    check(staged.k_scale, DType::FP16, 1);
+    if (storage == KvCacheStorage::Fp8E4M3Row256) {
+        check(staged.v, DType::FP8_E4M3FN, 256);
+        check(staged.v_scale, DType::FP16, 1);
+    } else {
+        check(staged.v, DType::U8, 128);
+        check(staged.v_scale, DType::U8, 16);
+    }
+}
+
 PagedKVBatchLayerView single_row_paged_kv_batch_view(const PagedKVLayerView& cache) {
     return {
         .k_pages       = cache.k_pages,
@@ -64,14 +93,26 @@ PagedKVBatchLayerView single_row_paged_kv_batch_view(const PagedKVLayerView& cac
         .head_dim      = cache.head_dim,
         .num_kv_heads  = cache.num_kv_heads,
         .storage       = cache.storage,
+        .staged        = cache.staged,
     };
 }
 
 DeviceKVPagePoolLayout plan_device_kv_page_pool(LayoutBuilder& builder,
                                                 const DeviceKVPagePoolSpec& spec) {
-    const std::int32_t physical_pages =
-        checked_i32(spec.page_group_count, "Paged KV physical page count");
+    (void)checked_i32(spec.page_group_count, "Paged KV physical page count");
+    const auto resident =
+        spec.resident_page_group_count ? spec.resident_page_group_count : spec.page_group_count;
+    if (resident > spec.page_group_count ||
+        (resident < spec.page_group_count &&
+         (!spec.overflow_device ||
+          spec.geometry.device_plane_order != PagedKVPlaneOrder::PageMajor))) {
+        throw std::invalid_argument(
+            "overflow KV requires a secondary device and PageMajor storage");
+    }
+    const std::int32_t physical_pages = checked_i32(resident, "resident KV page count");
+    const auto overflow_pages         = static_cast<std::int32_t>(spec.page_group_count - resident);
     validate_geometry(spec.geometry);
+    LayoutBuilder overflow_layout;
 
     DeviceKVPagePoolLayout layout;
     layout.spec = spec;
@@ -93,6 +134,25 @@ DeviceKVPagePoolLayout plan_device_kv_page_pool(LayoutBuilder& builder,
                 plane.alignment, label);
         }
         layout.planes.push_back(planned);
+        if (overflow_pages != 0) {
+            DeviceKVPlaneLayout remote;
+            remote.geometry = plane;
+            remote.storage  = overflow_layout.add_tensor(
+                plane.dtype,
+                {plane.leading_extent, kPagedKVPageSize, plane.head_extent, overflow_pages},
+                plane.alignment, label);
+            layout.overflow_planes.push_back(remote);
+        }
+    }
+    if (overflow_pages != 0) {
+        layout.overflow_bytes    = overflow_layout.finish(256);
+        std::size_t largest_page = 0;
+        for (const auto& plane : layout.planes) {
+            largest_page = std::max(largest_page, plane.storage.region.bytes / physical_pages);
+        }
+        layout.residency_scratch = builder.add_tensor(
+            DType::U8, {checked_i32(largest_page * 64, "KV residency exchange scratch")}, 256,
+            "KV residency exchange scratch");
     }
     return layout;
 }
@@ -113,6 +173,7 @@ KVExecutionTableLayout plan_kv_execution_tables(LayoutBuilder& builder,
 std::size_t DeviceKVPagePoolLayout::payload_bytes() const noexcept {
     std::size_t total = 0;
     for (const DeviceKVPlaneLayout& plane : planes) { total += plane.storage.region.bytes; }
+    total += residency_scratch.region.bytes;
     return total;
 }
 
@@ -206,7 +267,7 @@ DeviceKVPagePool::DeviceKVPagePool(DeviceSpan backing, const DeviceKVPagePoolLay
     }
 
     const std::int32_t physical_pages =
-        checked_i32(spec_.page_group_count, "Paged KV physical page count");
+        checked_i32(resident_capacity_pages(), "resident KV physical page count");
     planes_.reserve(layout.planes.size());
     for (std::size_t index = 0; index < layout.planes.size(); ++index) {
         const DeviceKVPlaneLayout& planned = layout.planes[index];
@@ -227,6 +288,28 @@ DeviceKVPagePool::DeviceKVPagePool(DeviceSpan backing, const DeviceKVPagePoolLay
             throw std::logic_error("Paged KV HeadMajor plane shape is inconsistent");
         }
         planes_.push_back(plane);
+    }
+    if (capacity_pages() > resident_capacity_pages()) {
+        if (!spec_.overflow_device || layout.overflow_planes.size() != planes_.size() ||
+            layout.overflow_bytes == 0 ||
+            geometry().device_plane_order != PagedKVPlaneOrder::PageMajor) {
+            throw std::invalid_argument("overflow KV layout is incomplete");
+        }
+        overflow_.emplace(layout.overflow_bytes, spec_.overflow_device);
+        overflow_planes_.reserve(layout.overflow_planes.size());
+        for (const auto& plane : layout.overflow_planes) {
+            overflow_planes_.push_back(plane.storage.bind({overflow_->data(), overflow_->size()}));
+        }
+        residency_scratch_ = layout.residency_scratch.bind(backing);
+        slot_to_physical_.resize(capacity_pages());
+        physical_to_slot_.resize(capacity_pages());
+        residency_remap_.resize(capacity_pages());
+        active_physical_pages_.resize(capacity_pages());
+        for (std::uint32_t p = 0; p < capacity_pages(); ++p) {
+            slot_to_physical_[p] = physical_to_slot_[p] = static_cast<std::int32_t>(p);
+        }
+    } else if (!layout.overflow_planes.empty() || layout.overflow_bytes != 0) {
+        throw std::invalid_argument("all-local KV layout unexpectedly has overflow storage");
     }
 
     free_page_runs_.reserve(spec_.page_group_count);
@@ -312,11 +395,14 @@ void DeviceKVPagePool::materialize(DeviceKVPageReservation& reservation,
     if (preferred_predecessor) {
         preferred = physical_index(*preferred_predecessor) + 1;
     } else if (!destination.empty()) {
-        preferred = destination.back().index_ + 1;
+        preferred = physical_index(destination.back().handle()) + 1;
     }
 
     std::size_t selected        = free_page_runs_.size();
     std::int32_t selected_begin = 0;
+    const bool prefer_local =
+        overflow_ && !free_page_runs_.empty() &&
+        free_page_runs_.front().begin < static_cast<std::int32_t>(resident_capacity_pages());
     if (preferred && *preferred >= 0) {
         const auto upper = std::upper_bound(
             free_page_runs_.begin(), free_page_runs_.end(), *preferred,
@@ -326,16 +412,20 @@ void DeviceKVPagePool::materialize(DeviceKVPageReservation& reservation,
             const std::uint64_t run_end =
                 static_cast<std::uint64_t>(candidate->begin) + candidate->count;
             const std::uint64_t requested_end = static_cast<std::uint64_t>(*preferred) + count;
-            if (*preferred >= candidate->begin && requested_end <= run_end) {
+            if (*preferred >= candidate->begin && requested_end <= run_end &&
+                (!prefer_local || requested_end <= resident_capacity_pages())) {
                 selected       = static_cast<std::size_t>(candidate - free_page_runs_.begin());
                 selected_begin = *preferred;
             }
         }
     }
     if (selected == free_page_runs_.size()) {
-        const auto contiguous =
-            std::find_if(free_page_runs_.begin(), free_page_runs_.end(),
-                         [count](const FreePageRun& run) { return run.count >= count; });
+        const auto contiguous = std::find_if(
+            free_page_runs_.begin(), free_page_runs_.end(), [&](const FreePageRun& run) {
+                return run.count >= count &&
+                       (!prefer_local ||
+                        static_cast<std::uint64_t>(run.begin) + count <= resident_capacity_pages());
+            });
         if (contiguous != free_page_runs_.end()) {
             selected       = static_cast<std::size_t>(contiguous - free_page_runs_.begin());
             selected_begin = contiguous->begin;
@@ -343,6 +433,7 @@ void DeviceKVPagePool::materialize(DeviceKVPageReservation& reservation,
     }
 
     const auto append_page = [&](std::int32_t page) {
+        if (!physical_to_slot_.empty()) { page = physical_to_slot_[page]; }
         destination.push_back(
             DeviceKVPageLease(*this, page, page_generations_[static_cast<std::size_t>(page)]));
         page_allocated_[static_cast<std::size_t>(page)] = true;
@@ -384,9 +475,10 @@ DeviceKVPageLease DeviceKVPagePool::materialize_one(DeviceKVPageReservation& res
     if (free_page_runs_.empty()) {
         throw std::logic_error("Paged KV reservation invariant was violated");
     }
-    FreePageRun& run        = free_page_runs_.front();
-    const std::int32_t page = run.begin++;
+    FreePageRun& run            = free_page_runs_.front();
+    const std::int32_t physical = run.begin++;
     if (--run.count == 0) { free_page_runs_.erase(free_page_runs_.begin()); }
+    const std::int32_t page = physical_to_slot_.empty() ? physical : physical_to_slot_[physical];
     page_allocated_[static_cast<std::size_t>(page)] = true;
     ++allocated_pages_;
     --reserved_pages_;
@@ -443,7 +535,7 @@ bool DeviceKVPagePool::valid_handle(DeviceKVPageHandle handle) const noexcept {
 
 std::int32_t DeviceKVPagePool::physical_index(DeviceKVPageHandle handle) const {
     if (!valid_handle(handle)) { throw std::invalid_argument("Paged KV page handle is stale"); }
-    return handle.index_;
+    return slot_to_physical_.empty() ? handle.index_ : slot_to_physical_[handle.index_];
 }
 
 void DeviceKVPagePool::validate_distinct_pages(std::span<const DeviceKVPageHandle> pages,
@@ -468,7 +560,7 @@ void DeviceKVPagePool::release_page(std::int32_t index, std::uint32_t generation
     if (!page_allocated_[position] || page_generations_[position] != generation) { return; }
     page_allocated_[position] = false;
     increment_generation(page_generations_[position]);
-    release_free_page(index);
+    release_free_page(slot_to_physical_.empty() ? index : slot_to_physical_[index]);
     --allocated_pages_;
 }
 
@@ -532,9 +624,27 @@ void DeviceKVPagePool::zero_pages(std::span<const DeviceKVPageHandle> pages,
     std::size_t begin = 0;
     while (begin < pages.size()) {
         std::size_t end = begin + 1;
-        while (end < pages.size() && pages[end].index_ == pages[end - 1].index_ + 1) { ++end; }
-        const std::int32_t first = pages[begin].index_;
+        while (
+            end < pages.size() &&
+            physical_index(pages[end]) == physical_index(pages[end - 1]) + 1 &&
+            (physical_index(pages[end]) < static_cast<std::int32_t>(resident_capacity_pages())) ==
+                (physical_index(pages[begin]) <
+                 static_cast<std::int32_t>(resident_capacity_pages()))) {
+            ++end;
+        }
+        const std::int32_t first = physical_index(pages[begin]);
         const std::int32_t count = static_cast<std::int32_t>(end - begin);
+        if (first >= static_cast<std::int32_t>(resident_capacity_pages())) {
+            for (const Tensor& plane : overflow_planes_) {
+                const auto offset =
+                    static_cast<std::size_t>(static_cast<std::byte*>(plane.data) -
+                                             static_cast<std::byte*>(overflow_->data())) +
+                    (first - resident_capacity_pages()) * plane.nb[3];
+                overflow_->zero(offset, static_cast<std::size_t>(count) * plane.nb[3], stream);
+            }
+            begin = end;
+            continue;
+        }
         for (const Tensor& plane : planes_) {
             auto* base = static_cast<unsigned char*>(plane.data);
             if (spec_.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor) {
@@ -556,6 +666,35 @@ void DeviceKVPagePool::copy_page(DeviceKVPageHandle source, DeviceKVPageHandle d
     const std::int32_t source_index      = physical_index(source);
     const std::int32_t destination_index = physical_index(destination);
     if (source_index == destination_index) { return; }
+    const auto resident = static_cast<std::int32_t>(resident_capacity_pages());
+    if (source_index >= resident || destination_index >= resident) {
+        for (std::size_t p = 0; p < planes_.size(); ++p) {
+            const auto bytes = planes_[p].nb[3];
+            const auto remote_base =
+                static_cast<std::size_t>(static_cast<std::byte*>(overflow_planes_[p].data) -
+                                         static_cast<std::byte*>(overflow_->data()));
+            const auto source_offset =
+                remote_base +
+                static_cast<std::size_t>(std::max(0, source_index - resident)) * bytes;
+            const auto destination_offset =
+                remote_base +
+                static_cast<std::size_t>(std::max(0, destination_index - resident)) * bytes;
+            auto* local = static_cast<std::byte*>(planes_[p].data);
+            if (source_index >= resident && destination_index >= resident) {
+                overflow_->copy_from_buffer_2d(*overflow_, source_offset, bytes, destination_offset,
+                                               bytes, bytes, 1, stream);
+            } else if (source_index >= resident) {
+                overflow_->copy_to_device_2d(source_offset, bytes,
+                                             local + destination_index * bytes, bytes, bytes, 1,
+                                             stream);
+            } else {
+                overflow_->copy_from_device_2d(destination_offset, bytes,
+                                               local + source_index * bytes, bytes, bytes, 1,
+                                               stream);
+            }
+        }
+        return;
+    }
     for (const Tensor& plane : planes_) {
         auto* base = static_cast<unsigned char*>(plane.data);
         if (spec_.geometry.device_plane_order == PagedKVPlaneOrder::PageMajor) {
@@ -580,6 +719,47 @@ void DeviceKVPagePool::copy_to_host(std::span<const DeviceKVPageHandle> source,
         throw std::invalid_argument("Paged KV D2H geometry or extent is inconsistent");
     }
     for (DeviceKVPageHandle page : source) { (void)physical_index(page); }
+    if (overflow_) {
+        if (!destination.backing()) { throw std::logic_error("cold KV view has no backing owner"); }
+        copy_offload(
+            source, *destination.backing(),
+            static_cast<std::size_t>(destination.data() -
+                                     static_cast<std::byte*>(destination.backing()->data())),
+            destination.layout(), true, stream);
+        return;
+    }
+    if (destination.backing() && destination.backing()->secondary()) {
+        const auto& layout     = destination.layout();
+        const auto base_offset = static_cast<std::size_t>(
+            destination.data() - static_cast<std::byte*>(destination.backing()->data()));
+        std::size_t begin = 0;
+        while (begin < source.size()) {
+            std::size_t end = begin + 1;
+            while (end < source.size() && source[end].index_ == source[end - 1].index_ + 1) {
+                ++end;
+            }
+            for (std::size_t p = 0; p < planes_.size(); ++p) {
+                const Tensor& plane      = planes_[p];
+                const auto& packed       = layout.planes[p];
+                const auto* data         = static_cast<const std::byte*>(plane.data);
+                const std::size_t offset = base_offset + begin * layout.page_stride + packed.offset;
+                if (geometry().device_plane_order == PagedKVPlaneOrder::PageMajor) {
+                    destination.backing()->copy_from_device_2d(
+                        offset, layout.page_stride, data + source[begin].index_ * plane.nb[3],
+                        plane.nb[3], packed.page_payload_bytes, end - begin, stream);
+                } else {
+                    for (std::int32_t h = 0; h < plane.ne[3]; ++h) {
+                        destination.backing()->copy_from_device_2d(
+                            offset + h * packed.head_payload_bytes, layout.page_stride,
+                            data + h * plane.nb[3] + source[begin].index_ * plane.nb[2],
+                            plane.nb[2], packed.head_payload_bytes, end - begin, stream);
+                    }
+                }
+            }
+            begin = end;
+        }
+        return;
+    }
 
     const HostKVPageLayout& host = destination.layout();
     std::size_t begin            = 0;
@@ -622,6 +802,47 @@ void DeviceKVPagePool::copy_from_host(HostKVAllocationConstView source,
         throw std::invalid_argument("Paged KV H2D geometry or extent is inconsistent");
     }
     validate_distinct_pages(destination, "Paged KV H2D destination contains duplicate pages");
+    if (overflow_) {
+        if (!source.backing()) { throw std::logic_error("cold KV view has no backing owner"); }
+        copy_offload(destination, *source.backing(),
+                     static_cast<std::size_t>(
+                         source.data() - static_cast<const std::byte*>(source.backing()->data())),
+                     source.layout(), false, stream);
+        return;
+    }
+    if (source.backing() && source.backing()->secondary()) {
+        const auto& layout     = source.layout();
+        const auto base_offset = static_cast<std::size_t>(
+            source.data() - static_cast<const std::byte*>(source.backing()->data()));
+        std::size_t begin = 0;
+        while (begin < destination.size()) {
+            std::size_t end = begin + 1;
+            while (end < destination.size() &&
+                   destination[end].index_ == destination[end - 1].index_ + 1) {
+                ++end;
+            }
+            for (std::size_t p = 0; p < planes_.size(); ++p) {
+                const Tensor& plane      = planes_[p];
+                const auto& packed       = layout.planes[p];
+                auto* data               = static_cast<std::byte*>(plane.data);
+                const std::size_t offset = base_offset + begin * layout.page_stride + packed.offset;
+                if (geometry().device_plane_order == PagedKVPlaneOrder::PageMajor) {
+                    source.backing()->copy_to_device_2d(
+                        offset, layout.page_stride, data + destination[begin].index_ * plane.nb[3],
+                        plane.nb[3], packed.page_payload_bytes, end - begin, stream);
+                } else {
+                    for (std::int32_t h = 0; h < plane.ne[3]; ++h) {
+                        source.backing()->copy_to_device_2d(
+                            offset + h * packed.head_payload_bytes, layout.page_stride,
+                            data + h * plane.nb[3] + destination[begin].index_ * plane.nb[2],
+                            plane.nb[2], packed.head_payload_bytes, end - begin, stream);
+                    }
+                }
+            }
+            begin = end;
+        }
+        return;
+    }
 
     const HostKVPageLayout& host = source.layout();
     std::size_t begin            = 0;
@@ -652,6 +873,54 @@ void DeviceKVPagePool::copy_from_host(HostKVAllocationConstView source,
                         host_base + static_cast<std::size_t>(head) * host_plane.head_payload_bytes,
                         host.page_stride, host_plane.head_payload_bytes, count,
                         cudaMemcpyHostToDevice, stream));
+                }
+            }
+        }
+        begin = end;
+    }
+}
+
+void DeviceKVPagePool::copy_offload(std::span<const DeviceKVPageHandle> pages,
+                                    const OffloadBuffer& buffer, std::size_t buffer_offset,
+                                    const HostKVPageLayout& layout, bool to_buffer,
+                                    cudaStream_t stream) const {
+    const auto resident = static_cast<std::int32_t>(resident_capacity_pages());
+    std::size_t begin   = 0;
+    while (begin < pages.size()) {
+        const auto first  = physical_index(pages[begin]);
+        const bool remote = first >= resident;
+        std::size_t end   = begin + 1;
+        while (end < pages.size() &&
+               physical_index(pages[end]) == physical_index(pages[end - 1]) + 1 &&
+               (physical_index(pages[end]) >= resident) == remote) {
+            ++end;
+        }
+        for (std::size_t p = 0; p < planes_.size(); ++p) {
+            const auto cold  = buffer_offset + begin * layout.page_stride + layout.planes[p].offset;
+            const auto bytes = layout.planes[p].page_payload_bytes;
+            const auto count = end - begin;
+            if (remote) {
+                const auto& plane = overflow_planes_[p];
+                const auto offset =
+                    static_cast<std::size_t>(static_cast<std::byte*>(plane.data) -
+                                             static_cast<std::byte*>(overflow_->data())) +
+                    static_cast<std::size_t>(first - resident) * plane.nb[3];
+                if (to_buffer) {
+                    buffer.copy_from_buffer_2d(*overflow_, offset, plane.nb[3], cold,
+                                               layout.page_stride, bytes, count, stream);
+                } else {
+                    overflow_->copy_from_buffer_2d(buffer, cold, layout.page_stride, offset,
+                                                   plane.nb[3], bytes, count, stream);
+                }
+            } else {
+                const auto& plane = planes_[p];
+                auto* data        = static_cast<std::byte*>(plane.data) + first * plane.nb[3];
+                if (to_buffer) {
+                    buffer.copy_from_device_2d(cold, layout.page_stride, data, plane.nb[3], bytes,
+                                               count, stream);
+                } else {
+                    buffer.copy_to_device_2d(cold, layout.page_stride, data, plane.nb[3], bytes,
+                                             count, stream);
                 }
             }
         }
@@ -731,7 +1000,8 @@ KVExecutionTablePool::KVExecutionTablePool(DeviceSpan backing, const KVExecution
     : spec_(layout.spec), pages_(&pages), block_tables_(layout.block_tables.bind(backing)),
       host_shadow_(checked_table_bytes(layout.spec)),
       row_in_use_(static_cast<std::size_t>(layout.spec.table_rows), false),
-      row_generations_(static_cast<std::size_t>(layout.spec.table_rows), 1) {
+      row_generations_(static_cast<std::size_t>(layout.spec.table_rows), 1),
+      row_extents_(static_cast<std::size_t>(layout.spec.table_rows), 0) {
     if (block_tables_.dtype != DType::I32 ||
         block_tables_.ne[0] !=
             checked_i32(spec_.logical_page_capacity, "Paged KV logical page capacity") ||
@@ -752,7 +1022,8 @@ KVExecutionRowLease KVExecutionTablePool::acquire(std::int32_t row_index) {
     }
     const std::size_t index = static_cast<std::size_t>(row_index);
     if (row_in_use_[index]) { throw std::logic_error("Paged KV execution row is already bound"); }
-    row_in_use_[index] = true;
+    row_in_use_[index]  = true;
+    row_extents_[index] = 0;
     return KVExecutionRowLease(*this, row_index, row_generations_[index]);
 }
 
@@ -815,7 +1086,7 @@ void KVExecutionTablePool::publish_repeated(KVExecutionRowHandle row_handle,
         throw std::invalid_argument("Repeated Paged KV mapping is outside its execution row");
     }
     const std::int32_t physical = pages_->physical_index(page);
-    auto* shadow                = static_cast<std::int32_t*>(host_shadow_.data()) +
+    auto* shadow = static_cast<std::int32_t*>(host_shadow_.data()) +
                    static_cast<std::size_t>(row_handle.row_) * logical_page_capacity();
     std::fill_n(shadow, count, physical);
     publish_indices(row_handle, 0, std::span<const std::int32_t>(shadow, count), stream);
@@ -825,11 +1096,144 @@ void KVExecutionTablePool::publish_indices(KVExecutionRowHandle row_handle,
                                            std::uint32_t logical_begin,
                                            std::span<const std::int32_t> indices,
                                            cudaStream_t stream) {
+    row_extents_[row_handle.row_] =
+        logical_begin == 0 ? static_cast<std::uint32_t>(indices.size())
+                           : std::max(row_extents_[row_handle.row_],
+                                      logical_begin + static_cast<std::uint32_t>(indices.size()));
     if (indices.empty()) { return; }
     Tensor destination_row = row(row_handle);
     auto* destination      = static_cast<std::int32_t*>(destination_row.data) + logical_begin;
     CUDA_CHECK(cudaMemcpyAsync(destination, indices.data(), indices.size_bytes(),
                                cudaMemcpyHostToDevice, stream));
+}
+
+void DeviceKVPagePool::exchange_residency(std::int32_t local, std::int32_t remote,
+                                          std::uint32_t count, bool occupied_local,
+                                          cudaStream_t stream) {
+    const auto resident = static_cast<std::int32_t>(resident_capacity_pages());
+    for (std::size_t p = 0; p < planes_.size(); ++p) {
+        const auto stride = static_cast<std::size_t>(planes_[p].nb[3]);
+        const auto bytes  = stride * count;
+        auto* destination = static_cast<std::byte*>(planes_[p].data) + local * stride;
+        const auto remote_offset =
+            static_cast<std::size_t>(static_cast<std::byte*>(overflow_planes_[p].data) -
+                                     static_cast<std::byte*>(overflow_->data())) +
+            static_cast<std::size_t>(remote - resident) * stride;
+        if (occupied_local) {
+            CUDA_CHECK(cudaMemcpyAsync(residency_scratch_.data, destination, bytes,
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
+        overflow_->copy_to_device_2d(remote_offset, bytes, destination, bytes, bytes, 1, stream);
+        if (occupied_local) {
+            overflow_->copy_from_device_2d(remote_offset, bytes, residency_scratch_.data, bytes,
+                                           bytes, 1, stream);
+        }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    for (std::uint32_t offset = 0; offset < count; ++offset) {
+        const auto a                 = local + static_cast<std::int32_t>(offset);
+        const auto b                 = remote + static_cast<std::int32_t>(offset);
+        const auto cold_slot         = physical_to_slot_[a];
+        const auto hot_slot          = physical_to_slot_[b];
+        physical_to_slot_[a]         = hot_slot;
+        physical_to_slot_[b]         = cold_slot;
+        slot_to_physical_[hot_slot]  = a;
+        slot_to_physical_[cold_slot] = b;
+        residency_remap_[a]          = b;
+        residency_remap_[b]          = a;
+        active_physical_pages_[a]    = true;
+        active_physical_pages_[b]    = false;
+        if (!occupied_local) {
+            const auto next = std::upper_bound(
+                free_page_runs_.begin(), free_page_runs_.end(), a,
+                [](std::int32_t page, const FreePageRun& run) { return page < run.begin; });
+            if (next == free_page_runs_.begin()) { std::terminate(); }
+            consume_free_run(static_cast<std::size_t>((next - 1) - free_page_runs_.begin()), a, 1);
+            release_free_page(b);
+        }
+    }
+}
+
+void KVExecutionTablePool::truncate(KVExecutionRowHandle handle, std::uint32_t count) {
+    if (!valid_handle(handle) || count > row_extents_[handle.row_]) {
+        throw std::invalid_argument("KV execution truncation exceeds its published extent");
+    }
+    row_extents_[handle.row_] = count;
+}
+
+bool KVExecutionTablePool::prioritize_active_residency(DeviceKVPagePool& pages,
+                                                       cudaStream_t stream) {
+    if (&pages != pages_) { throw std::invalid_argument("KV residency names another pool"); }
+    if (!pages.overflow_) { return false; }
+    auto& hot = pages.active_physical_pages_;
+    std::fill(hot.begin(), hot.end(), false);
+    auto* shadow        = static_cast<std::int32_t*>(host_shadow_.data());
+    const auto resident = static_cast<std::int32_t>(pages.resident_capacity_pages());
+    const auto capacity = static_cast<std::int32_t>(pages.capacity_pages());
+    bool remote_hot     = false;
+    for (std::int32_t row = 0; row < row_count(); ++row) {
+        if (!row_in_use_[row]) { continue; }
+        for (std::uint32_t column = 0; column < row_extents_[row]; ++column) {
+            const auto physical =
+                shadow[static_cast<std::size_t>(row) * logical_page_capacity() + column];
+            if (physical < 0 || physical >= capacity ||
+                !pages.page_allocated_[pages.physical_to_slot_[physical]]) {
+                throw std::logic_error("Active KV table references an unallocated physical page");
+            }
+            hot[physical] = true;
+            remote_hot |= physical >= resident;
+        }
+    }
+    if (!remote_hot) { return false; }
+    for (std::int32_t p = 0; p < capacity; ++p) { pages.residency_remap_[p] = p; }
+    std::int32_t local       = 0;
+    std::int32_t remote      = resident;
+    std::int32_t cold_cursor = 0;
+    bool changed             = false;
+    while (remote < capacity) {
+        while (remote < capacity && !hot[remote]) { ++remote; }
+        if (remote == capacity) { break; }
+        // Free primary space first; otherwise demote a cold replica, never another active row.
+        if (!pages.free_page_runs_.empty() && pages.free_page_runs_.front().begin < resident) {
+            local = pages.free_page_runs_.front().begin;
+        } else {
+            local = cold_cursor;
+            while (local < resident && hot[local]) { ++local; }
+        }
+        if (local == resident) { break; }
+        const bool occupied = pages.page_allocated_[pages.physical_to_slot_[local]];
+        std::uint32_t count = 1;
+        while (count < 64 && local + count < static_cast<std::uint32_t>(resident) &&
+               remote + count < static_cast<std::uint32_t>(capacity) && !hot[local + count] &&
+               hot[remote + count] &&
+               pages.page_allocated_[pages.physical_to_slot_[local + count]] == occupied) {
+            ++count;
+        }
+        pages.exchange_residency(local, remote, count, occupied, stream);
+        changed = true;
+        if (occupied) { cold_cursor = local + static_cast<std::int32_t>(count); }
+        remote += static_cast<std::int32_t>(count);
+    }
+    if (!changed) { return false; }
+    for (std::int32_t r = 0; r < row_count(); ++r) {
+        if (!row_in_use_[r]) { continue; }
+        auto* indices = shadow + static_cast<std::size_t>(r) * logical_page_capacity();
+        for (std::uint32_t p = 0; p < row_extents_[r]; ++p) {
+            indices[p] = pages.residency_remap_[indices[p]];
+        }
+        publish_indices(KVExecutionRowHandle(this, r, row_generations_[r]), 0,
+                        {indices, row_extents_[r]}, stream);
+    }
+    return true;
+}
+
+std::span<const std::int32_t> KVExecutionTablePool::host_row(std::int32_t row_index) const {
+    if (row_index < 0 || row_index >= row_count() || !row_in_use_[row_index]) {
+        throw std::out_of_range("KV host execution row is not active");
+    }
+    return {static_cast<const std::int32_t*>(host_shadow_.data()) +
+                static_cast<std::size_t>(row_index) * logical_page_capacity(),
+            logical_page_capacity()};
 }
 
 Tensor KVExecutionTablePool::row(KVExecutionRowHandle handle) const {

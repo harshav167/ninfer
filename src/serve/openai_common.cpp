@@ -108,14 +108,15 @@ OpenAIPromptCachePolicy parse_openai_prompt_cache_policy(const RequestJson& body
     return policy;
 }
 
-void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCachePolicy policy) {
+void apply_openai_prompt_cache_policy(GenerationRequest& request, std::vector<ChatTurn>& messages,
+                                      OpenAIPromptCachePolicy policy) {
     std::vector<std::optional<CacheBoundary>*> explicit_boundaries;
     for (ToolDefinition& tool : request.tools) {
         if (tool.cache_boundary_after) {
             explicit_boundaries.push_back(&tool.cache_boundary_after);
         }
     }
-    for (ChatTurn& turn : request.messages) {
+    for (ChatTurn& turn : messages) {
         for (ContentPart& part : turn.content) {
             if (part.cache_boundary_after) {
                 explicit_boundaries.push_back(&part.cache_boundary_after);
@@ -127,7 +128,7 @@ void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCa
     }
 
     std::optional<CacheBoundary>* automatic_target = nullptr;
-    for (auto turn = request.messages.rbegin(); turn != request.messages.rend(); ++turn) {
+    for (auto turn = messages.rbegin(); turn != messages.rend(); ++turn) {
         if (!turn->tool_calls.empty()) {
             automatic_target = &turn->cache_boundary_after;
             break;

@@ -6,6 +6,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
+#include "ops/kernel/tiered_kv_pointer.cuh"
 #include "ops/kv_cache/append/geometry.cuh"
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
@@ -19,12 +20,12 @@
 
 namespace ninfer::ops {
 
-template <typename Geometry>
+template <typename Geometry, bool Tiered>
 __device__ __forceinline__ void kv_cache_append_full_k8v4_row(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
-    std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
-    __half* __restrict__ scale_k, std::uint8_t* __restrict__ scale_v, int token, int kv_head,
-    int physical_page, int page_offset, int lane, float* scratch) {
+    KVPlanePointer<std::uint8_t, Tiered> cache_k, KVPlanePointer<std::uint8_t, Tiered> cache_v,
+    KVPlanePointer<__half, Tiered> scale_k, KVPlanePointer<std::uint8_t, Tiered> scale_v, int token,
+    int kv_head, int physical_page, int page_offset, int lane, float* scratch) {
     constexpr unsigned FullMask = 0xffffffffU;
     float values[8];
     float local_absmax = 0.0F;
@@ -67,15 +68,13 @@ __device__ __forceinline__ void kv_cache_append_full_k8v4_row(
     }
 }
 
-template <typename Geometry, typename Metadata>
-__launch_bounds__(256) __global__
-    void kv_cache_append_full_k8v4_kernel(const __nv_bfloat16* __restrict__ k,
-                                          const __nv_bfloat16* __restrict__ v,
-                                          const std::int32_t* __restrict__ positions,
-                                          Metadata metadata, std::uint8_t* __restrict__ cache_k,
-                                          std::uint8_t* __restrict__ cache_v,
-                                          __half* __restrict__ scale_k,
-                                          std::uint8_t* __restrict__ scale_v, std::int32_t width) {
+template <typename Geometry, typename Metadata, bool Tiered>
+__launch_bounds__(256) __global__ void kv_cache_append_full_k8v4_kernel(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const std::int32_t* __restrict__ positions, Metadata metadata,
+    KVPlanePointer<std::uint8_t, Tiered> cache_k, KVPlanePointer<std::uint8_t, Tiered> cache_v,
+    KVPlanePointer<__half, Tiered> scale_k, KVPlanePointer<std::uint8_t, Tiered> scale_v,
+    std::int32_t width) {
     constexpr int Warps         = 8;
     constexpr unsigned FullMask = 0xffffffffU;
     __shared__ float scratch[Warps][kKVCacheNvfp4HeadDim];
@@ -92,17 +91,18 @@ __launch_bounds__(256) __global__
     const std::int32_t* block_table = metadata.block_table();
     int physical_page               = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
     physical_page                   = __shfl_sync(FullMask, physical_page, 0);
-    kv_cache_append_full_k8v4_row<Geometry>(k, v, cache_k, cache_v, scale_k, scale_v, token,
-                                            kv_head, physical_page, position & kPagedKVPageMask,
-                                            lane, scratch[warp]);
+    kv_cache_append_full_k8v4_row<Geometry, Tiered>(
+        k, v, cache_k, cache_v, scale_k, scale_v, token, kv_head, physical_page,
+        position & kPagedKVPageMask, lane, scratch[warp]);
 }
 
-template <typename Geometry, typename Metadata>
+template <typename Geometry, typename Metadata, bool Tiered>
 __launch_bounds__(256) __global__ void kv_cache_append_full_k8v4_page_kernel(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const std::int32_t* __restrict__ positions, Metadata metadata,
-    std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
-    __half* __restrict__ scale_k, std::uint8_t* __restrict__ scale_v, std::int32_t width) {
+    KVPlanePointer<std::uint8_t, Tiered> cache_k, KVPlanePointer<std::uint8_t, Tiered> cache_v,
+    KVPlanePointer<__half, Tiered> scale_k, KVPlanePointer<std::uint8_t, Tiered> scale_v,
+    std::int32_t width) {
     constexpr int Warps         = 8;
     constexpr int TokensPerTile = 8;
     constexpr unsigned FullMask = 0xffffffffU;
@@ -122,9 +122,9 @@ __launch_bounds__(256) __global__ void kv_cache_append_full_k8v4_page_kernel(
     int physical_page  = lane == 0 ? block_table[tile_position >> kPagedKVPageShift] : 0;
     physical_page      = __shfl_sync(FullMask, physical_page, 0);
     const int position = base_position + token;
-    kv_cache_append_full_k8v4_row<Geometry>(k, v, cache_k, cache_v, scale_k, scale_v, token,
-                                            kv_head, physical_page, position & kPagedKVPageMask,
-                                            lane, scratch[warp]);
+    kv_cache_append_full_k8v4_row<Geometry, Tiered>(
+        k, v, cache_k, cache_v, scale_k, scale_v, token, kv_head, physical_page,
+        position & kPagedKVPageMask, lane, scratch[warp]);
 }
 
 } // namespace ninfer::ops

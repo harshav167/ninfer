@@ -59,6 +59,7 @@ void require_contiguous_nonnull(const Tensor& tensor, const char* op, const char
 }
 
 std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_heads, const char* op) {
+    validate_staged_kv_planes(cache.staged, cache.storage, kv_heads);
     PagedKVStorageLayout layout{};
     try {
         layout = paged_kv_storage_layout(cache.storage, kHeadDim);
@@ -116,6 +117,7 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
 
 std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int32_t kv_heads,
                                    const char* op) {
+    validate_staged_kv_planes(cache.staged, cache.storage, kv_heads);
     PagedKVStorageLayout layout{};
     try {
         layout = paged_kv_storage_layout(cache.storage, kHeadDim);
@@ -286,11 +288,10 @@ void for_each_small_t_chunk(const Tensor& q, const Tensor& positions, WorkspaceA
                             KvCacheStorage cache_storage, CausalAttentionExecutionEnvelope envelope,
                             Tensor& out, Launch&& launch) {
     for (std::int32_t begin = 0; begin < q.ne[2];
-         begin +=
-         causal_attention_chunk_tokens(q.ne[1], q.ne[2], 1, cache_storage, envelope)) {
-        const std::int32_t count = std::min(
-            causal_attention_chunk_tokens(q.ne[1], q.ne[2], 1, cache_storage, envelope),
-            q.ne[2] - begin);
+         begin += causal_attention_chunk_tokens(q.ne[1], q.ne[2], 1, cache_storage, envelope)) {
+        const std::int32_t count =
+            std::min(causal_attention_chunk_tokens(q.ne[1], q.ne[2], 1, cache_storage, envelope),
+                     q.ne[2] - begin);
         auto chunk_scope = workspace.scope();
         const std::int32_t splits =
             detail::causal_attention_split_capacity(q.ne[1], count, cache_storage, envelope);
@@ -308,11 +309,11 @@ void launch_chunked_small_t(const Tensor& q, const Tensor& k, const Tensor& v,
                             CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                             Tensor& out, cudaStream_t stream) {
     for (std::int32_t begin = 0; begin < q.ne[2];
-         begin += causal_attention_chunk_tokens(q.ne[1], q.ne[2], q.ne[3], cache.storage,
-                                                        envelope)) {
-        const std::int32_t count  = std::min(causal_attention_chunk_tokens(
-                                                q.ne[1], q.ne[2], q.ne[3], cache.storage, envelope),
-                                             q.ne[2] - begin);
+         begin +=
+         causal_attention_chunk_tokens(q.ne[1], q.ne[2], q.ne[3], cache.storage, envelope)) {
+        const std::int32_t count = std::min(
+            causal_attention_chunk_tokens(q.ne[1], q.ne[2], q.ne[3], cache.storage, envelope),
+            q.ne[2] - begin);
         auto chunk_scope          = workspace.scope();
         const std::int32_t splits = detail::causal_attention_split_capacity(
             q.ne[1], count, cache.storage, envelope, q.ne[3]);
@@ -425,12 +426,12 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         if (route == detail::CausalAttentionRoute::SmallT) { return chunk_capacity(width); }
         std::size_t maximum = 0;
         for (std::int32_t begin = 0; begin < width;
-             begin += causal_attention_chunk_tokens(q_heads, width, batch_size,
-                                                            cache_storage, envelope)) {
+             begin +=
+             causal_attention_chunk_tokens(q_heads, width, batch_size, cache_storage, envelope)) {
             maximum = std::max(
                 maximum,
-                chunk_capacity(std::min(causal_attention_chunk_tokens(
-                                            q_heads, width, batch_size, cache_storage, envelope),
+                chunk_capacity(std::min(causal_attention_chunk_tokens(q_heads, width, batch_size,
+                                                                      cache_storage, envelope),
                                         width - begin)));
         }
         return maximum;

@@ -135,6 +135,20 @@ struct ContextCacheOptions {
     // Host StateImages and Host KV bytes are independently configured pinned-memory capacities.
     std::uint32_t host_state_slots     = kDefaultHostStateSlots;
     std::size_t host_kv_capacity_bytes = kDefaultHostKvCapacityBytes;
+    // Alternative cold tier, mutually exclusive with pinned-host retention. Only
+    // inactive checkpoints may reside here; active operands remain on EngineOptions::device.
+    std::optional<int> secondary_cache_device;
+    std::uint32_t secondary_cache_state_slots     = 0;
+    std::size_t secondary_cache_kv_capacity_bytes = 0;
+
+    [[nodiscard]] std::uint32_t offload_state_slots() const noexcept {
+        return secondary_cache_device ? secondary_cache_state_slots : host_state_slots;
+    }
+
+    [[nodiscard]] std::size_t offload_kv_capacity_bytes() const noexcept {
+        return secondary_cache_device ? secondary_cache_kv_capacity_bytes : host_kv_capacity_bytes;
+    }
+
     // Bounded private/shared logical catalogs and per-continuation long-anchor count.
     std::optional<std::uint32_t> max_private_continuations;
     std::optional<std::uint32_t> max_shared_prefixes;
@@ -146,6 +160,13 @@ struct ContextCostOptions {
     // nonempty runtime preset independently overrides its matching machine transfer and
     // artifact-prefill components; absent entries retain the preceding numerical layer.
     std::filesystem::path preset_path;
+};
+
+struct ActiveKvOverflowOptions {
+    // Shared local active-KV budget, not a per-lane partition. Remaining pages of
+    // the explicit kv_capacity live on this secondary device and are layer-staged.
+    std::optional<int> secondary_device;
+    std::uint32_t resident_tokens = 0;
 };
 
 struct EngineOptions {
@@ -169,6 +190,7 @@ struct EngineOptions {
     bool use_cuda_graph                    = true;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
+    ActiveKvOverflowOptions active_kv;
     StartupObserver startup_observer;
 };
 
@@ -854,6 +876,17 @@ struct MemorySummary {
     std::uint32_t host_state_occupied_slots       = 0;
     std::size_t host_kv_capacity_bytes            = 0;
     std::size_t host_kv_occupied_bytes            = 0;
+    int secondary_cache_device                    = -1;
+    std::uint32_t secondary_state_capacity_slots  = 0;
+    std::uint32_t secondary_state_occupied_slots  = 0;
+    std::size_t secondary_kv_capacity_bytes       = 0;
+    std::size_t secondary_kv_occupied_bytes       = 0;
+    std::size_t secondary_staging_bytes           = 0;
+    int active_kv_secondary_device                = -1;
+    std::uint32_t active_kv_resident_tokens       = 0;
+    std::size_t active_kv_secondary_bytes         = 0;
+    std::size_t active_kv_device_staging_bytes    = 0;
+    std::size_t active_kv_host_staging_bytes      = 0;
 };
 
 // Worker-owned monotonic nanosecond counters. Top-level Host phases are mutually exclusive;
@@ -946,13 +979,20 @@ struct RuntimeStats {
     double backend_kv_h2d_seconds      = 0.0;
     double backend_kv_d2d_seconds      = 0.0;
 
-    std::uint64_t pressure_spill_pages                 = 0;
-    std::uint64_t partial_tail_cow_pages               = 0;
-    std::uint32_t device_state_occupied_slots          = 0;
-    std::uint32_t host_state_occupied_slots            = 0;
-    std::uint32_t device_main_kv_occupied_pages        = 0;
-    std::uint32_t device_backend_kv_occupied_pages     = 0;
-    std::size_t host_kv_occupied_bytes                 = 0;
+    std::uint64_t pressure_spill_pages             = 0;
+    std::uint64_t partial_tail_cow_pages           = 0;
+    std::uint32_t device_state_occupied_slots      = 0;
+    std::uint32_t host_state_occupied_slots        = 0;
+    std::uint32_t device_main_kv_occupied_pages    = 0;
+    std::uint32_t device_backend_kv_occupied_pages = 0;
+    std::size_t host_kv_occupied_bytes             = 0;
+    // The legacy h2d/d2h counters represent cold-tier reads/writes. When this
+    // ordinal is nonnegative, their endpoint is secondary VRAM via host staging.
+    int secondary_cache_device                         = -1;
+    std::uint32_t secondary_state_occupied_slots       = 0;
+    std::size_t secondary_kv_occupied_bytes            = 0;
+    std::uint64_t active_kv_read_bytes                 = 0;
+    std::uint64_t active_kv_write_bytes                = 0;
     std::uint64_t pressure_private_owners_degraded     = 0;
     std::uint64_t pressure_private_owners_evicted      = 0;
     std::uint64_t pressure_shared_owners_degraded      = 0;

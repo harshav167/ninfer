@@ -301,7 +301,7 @@ std::optional<OperationalRecord> render_tool_call_fallback(const RequestLogConte
     return OperationalRecord{
         .severity = OperationalSeverity::Warning,
         .message  = "req#" + std::to_string(context.id) + " tool markup returned as text | " +
-                   pretty_code(ninfer::tool_call_parse_fallback_reason_name(reason)),
+                    pretty_code(ninfer::tool_call_parse_fallback_reason_name(reason)),
     };
 }
 
@@ -451,6 +451,17 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
                   product::format_pretty_count(memory.kv_capacity_max_page_groups),
                   product::format_pretty_bytes(memory.runtime_reservation_bytes),
                   product::format_pretty_bytes(memory.available_after_startup_bytes));
+    if (memory.active_kv_secondary_device >= 0) {
+        logger_->info(
+            "active KV overflow | {} local tokens | CUDA device {} holds {} | {} GPU staging | "
+            "{} pinned DMA staging | layer-streamed {}, eager execution",
+            product::format_pretty_count(memory.active_kv_resident_tokens),
+            memory.active_kv_secondary_device,
+            product::format_pretty_bytes(memory.active_kv_secondary_bytes),
+            product::format_pretty_bytes(memory.active_kv_device_staging_bytes),
+            product::format_pretty_bytes(memory.active_kv_host_staging_bytes),
+            kv_cache_name(memory.kv_cache));
+    }
 
     if (cache.enabled) {
         logger_->info(
@@ -460,6 +471,14 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
             product::format_pretty_bytes(cache.host_kv_capacity_bytes),
             *cache.max_private_continuations, *cache.max_shared_prefixes,
             *cache.max_long_anchors_per_continuation);
+        if (cache.secondary_cache_device) {
+            logger_->info(
+                "secondary cache | CUDA device {} | {} states | {} KV | {} pinned staging | "
+                "inactive checkpoints only, host-staged transfers",
+                *cache.secondary_cache_device, cache.secondary_cache_state_slots,
+                product::format_pretty_bytes(cache.secondary_cache_kv_capacity_bytes),
+                product::format_pretty_bytes(memory.secondary_staging_bytes));
+        }
     } else {
         logger_->info("context cache | root only");
     }

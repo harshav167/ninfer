@@ -11,7 +11,8 @@
 namespace ninfer::ops::detail {
 namespace {
 
-template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput>
+template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typename CacheInput,
+          bool Tiered>
 void launch_fp8_partial(const Tensor& q, CacheInput input, const Tensor& positions, float scale,
                         PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
                         std::int32_t logical_capacity, std::int32_t splits, Tensor& partial_acc,
@@ -25,19 +26,25 @@ void launch_fp8_partial(const Tensor& q, CacheInput input, const Tensor& positio
     using KernelInput                  = CacheInput;
     const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
     const auto launch = [&]() {
-        auto kernel = causal_attention_small_t_fp8_tiled_kernel<
-            Geometry, TokenTile, Warps, MinBlocks, KeyBlock, true, MultiBatch, Masked, KernelInput>;
+        auto kernel =
+            causal_attention_small_t_fp8_tiled_kernel<Geometry, TokenTile, Warps, MinBlocks,
+                                                      KeyBlock, true, MultiBatch, Masked,
+                                                      KernelInput, Tiered>;
         static const cudaError_t attr = cudaFuncSetAttribute(
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(DynamicBytes));
         CUDA_CHECK(attr);
 
         const auto q_ptr         = static_cast<const __nv_bfloat16*>(q.data);
         const auto positions_ptr = static_cast<const std::int32_t*>(positions.data);
-        const auto cache_k_ptr   = static_cast<std::uint8_t*>(cache.k_pages.data);
-        const auto cache_v_ptr   = static_cast<std::uint8_t*>(cache.v_pages.data);
-        const auto k_scale_ptr   = static_cast<__half*>(cache.k_scale_pages.data);
-        const auto v_scale_ptr   = static_cast<__half*>(cache.v_scale_pages.data);
-        const auto tables_ptr    = static_cast<const std::int32_t*>(cache.block_tables.data);
+        const auto cache_k_ptr =
+            kv_plane_pointer<std::uint8_t, Tiered>(cache.k_pages, cache.staged.k);
+        const auto cache_v_ptr =
+            kv_plane_pointer<std::uint8_t, Tiered>(cache.v_pages, cache.staged.v);
+        const auto k_scale_ptr =
+            kv_plane_pointer<__half, Tiered>(cache.k_scale_pages, cache.staged.k_scale);
+        const auto v_scale_ptr =
+            kv_plane_pointer<__half, Tiered>(cache.v_scale_pages, cache.staged.v_scale);
+        const auto tables_ptr = static_cast<const std::int32_t*>(cache.block_tables.data);
         const auto valid_ptr =
             invocation.valid_columns == nullptr
                 ? nullptr
@@ -68,15 +75,15 @@ void launch_fp8_reduce(const Tensor& positions, const CausalSmallTInvocation& in
     constexpr int DChunk = Geometry::QHeads == 24 ? 256 : 64;
     const auto launch    = [&]<bool Offset>() {
         const dim3 grid(Geometry::QHeads, div_up(kCausalHeadDim, DChunk),
-                           invocation.width * invocation.batch_size);
+                        invocation.width * invocation.batch_size);
         causal_attention_small_t_fp8_reduce_output_kernel<Geometry, DChunk, MultiBatch, Masked,
-                                                             Offset><<<grid, Block, 0, stream>>>(
+                                                          Offset><<<grid, Block, 0, stream>>>(
             static_cast<const float*>(partial_acc.data), static_cast<const float*>(partial_m.data),
             static_cast<const float*>(partial_l.data),
             static_cast<const std::int32_t*>(positions.data),
             invocation.valid_columns == nullptr
-                   ? nullptr
-                   : static_cast<const std::int32_t*>(invocation.valid_columns->data),
+                ? nullptr
+                : static_cast<const std::int32_t*>(invocation.valid_columns->data),
             invocation.width, invocation.full_width, invocation.column_begin, invocation.batch_size,
             splits, static_cast<__nv_bfloat16*>(out.data));
     };
@@ -100,9 +107,15 @@ void causal_attention_small_t_fp8_launch_for(const Tensor& q, CacheInput input,
         Geometry::QHeads, invocation.width, cache.storage, envelope, invocation.batch_size);
 
     const auto launch_partial = [&]<int Tokens, bool MultiBatch, bool Masked>() {
-        launch_fp8_partial<Geometry, Tokens, MultiBatch, Masked>(
-            q, input, positions, scale, cache, invocation, logical_capacity, splits, partial_acc,
-            partial_m, partial_l, stream);
+        if (cache.staged.enabled()) {
+            launch_fp8_partial<Geometry, Tokens, MultiBatch, Masked, CacheInput, true>(
+                q, input, positions, scale, cache, invocation, logical_capacity, splits,
+                partial_acc, partial_m, partial_l, stream);
+        } else {
+            launch_fp8_partial<Geometry, Tokens, MultiBatch, Masked, CacheInput, false>(
+                q, input, positions, scale, cache, invocation, logical_capacity, splits,
+                partial_acc, partial_m, partial_l, stream);
+        }
     };
     const auto dispatch_metadata = [&]<int Tokens>() {
         const bool masked = invocation.valid_columns != nullptr;

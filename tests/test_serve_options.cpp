@@ -1,5 +1,6 @@
 #include "serve/serve_options.h"
 #include "serve/translate.h"
+#include "runtime/engine/model_instance.h"
 
 #include <iostream>
 #include <string>
@@ -80,6 +81,52 @@ int main() {
     failures += check(kv_help.find("nvfp4") != std::string::npos &&
                           kv_help.find("k8v4") != std::string::npos,
                       "serve help omits a production KV storage mode");
+    const ServeOptions secondary =
+        parse({"ninfer-serve", "model.ninfer", "--host-state-slots", "0", "--host-kv-mib", "0",
+               "--secondary-cache-device", "1", "--secondary-cache-state-slots", "4",
+               "--secondary-cache-kv-mib", "4096"});
+    failures += check(secondary.context_cache.secondary_cache_device == 1 &&
+                          secondary.context_cache.offload_state_slots() == 4 &&
+                          secondary.context_cache.offload_kv_capacity_bytes() == (4096ULL << 20) &&
+                          secondary.context_cache.host_state_slots == 0 &&
+                          secondary.context_cache.host_kv_capacity_bytes == 0,
+                      "secondary cache options did not preserve separate GPU and host capacities");
+    failures += check(kv_help.find("--secondary-cache-device") != std::string::npos,
+                      "serve help omits secondary cache device");
+
+    const auto active_cli =
+        parse({"ninfer-serve", "model.ninfer", "--max-context", "4096", "--kv-capacity", "8192",
+               "--max-concurrency", "2", "--kv-dtype", "k8v4", "--active-kv-secondary-device", "1",
+               "--active-kv-local-tokens", "4096"});
+    ninfer::EngineOptions active_options;
+    active_options.max_context     = active_cli.max_context;
+    active_options.kv_capacity     = active_cli.kv_capacity;
+    active_options.max_concurrency = active_cli.max_concurrency;
+    active_options.kv_cache        = active_cli.kv_cache;
+    active_options.active_kv       = active_cli.active_kv;
+    const auto resolved_active     = ninfer::runtime::normalize_engine_options(active_options);
+    failures += check(!resolved_active.use_cuda_graph,
+                      "host-driven active transfers must not enter whole-model CUDA capture");
+    const auto reject_active = [&](ninfer::EngineOptions candidate, const char* label) {
+        bool rejected = false;
+        try {
+            (void)ninfer::runtime::normalize_engine_options(candidate);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, label);
+    };
+    auto invalid_active                       = active_options;
+    invalid_active.active_kv.secondary_device = 0;
+    reject_active(invalid_active, "active overflow accepted the inference GPU as remote storage");
+    invalid_active                           = active_options;
+    invalid_active.active_kv.resident_tokens = 8192;
+    reject_active(invalid_active, "active overflow accepted an empty remote budget");
+    invalid_active                           = active_options;
+    invalid_active.active_kv.resident_tokens = 4097;
+    reject_active(invalid_active, "active overflow accepted an unaligned residency boundary");
+    invalid_active          = active_options;
+    invalid_active.kv_cache = ninfer::KvCacheStorage::BFloat16;
+    reject_active(invalid_active,
+                  "active overflow accepted a cache codec without a staged consumer");
 
     const ServeOptions model_alias =
         parse({"ninfer-serve", "model.ninfer", "--model-id", "deployment-alias"});

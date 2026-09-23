@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/offload_buffer.h"
 #include "core/cyclic_kv_cache.h"
 #include "core/layout.h"
 #include "core/linear_attention_state.h"
@@ -58,11 +59,13 @@ struct StateImageDeviceLayout {
 struct HostStateImageView {
     std::byte* data                    = nullptr;
     const StateImageHostLayout* layout = nullptr;
+    const OffloadBuffer* backing       = nullptr;
 };
 
 struct HostStateImageConstView {
     const std::byte* data              = nullptr;
     const StateImageHostLayout* layout = nullptr;
+    const OffloadBuffer* backing       = nullptr;
 };
 
 struct HostStateSlotHandle {
@@ -74,7 +77,8 @@ struct HostStateSlotHandle {
  */
 class HostStatePool {
 public:
-    HostStatePool(StateImageHostLayout layout, std::uint32_t capacity);
+    HostStatePool(StateImageHostLayout layout, std::uint32_t capacity,
+                  std::optional<int> secondary_device = std::nullopt);
 
     HostStatePool(const HostStatePool&)            = delete;
     HostStatePool& operator=(const HostStatePool&) = delete;
@@ -93,6 +97,10 @@ public:
 
     [[nodiscard]] const StateImageHostLayout& layout() const noexcept { return layout_; }
 
+    [[nodiscard]] std::size_t staging_bytes() const noexcept {
+        return backing_ ? backing_->staging_bytes() : 0;
+    }
+
 private:
     struct Slot {
         std::uint32_t generation = 1;
@@ -103,7 +111,7 @@ private:
     [[nodiscard]] std::byte* slot_data(std::uint32_t index) const noexcept;
 
     StateImageHostLayout layout_;
-    std::optional<PinnedHostBuffer> backing_;
+    std::optional<OffloadBuffer> backing_;
     std::vector<Slot> slots_;
     std::vector<std::uint32_t> free_slots_;
     std::uint32_t free_count_ = 0;

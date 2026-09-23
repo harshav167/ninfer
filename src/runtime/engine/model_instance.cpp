@@ -69,6 +69,36 @@ std::size_t current_free_device_bytes() {
 } // namespace
 
 EngineOptions normalize_engine_options(EngineOptions options) {
+    if (options.active_kv.secondary_device) {
+        const auto secondary = *options.active_kv.secondary_device;
+        if (options.purpose != EnginePurpose::Generation || secondary < 0 ||
+            secondary == options.device ||
+            (options.kv_cache != KvCacheStorage::Fp8KeyNvfp4Value &&
+             options.kv_cache != KvCacheStorage::Fp8E4M3Row256) ||
+            (options.speculative.backend != SpeculativeBackend::None &&
+             options.speculative.backend != SpeculativeBackend::DFlash2)) {
+            throw std::invalid_argument(
+                "active KV overflow requires FP8 or K8V4 generation, a distinct "
+                "GPU, and none or DFlash2 speculation");
+        }
+        if (options.kv_capacity.mode != KvCapacityMode::Explicit ||
+            options.active_kv.resident_tokens == 0 || options.active_kv.resident_tokens % 64 != 0 ||
+            options.kv_capacity.explicit_tokens % 64 != 0 ||
+            options.active_kv.resident_tokens >= options.kv_capacity.explicit_tokens) {
+            throw std::invalid_argument(
+                "active KV overflow requires explicit page-aligned local and total token budgets");
+        }
+        if (options.context_cache.secondary_cache_device &&
+            *options.context_cache.secondary_cache_device != secondary) {
+            throw std::invalid_argument(
+                "active and inactive KV overflow must share the secondary GPU");
+        }
+        // Full-model graphs cannot contain host-driven cross-device staging. The
+        // ordinary eager kernels retain their exact arithmetic and cache semantics.
+        options.use_cuda_graph = false;
+    } else if (options.active_kv.resident_tokens != 0) {
+        throw std::invalid_argument("active KV local token budget requires a secondary device");
+    }
     switch (options.purpose) {
     case EnginePurpose::Generation:
         break;
@@ -91,6 +121,24 @@ EngineOptions normalize_engine_options(EngineOptions options) {
 
     ContextCacheOptions& cache      = options.context_cache;
     const std::uint32_t concurrency = options.max_concurrency;
+    if (cache.secondary_cache_device) {
+        if (!cache.enabled || *cache.secondary_cache_device < 0 ||
+            *cache.secondary_cache_device == options.device) {
+            throw std::invalid_argument(
+                "secondary cache requires an enabled cache and a distinct device");
+        }
+        if (cache.host_state_slots != 0 || cache.host_kv_capacity_bytes != 0) {
+            throw std::invalid_argument(
+                "secondary cache and pinned-host retention are mutually exclusive");
+        }
+        if (cache.secondary_cache_state_slots == 0 ||
+            cache.secondary_cache_kv_capacity_bytes == 0) {
+            throw std::invalid_argument("secondary cache requires nonzero state and KV capacities");
+        }
+    } else if (cache.secondary_cache_state_slots != 0 ||
+               cache.secondary_cache_kv_capacity_bytes != 0) {
+        throw std::invalid_argument("secondary cache capacities require secondary_cache_device");
+    }
     if (!cache.enabled) {
         if ((cache.device_state_slots && *cache.device_state_slots != 0) ||
             (cache.max_private_continuations && *cache.max_private_continuations != concurrency) ||
@@ -172,8 +220,8 @@ ConstructedModel construct_model(const EngineOptions& options, DeviceContext& de
     const auto signature = models::qwen3_5::prefill_signature(*instance->model);
     auto context_cost    = resolve_context_machine_cost(
         {.hardware_class =
-                context_cost_hardware_class(device.props.name, device.props.major, device.props.minor),
-            .prefill_signature = signature},
+             context_cost_hardware_class(device.props.name, device.props.major, device.props.minor),
+         .prefill_signature = signature},
         options.context_cost.preset_path);
     auto planner    = models::qwen3_5::make_sequence_planner(instance->parameters, device, options);
     auto resolution = resolve_kv_capacity(options.kv_capacity, planner.capacity_curve(),

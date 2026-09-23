@@ -7,6 +7,7 @@
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_common.cuh"
+#include "ops/kernel/tiered_kv_pointer.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -60,11 +61,12 @@ __device__ __forceinline__ int4 causal_prompt_fp8_dequant_f16x8(const std::uint8
                      static_cast<int>(packed[2]), static_cast<int>(packed[3]));
 }
 
-template <typename Geometry, typename Metadata>
+template <typename Geometry, typename Metadata, bool Tiered>
 __global__ __maxnreg__(120) void causal_attention_prompt_fp8_kernel(
-    const __nv_bfloat16* __restrict__ q, const std::uint8_t* __restrict__ cache_k,
-    const std::uint8_t* __restrict__ cache_v, const __half* __restrict__ cache_k_scale,
-    const __half* __restrict__ cache_v_scale, Metadata metadata,
+    const __nv_bfloat16* __restrict__ q, KVPlanePointer<const std::uint8_t, Tiered> cache_k,
+    KVPlanePointer<const std::uint8_t, Tiered> cache_v,
+    KVPlanePointer<const __half, Tiered> cache_k_scale,
+    KVPlanePointer<const __half, Tiered> cache_v_scale, Metadata metadata,
     const std::int32_t* __restrict__ positions, float scale, __nv_bfloat16* __restrict__ out,
     std::int32_t width) {
     constexpr int D             = kCausalPromptHeadDim;
@@ -308,14 +310,14 @@ __global__ __maxnreg__(120) void causal_attention_prompt_fp8_kernel(
             const float nm1         = fmaxf(previous_m1, bm1);
             const float nm0_scaled  = nm0 * scale_l2;
             const float nm1_scaled  = nm1 * scale_l2;
-            const float alpha0      = previous_m0 == -CUDART_INF_F
-                                          ? 0.0F
-                                          : exp2_approx(__fmaf_rn(previous_m0, scale_l2, -nm0_scaled));
-            const float alpha1      = previous_m1 == -CUDART_INF_F
-                                          ? 0.0F
-                                          : exp2_approx(__fmaf_rn(previous_m1, scale_l2, -nm1_scaled));
-            float bl0               = 0.0F;
-            float bl1               = 0.0F;
+            const float alpha0 = previous_m0 == -CUDART_INF_F
+                                     ? 0.0F
+                                     : exp2_approx(__fmaf_rn(previous_m0, scale_l2, -nm0_scaled));
+            const float alpha1 = previous_m1 == -CUDART_INF_F
+                                     ? 0.0F
+                                     : exp2_approx(__fmaf_rn(previous_m1, scale_l2, -nm1_scaled));
+            float bl0          = 0.0F;
+            float bl1          = 0.0F;
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
                 const int col0  = col_base + nt * 8 + 2 * lid;

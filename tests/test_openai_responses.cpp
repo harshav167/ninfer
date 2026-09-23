@@ -297,6 +297,98 @@ int test_typed_items_and_cache_markers() {
     return failures;
 }
 
+int test_prompt_cache_policy_uses_response_input_turns() {
+    const Json automatic_body = {
+        {"model", "m"},
+        {"input", "hello"},
+        {"tools", Json::array({Json{{"type", "function"}, {"name", "lookup"}}})},
+    };
+    const OpenAIResponsesCreateRequest automatic =
+        parse_openai_responses_create_request(automatic_body, limits());
+
+    int failures = 0;
+    OpenAIResponsesStore store(8, 1ULL << 20);
+    const OpenAIResponsesResolvedPrompt resolved =
+        resolve_openai_responses_prompt(automatic.prompt, store, "resp_cache_policy", true);
+    const ninfer::PromptInput translated =
+        to_prompt_input(resolved.generation, ResolvedPromptSemantics{},
+                        [](const ContentPart&) { return ninfer::OwnedMedia{}; });
+    failures += check(translated.context_cache.markers.size() == 1 &&
+                          translated.context_cache.markers[0].location ==
+                              ninfer::PromptCacheMarkerLocation::MessagePartBoundary &&
+                          ninfer::has_shared_candidate_evidence(
+                              translated.context_cache.markers[0].evidence,
+                              ninfer::SharedCandidateEvidence::DefaultAutomatic),
+                      "Responses input cache policy reaches the Engine marker list");
+
+    Json explicit_body = {
+        {"model", "m"},
+        {"input", Json::array()},
+        {"prompt_cache_options", Json{{"mode", "explicit"}}},
+    };
+    for (int index = 0; index < 5; ++index) {
+        explicit_body["input"].push_back(
+            Json{{"id", "msg_cache_" + std::to_string(index)},
+                 {"type", "message"},
+                 {"role", "user"},
+                 {"content",
+                  Json::array({Json{{"type", "input_text"},
+                                    {"text", "part " + std::to_string(index)},
+                                    {"prompt_cache_breakpoint", Json{{"mode", "explicit"}}}}})}});
+    }
+    const OpenAIResponsesCreateRequest explicit_request =
+        parse_openai_responses_create_request(explicit_body, limits());
+    const auto explicit_resolved =
+        resolve_openai_responses_prompt(explicit_request.prompt, store, "resp_explicit", true);
+    std::size_t retained = 0;
+    for (const ChatTurn& turn : explicit_resolved.generation.messages) {
+        if (turn.content.back().cache_boundary_after) { ++retained; }
+    }
+    failures +=
+        check(!explicit_resolved.generation.messages.front().content.back().cache_boundary_after &&
+                  retained == ninfer::kMaximumExplicitPromptCacheMarkers,
+              "Responses explicit cache policy keeps only the last four input boundaries");
+    return failures;
+}
+
+int test_long_chain_cache_markers() {
+    int failures = 0;
+    for (bool explicit_markers : {false, true}) {
+        OpenAIResponsesStore store(32, 1ULL << 20);
+        std::optional<std::string> previous;
+        for (int turn = 0; turn < 12; ++turn) {
+            Json part{{"type", "input_text"}, {"text", "turn " + std::to_string(turn)}};
+            if (explicit_markers) { part["prompt_cache_breakpoint"] = Json{{"mode", "explicit"}}; }
+            Json body{
+                {"model", "m"},
+                {"input", Json::array({Json{{"role", "user"}, {"content", Json::array({part})}}})}};
+            if (previous) { body["previous_response_id"] = *previous; }
+            if (explicit_markers) { body["prompt_cache_options"] = Json{{"mode", "explicit"}}; }
+            auto request  = parse_openai_responses_create_request(body, limits());
+            const auto id = "resp_chain_" + std::to_string(turn);
+            auto resolved = resolve_openai_responses_prompt(request.prompt, store, id, true);
+            const auto translated =
+                to_prompt_input(resolved.generation, ResolvedPromptSemantics{},
+                                [](const ContentPart&) { return ninfer::OwnedMedia{}; });
+            failures += check(translated.context_cache.markers.size() <=
+                                  ninfer::kMaximumExplicitPromptCacheMarkers,
+                              "chained history exceeded the Engine cache marker limit");
+            failures += check(resolved.generation.messages.back().content.back().text ==
+                                  "turn " + std::to_string(turn),
+                              "cache policy changed the latest user input");
+            auto context =
+                append_openai_response_context(resolved.parent, request.prompt.input_turns);
+            context = append_openai_response_context(
+                context, {text_turn(ninfer::ChatRole::Assistant, "answer")});
+            auto record = stored_parent(context);
+            record.id   = id;
+            store.put(std::move(record));
+            previous = id;
+        }
+    }
+    return failures;
+}
+
 int test_contiguous_assistant_items() {
     const Json body = {
         {"model", "m"},
@@ -519,9 +611,9 @@ int test_tools_and_effective_subset() {
         {"input", "time"},
         {"tools", Json::array({weather, clock})},
         {"tool_choice",
-            Json{{"type", "allowed_tools"},
-                 {"mode", "auto"},
-                 {"tools", Json::array({Json{{"type", "function"}, {"name", "clock"}}})}}}};
+         Json{{"type", "allowed_tools"},
+              {"mode", "auto"},
+              {"tools", Json::array({Json{{"type", "function"}, {"name", "clock"}}})}}}};
     const OpenAIResponsesCreateRequest request =
         parse_openai_responses_create_request(body, limits());
     int failures = 0;
@@ -987,6 +1079,8 @@ int main() {
     failures += test_basic_request_and_resolution();
     failures += test_budgets_and_nonsemantic_hints();
     failures += test_typed_items_and_cache_markers();
+    failures += test_prompt_cache_policy_uses_response_input_turns();
+    failures += test_long_chain_cache_markers();
     failures += test_contiguous_assistant_items();
     failures += test_response_output_history_round_trip();
     failures += test_assistant_item_boundaries_and_errors();

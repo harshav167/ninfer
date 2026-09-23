@@ -652,21 +652,6 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
         sequence.rebuild_work       = request_plan.root_rebuild_work;
         sequence.rebuild_tail_begin = request_plan.root_rebuild_tail_begin;
 
-        if (is_masked_draft_backend(speculative_backend)) {
-            if (!dflash || !io.dflash_decode || (backend_kv_cache() && !sequence.kv->backend)) {
-                throw std::logic_error("DFlash prefill state is incomplete");
-            }
-            *dflash_host_ingress                       = {};
-            dflash_host_ingress->active_lanes[0]       = static_cast<std::int32_t>(sequence.lane);
-            const StateImageSelectors selectors        = state_selectors(sequence);
-            dflash_host_ingress->state_source_slots[0] = selectors.source;
-            dflash_host_ingress->state_destination_slots[0] = selectors.destination;
-            dflash_host_ingress->dflash_kv_table_rows[0] =
-                sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0;
-            CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
-                                       sizeof(qwen3_5::DFlashDecodeIngress), cudaMemcpyHostToDevice,
-                                       device.stream));
-        }
 
         staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
         request.lifecycle = Lifecycle::Prefilling;
@@ -949,6 +934,28 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
     return timing.finish();
 }
 
+void ProgramImpl::bind_scalar_prefill(SequenceState& sequence) {
+    // Scalar prefill/control units interleave with batched decode. Both the
+    // scalar table selectors and draft ingress are shared scratch, not sequence state.
+    bind_sequence_kv(sequence);
+    if (!is_masked_draft_backend(speculative_backend)) { return; }
+    if (!dflash || !io.dflash_decode || !sequence.kv ||
+        (backend_kv_cache() && !sequence.kv->backend)) {
+        throw std::logic_error("DFlash scalar prefill state is incomplete");
+    }
+    *dflash_host_ingress                            = {};
+    dflash_host_ingress->active_lanes[0]            = static_cast<std::int32_t>(sequence.lane);
+    const auto selectors                            = state_selectors(sequence);
+    dflash_host_ingress->state_source_slots[0]      = selectors.source;
+    dflash_host_ingress->state_destination_slots[0] = selectors.destination;
+    dflash_host_ingress->text_kv_table_rows[0] = text_kv_addresses->bound_row(sequence.kv->text);
+    dflash_host_ingress->dflash_kv_table_rows[0] =
+        sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend) : 0;
+    CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
+                               sizeof(qwen3_5::DFlashDecodeIngress), cudaMemcpyHostToDevice,
+                               device.stream));
+}
+
 runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                                                         RequestControl& request,
                                                         runtime::ExecutionTiming* failed_timing) {
@@ -982,6 +989,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 .timing  = timing.finish(),
             };
         }
+        bind_scalar_prefill(sequence);
         StateImageSelectors selectors = state_selectors(sequence);
         Tensor rewrite_capture_hidden;
         Tensor* rewrite_capture_hidden_ptr = nullptr;

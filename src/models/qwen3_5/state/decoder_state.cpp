@@ -1,5 +1,7 @@
 #include "models/qwen3_5/state/decoder_state.h"
 
+#include "core/device.h"
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -14,7 +16,10 @@ std::uint32_t page_count(std::uint32_t capacity) {
 
 PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std::uint32_t capacity,
                               std::int32_t kv_heads, std::int32_t head_dim, KvCacheStorage storage,
-                              std::int32_t table_rows, std::uint32_t physical_page_groups) {
+                              std::int32_t table_rows, std::uint32_t physical_page_groups,
+                              std::uint32_t resident_page_groups = 0,
+                              std::optional<int> overflow_device = std::nullopt,
+                              std::uint32_t active_step_capacity = 0) {
     if (layers == 0 ||
         layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
@@ -43,18 +48,24 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
                                        layer_storage.value.scale_leading_extent, kv_heads, 256});
         }
     }
-    return PagedKVCacheLayout{
+    PagedKVCacheLayout out{
         .pages = plan_device_kv_page_pool(
-            builder, DeviceKVPagePoolSpec{.page_group_count = physical_page_groups,
-                                          .geometry         = std::move(geometry)}),
+            builder, DeviceKVPagePoolSpec{.page_group_count          = physical_page_groups,
+                                          .geometry                  = std::move(geometry),
+                                          .resident_page_group_count = resident_page_groups,
+                                          .overflow_device           = overflow_device}),
         .execution_tables = plan_kv_execution_tables(
             builder,
             KVExecutionTableSpec{.logical_page_capacity = logical_pages, .table_rows = table_rows}),
-        .layers        = layers,
-        .max_context   = capacity,
-        .kv_heads      = kv_heads,
-        .layer_storage = layer_storage,
+        .layers               = layers,
+        .max_context          = capacity,
+        .kv_heads             = kv_heads,
+        .layer_storage        = layer_storage,
+        .active_step_capacity = active_step_capacity,
     };
+    out.active_staging =
+        plan_active_kv_staging(builder, out.pages, layer_storage.planes_per_layer());
+    return out;
 }
 
 } // namespace
@@ -63,7 +74,8 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
     DecoderStateLayout layout;
     layout.text_kv = plan_cache(builder, spec.full_attention_layers, spec.capacity, spec.kv_heads,
                                 spec.attention_head_dim, spec.kv_storage, spec.kv_table_rows,
-                                spec.text_physical_page_groups);
+                                spec.text_physical_page_groups, spec.text_resident_page_groups,
+                                spec.text_overflow_device, spec.active_step_capacity);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_storage, spec.kv_table_rows,
@@ -79,6 +91,20 @@ PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
     if (pages_.plane_count() !=
         static_cast<std::size_t>(layers_) * layer_storage_.planes_per_layer()) {
         throw std::invalid_argument("Paged KV layer plane inventory is inconsistent");
+    }
+    if (pages_.overflow_buffer()) {
+        if (layout.active_step_capacity == 0) {
+            throw std::invalid_argument("active KV metadata capacity is zero");
+        }
+        active_step_capacity_ = layout.active_step_capacity;
+        active_staging_bytes_ = layout.active_staging.bytes;
+        active_metadata_.emplace((static_cast<std::size_t>(active_step_capacity_) + 16U) *
+                                 sizeof(std::int32_t));
+        const auto overflow_pages = pages_.capacity_pages() - pages_.resident_capacity_pages();
+        active_marks_.resize(overflow_pages);
+        active_reads_.reserve(overflow_pages);
+        active_writes_.reserve(overflow_pages);
+        active_stager_ = std::make_unique<ActiveKVStager>(backing, layout.active_staging, pages_);
     }
 }
 
@@ -131,7 +157,105 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
         .head_dim      = direct.head_dim,
         .num_kv_heads  = direct.num_kv_heads,
         .storage       = direct.storage,
+        .staged        = direct.staged,
     };
+}
+
+PagedKVBatchLayerView PagedKVCache::prepare_layer(std::uint32_t layer, const Tensor& positions,
+                                                  const Tensor& valid_columns,
+                                                  const Tensor& table_rows,
+                                                  cudaStream_t stream) const {
+    PagedKVBatchLayerView result = batch_layer_view(layer);
+    if (!active_stager_) { return result; }
+    if (layer != active_next_layer_) { throw std::logic_error("active KV layer order changed"); }
+    if (layer == 0) {
+        const auto width = positions.ne[0];
+        const auto batch = positions.ne[1];
+        if (positions.dtype != DType::I32 || !positions.data || !positions.is_contiguous() ||
+            width <= 0 || batch <= 0 || batch > 8 || positions.ne[2] != 1 || positions.ne[3] != 1 ||
+            positions.numel() > active_step_capacity_ || table_rows.dtype != DType::I32 ||
+            !table_rows.data || !table_rows.is_contiguous() || table_rows.numel() < batch ||
+            (valid_columns.data &&
+             (valid_columns.dtype != DType::I32 || !valid_columns.is_contiguous() ||
+              valid_columns.numel() < batch))) {
+            throw std::invalid_argument("active KV staging metadata is invalid");
+        }
+        auto* host_positions = static_cast<std::int32_t*>(active_metadata_->data());
+        auto* host_rows      = host_positions + active_step_capacity_;
+        auto* host_valid     = host_rows + 8;
+        CUDA_CHECK(cudaMemcpyAsync(host_positions, positions.data, positions.bytes(),
+                                   cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(host_rows, table_rows.data, batch * sizeof(std::int32_t),
+                                   cudaMemcpyDeviceToHost, stream));
+        if (valid_columns.data) {
+            CUDA_CHECK(cudaMemcpyAsync(host_valid, valid_columns.data, batch * sizeof(std::int32_t),
+                                       cudaMemcpyDeviceToHost, stream));
+        } else {
+            std::fill_n(host_valid, batch, width);
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        execution_tables_.prioritize_active_residency(pages_, stream);
+        std::fill(active_marks_.begin(), active_marks_.end(), 0);
+        active_reads_.clear();
+        active_writes_.clear();
+        const auto resident = pages_.resident_capacity_pages();
+        for (std::int32_t b = 0; b < batch; ++b) {
+            if (host_valid[b] < 0 || host_valid[b] > width) {
+                throw std::invalid_argument("active KV valid columns exceed width");
+            }
+            if (host_valid[b] == 0) { continue; }
+            const auto table     = execution_tables_.host_row(host_rows[b]);
+            std::int32_t maximum = -1;
+            const auto mark      = [&](std::uint32_t logical, std::uint8_t bits) {
+                if (logical >= table.size() || table[logical] < 0 ||
+                    static_cast<std::uint32_t>(table[logical]) >= pages_.capacity_pages()) {
+                    throw std::logic_error("active KV execution mapping is invalid");
+                }
+                const auto physical = static_cast<std::uint32_t>(table[logical]);
+                if (physical >= resident) { active_marks_[physical - resident] |= bits; }
+            };
+            for (std::int32_t t = 0; t < host_valid[b]; ++t) {
+                const auto position = host_positions[b * width + t];
+                if (position < 0 || static_cast<std::uint32_t>(position) >= max_context_) {
+                    throw std::invalid_argument("active KV position is outside the context");
+                }
+                maximum = std::max(maximum, position);
+                mark(static_cast<std::uint32_t>(position) / kPagedKVPageSize, 3);
+            }
+            for (std::uint32_t p = 0; p <= static_cast<std::uint32_t>(maximum) / kPagedKVPageSize;
+                 ++p) {
+                mark(p, 1);
+            }
+        }
+        for (std::uint32_t p = 0; p < active_marks_.size(); ++p) {
+            if (active_marks_[p] & 1U) { active_reads_.push_back(resident + p); }
+            if (active_marks_[p] & 2U) { active_writes_.push_back(resident + p); }
+        }
+        active_pipeline_ = !active_reads_.empty();
+        if (active_pipeline_) { active_stager_->begin(active_reads_, active_writes_); }
+    }
+    if (active_pipeline_) {
+        const auto staged = active_stager_->prepare(layer, stream);
+        if (staged.size() != 4) {
+            throw std::logic_error("quantized staged plane inventory is incomplete");
+        }
+        result.staged = {staged[0], staged[1], staged[2], staged[3]};
+    }
+    return result;
+}
+
+void PagedKVCache::complete_layer(std::uint32_t layer, cudaStream_t stream) const {
+    if (!active_stager_) { return; }
+    if (layer != active_next_layer_) {
+        throw std::logic_error("active KV completion order changed");
+    }
+    if (active_pipeline_) { active_stager_->commit(layer, stream); }
+    ++active_next_layer_;
+    if (active_next_layer_ == layers_) {
+        if (active_pipeline_) { active_stager_->finish(); }
+        active_next_layer_ = 0;
+        active_pipeline_   = false;
+    }
 }
 
 std::size_t DecoderStateLayout::kv_payload_bytes() const noexcept {

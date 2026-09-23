@@ -1522,6 +1522,7 @@ public:
             pages_->release_active_reference(page);
             pages_->dematerialize(page, address.reservation);
         }
+        tables_->truncate(address.row->handle(), target);
         if (target != 0) {
             const std::uint32_t columns =
                 frontier - (target - 1U) * static_cast<std::uint32_t>(kPagedKVPageSize);

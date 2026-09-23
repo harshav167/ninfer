@@ -321,6 +321,33 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
     context.synchronize();
     failures += expect(std::memcmp(roundtrip_view.data(), host_view.data(), expected.size()) == 0,
                        label + " Device -> Host -> Device roundtrip changed bytes");
+    int devices = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&devices));
+    if (devices >= 2) {
+        ninfer::HostKVArena remote_arena(host_layout.page_stride * 8,
+                                         std::span<const ninfer::HostKVPageLayout>(layouts), 1);
+        auto padding = remote_arena.allocate(host_layout, 1);
+        auto remote  = remote_arena.allocate(host_layout, 5);
+        failures += expect(padding.has_value() && remote.has_value(),
+                           label + " secondary arena allocation failed");
+        source.copy_to_host(source_handles, remote_arena.writable_view(*remote), context.stream);
+        destination.zero_pages(restored_handles, context.stream);
+        destination.copy_from_host(remote_arena.view(*remote).subview(0, 5), restored_handles,
+                                   context.stream);
+        std::memset(roundtrip_view.data(), 0, expected.size());
+        destination.copy_to_host(restored_handles, roundtrip_view, context.stream);
+        context.synchronize();
+        failures +=
+            expect(std::memcmp(roundtrip_view.data(), expected.data(), expected.size()) == 0,
+                   label + " secondary GPU roundtrip differs from independent byte oracle");
+        auto stale_view = remote_arena.view(*remote);
+        remote->release();
+        failures += expect(!stale_view.valid(), label + " secondary stale view remains valid");
+        int restored_device = -1;
+        CUDA_CHECK(cudaGetDevice(&restored_device));
+        failures +=
+            expect(restored_device == 0, label + " secondary transfer changed current device");
+    }
 
     destination.copy_page(restored[0].handle(), restored[4].handle(), context.stream);
     const ninfer::DeviceKVPageHandle copied[] = {restored[0].handle(), restored[4].handle()};
@@ -417,6 +444,257 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
     return failures;
 }
 
+PlannedCache plan_split_cache(std::uint32_t total, std::uint32_t resident,
+                              std::uint32_t logical_pages, std::int32_t rows,
+                              ninfer::KVPageGeometry geometry) {
+    ninfer::LayoutBuilder builder;
+    PlannedCache out;
+    out.pages  = ninfer::plan_device_kv_page_pool(builder, {.page_group_count = total,
+                                                            .geometry         = std::move(geometry),
+                                                            .resident_page_group_count = resident,
+                                                            .overflow_device           = 1});
+    out.tables = ninfer::plan_kv_execution_tables(
+        builder, {.logical_page_capacity = logical_pages, .table_rows = rows});
+    out.bytes = builder.finish(256);
+    return out;
+}
+
+void fill_handle_pages(ninfer::DeviceKVPagePool& pool,
+                       std::span<const ninfer::DeviceKVPageHandle> pages,
+                       ninfer::HostKVArena& arena, const ninfer::HostKVPageLayout& layout,
+                       cudaStream_t stream, unsigned tag) {
+    std::optional<ninfer::HostKVAllocation> host =
+        arena.allocate(layout, static_cast<std::uint32_t>(pages.size()));
+    if (!host) { throw std::bad_alloc(); }
+    ninfer::HostKVAllocationView view = arena.writable_view(*host);
+    for (std::size_t page = 0; page < pages.size(); ++page) {
+        for (std::size_t plane = 0; plane < layout.planes.size(); ++plane) {
+            auto* row = view.data() + page * layout.page_stride + layout.planes[plane].offset;
+            for (std::size_t i = 0; i < layout.planes[plane].page_payload_bytes; ++i) {
+                row[i] = std::byte(static_cast<unsigned char>(
+                    (i * 31U + (tag + page) * 17U + plane * 13U) & 0xffU));
+            }
+        }
+    }
+    pool.copy_from_host(arena.view(*host), pages, stream);
+    // The arena may reuse this pinned extent as soon as its lease is destroyed.
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+}
+
+int expect_handle_pages(ninfer::DeviceKVPagePool& pool,
+                        std::span<const ninfer::DeviceKVPageHandle> pages,
+                        ninfer::HostKVArena& arena, const ninfer::HostKVPageLayout& layout,
+                        cudaStream_t stream, unsigned tag, const std::string& label) {
+    std::optional<ninfer::HostKVAllocation> host =
+        arena.allocate(layout, static_cast<std::uint32_t>(pages.size()));
+    if (!host) { throw std::bad_alloc(); }
+    ninfer::HostKVAllocationView view = arena.writable_view(*host);
+    std::memset(view.data(), 0, layout.page_stride * pages.size());
+    pool.copy_to_host(pages, view, stream);
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    for (std::size_t page = 0; page < pages.size(); ++page) {
+        for (std::size_t plane = 0; plane < layout.planes.size(); ++plane) {
+            const auto* row = view.data() + page * layout.page_stride + layout.planes[plane].offset;
+            for (std::size_t i = 0; i < layout.planes[plane].page_payload_bytes; ++i) {
+                const auto expected = std::byte(static_cast<unsigned char>(
+                    (i * 31U + (tag + page) * 17U + plane * 13U) & 0xffU));
+                if (row[i] != expected) {
+                    return expect(false,
+                                  label + " payload changed at page " + std::to_string(page));
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+int exercise_active_residency(ninfer::DeviceContext& context, int device_count) {
+    int failures = 0;
+    ninfer::KVPageGeometry geometry{
+        .device_plane_order = ninfer::PagedKVPlaneOrder::PageMajor,
+        .planes             = {{ninfer::DType::I8, 8, 2, 256}, {ninfer::DType::FP16, 1, 2, 256}},
+    };
+
+    PlannedCache local_plan = plan_cache(4, 4, 1, geometry);
+    ninfer::DeviceArena local_arena(local_plan.bytes);
+    ninfer::DeviceKVPagePool local_pool({local_arena.base(), local_arena.capacity()},
+                                        local_plan.pages);
+    ninfer::KVExecutionTablePool local_tables({local_arena.base(), local_arena.capacity()},
+                                              local_plan.tables, local_pool);
+    ninfer::KVExecutionRowLease local_row              = local_tables.acquire(0);
+    std::vector<ninfer::DeviceKVPageLease> local_pages = materialize(local_pool, 2);
+    local_tables.publish(local_row.handle(), 0, local_pages, context.stream);
+    failures += expect(!local_tables.prioritize_active_residency(local_pool, context.stream),
+                       "all-local residency rebalance reported a move");
+    if (device_count < 2) { return failures; }
+
+    constexpr std::uint32_t kResident = 4;
+    constexpr std::uint32_t kTotal    = 8;
+    PlannedCache plan                 = plan_split_cache(kTotal, kResident, 8, 3, geometry);
+
+    ninfer::DeviceArena arena(plan.bytes);
+    ninfer::DeviceKVPagePool pool({arena.base(), arena.capacity()}, plan.pages);
+    ninfer::KVExecutionTablePool tables({arena.base(), arena.capacity()}, plan.tables, pool);
+    const ninfer::HostKVPageLayout host_layout = ninfer::plan_host_kv_page_layout(geometry);
+    const ninfer::HostKVPageLayout layouts[]   = {host_layout};
+    ninfer::HostKVArena host_arena(host_layout.page_stride * 32,
+                                   std::span<const ninfer::HostKVPageLayout>(layouts));
+
+    std::vector<ninfer::DeviceKVPageLease> occupy = materialize(pool, 4);
+    occupy[0].release();
+    occupy[1].release();
+    std::vector<ninfer::DeviceKVPageLease> preferred = materialize(pool, 3);
+    ninfer::KVExecutionRowLease alloc_row            = tables.acquire(0);
+    tables.publish(alloc_row.handle(), 0, preferred, context.stream);
+    context.synchronize();
+    const auto preferred_mapping = read_mapping(tables.row(alloc_row.handle()), preferred.size());
+    failures += expect(std::count_if(preferred_mapping.begin(), preferred_mapping.end(),
+                                     [](auto page) { return page < kResident; }) == 2,
+                       "free resident pages lost to a remote contiguous run");
+    alloc_row.release();
+    preferred.clear();
+    occupy.clear();
+
+    std::vector<ninfer::DeviceKVPageLease> cold = materialize(pool, 4);
+    std::vector<ninfer::DeviceKVPageLease> hot  = materialize(pool, 2);
+    const auto cold_handles                     = handles(cold);
+    const auto hot_handles                      = handles(hot);
+    fill_handle_pages(pool, cold_handles, host_arena, host_layout, context.stream, 10);
+    fill_handle_pages(pool, hot_handles, host_arena, host_layout, context.stream, 80);
+    ninfer::KVExecutionRowLease row0 = tables.acquire(0);
+    tables.publish(row0.handle(), 0, hot_handles, context.stream);
+    context.synchronize();
+    const std::vector<std::int32_t> before = read_mapping(tables.row(row0.handle()), 2);
+    failures += expect(before[0] >= static_cast<std::int32_t>(kResident) &&
+                           before[1] >= static_cast<std::int32_t>(kResident),
+                       "cold primary did not push the live row into remote pages");
+    failures += expect(tables.prioritize_active_residency(pool, context.stream),
+                       "cold primary + hot remote did not rebalance");
+    context.synchronize();
+    const std::vector<std::int32_t> after_swap = read_mapping(tables.row(row0.handle()), 2);
+    failures += expect(after_swap[0] < static_cast<std::int32_t>(kResident) &&
+                           after_swap[1] < static_cast<std::int32_t>(kResident),
+                       "hot remote pages were not promoted onto the resident prefix");
+    failures += expect_handle_pages(pool, hot_handles, host_arena, host_layout, context.stream, 80,
+                                    "hot handle");
+    failures += expect_handle_pages(pool, cold_handles, host_arena, host_layout, context.stream, 10,
+                                    "stable cold handle");
+    const std::vector<std::int32_t> host_ids(tables.host_row(0).begin(),
+                                             tables.host_row(0).begin() + 2);
+    failures += expect(host_ids == after_swap, "host table lagged the GPU remapping");
+    failures += expect(!tables.prioritize_active_residency(pool, context.stream),
+                       "second residency call moved pages");
+    context.synchronize();
+    failures += expect(read_mapping(tables.row(row0.handle()), 2) == after_swap,
+                       "second residency call changed physical IDs");
+
+    const ninfer::DeviceKVPageHandle stale = cold[0].handle();
+    cold[0].release();
+    bool stale_rejected = false;
+    try {
+        pool.zero_pages(std::span<const ninfer::DeviceKVPageHandle>(&stale, 1), context.stream);
+    } catch (const std::invalid_argument&) { stale_rejected = true; }
+    failures += expect(stale_rejected, "remapped released handle remained usable");
+    std::vector<ninfer::DeviceKVPageLease> recycled = materialize(pool, 1);
+    failures += expect_size(pool.allocated_pages(), 6, "reallocation after remap lost a page");
+    recycled.clear();
+    cold.clear();
+    hot.clear();
+    row0.release();
+
+    std::vector<ninfer::DeviceKVPageLease> packed = materialize(pool, 6);
+    const std::vector<ninfer::DeviceKVPageHandle> retained_handles{packed[0].handle(),
+                                                                   packed[1].handle()};
+    const std::vector<ninfer::DeviceKVPageHandle> remote_handles{packed[4].handle(),
+                                                                 packed[5].handle()};
+    fill_handle_pages(pool, retained_handles, host_arena, host_layout, context.stream, 3);
+    fill_handle_pages(pool, remote_handles, host_arena, host_layout, context.stream, 90);
+    packed[2].release();
+    packed[3].release();
+    ninfer::KVExecutionRowLease promote_row = tables.acquire(0);
+    tables.publish(promote_row.handle(), 0, remote_handles, context.stream);
+    failures += expect(tables.prioritize_active_residency(pool, context.stream),
+                       "free resident promotion did not run");
+    context.synchronize();
+    const std::vector<std::int32_t> promoted =
+        read_mapping(tables.row(promote_row.handle()), remote_handles.size());
+    failures += expect(promoted[0] < static_cast<std::int32_t>(kResident) &&
+                           promoted[1] < static_cast<std::int32_t>(kResident),
+                       "free resident was not used to promote hot remote pages");
+    failures += expect_handle_pages(pool, retained_handles, host_arena, host_layout, context.stream,
+                                    3, "untouched cold during free promotion");
+    failures += expect_handle_pages(pool, remote_handles, host_arena, host_layout, context.stream,
+                                    90, "promoted hot after free resident swap");
+    promote_row.release();
+    packed.clear();
+
+
+    std::vector<ninfer::DeviceKVPageLease> shared_cold = materialize(pool, 4);
+    std::vector<ninfer::DeviceKVPageLease> shared_hot  = materialize(pool, 1);
+    fill_handle_pages(pool, handles(shared_hot), host_arena, host_layout, context.stream, 42);
+    ninfer::KVExecutionRowLease shared0 = tables.acquire(0);
+    ninfer::KVExecutionRowLease shared1 = tables.acquire(1);
+    tables.publish_repeated(shared0.handle(), shared_hot[0].handle(), 2, context.stream);
+    tables.publish_repeated(shared1.handle(), shared_hot[0].handle(), 2, context.stream);
+    failures += expect(tables.prioritize_active_residency(pool, context.stream),
+                       "shared hot remote was not promoted");
+    context.synchronize();
+    const std::vector<std::int32_t> shared_a = read_mapping(tables.row(shared0.handle()), 2);
+    const std::vector<std::int32_t> shared_b = read_mapping(tables.row(shared1.handle()), 2);
+    failures += expect(shared_a == shared_b && shared_a[0] == shared_a[1] &&
+                           shared_a[0] < static_cast<std::int32_t>(kResident),
+                       "shared handle did not keep one resident physical ID");
+    failures += expect_handle_pages(pool, handles(shared_hot), host_arena, host_layout,
+                                    context.stream, 42, "shared hot payload");
+    shared0.release();
+    shared1.release();
+    shared_cold.clear();
+    shared_hot.clear();
+
+    std::vector<ninfer::DeviceKVPageLease> multi_cold  = materialize(pool, 4);
+    std::vector<ninfer::DeviceKVPageLease> row_a_pages = materialize(pool, 1);
+    std::vector<ninfer::DeviceKVPageLease> row_b_pages = materialize(pool, 1);
+    fill_handle_pages(pool, handles(row_a_pages), host_arena, host_layout, context.stream, 21);
+    fill_handle_pages(pool, handles(row_b_pages), host_arena, host_layout, context.stream, 22);
+    ninfer::KVExecutionRowLease live_a = tables.acquire(0);
+    ninfer::KVExecutionRowLease live_b = tables.acquire(1);
+    tables.publish(live_a.handle(), 0, row_a_pages, context.stream);
+    tables.publish(live_b.handle(), 0, row_b_pages, context.stream);
+    failures += expect(tables.prioritize_active_residency(pool, context.stream),
+                       "union of live rows was not rebalanced");
+    context.synchronize();
+    failures += expect(
+        read_mapping(tables.row(live_a.handle()), 1)[0] < static_cast<std::int32_t>(kResident) &&
+            read_mapping(tables.row(live_b.handle()), 1)[0] < static_cast<std::int32_t>(kResident),
+        "multiple live rows left a hot page remote");
+    live_a.release();
+    live_b.release();
+    multi_cold.clear();
+    row_a_pages.clear();
+    row_b_pages.clear();
+
+    std::vector<ninfer::DeviceKVPageLease> over = materialize(pool, 6);
+    ninfer::KVExecutionRowLease over_row        = tables.acquire(0);
+    tables.publish(over_row.handle(), 0, over, context.stream);
+    context.synchronize();
+    const std::vector<std::int32_t> over_before = read_mapping(tables.row(over_row.handle()), 6);
+    std::vector<std::int32_t> original_resident;
+    for (std::int32_t id : over_before) {
+        if (id < static_cast<std::int32_t>(kResident)) { original_resident.push_back(id); }
+    }
+    const bool moved = tables.prioritize_active_residency(pool, context.stream);
+    context.synchronize();
+    const std::vector<std::int32_t> over_after = read_mapping(tables.row(over_row.handle()), 6);
+    failures += expect(!moved, "over-capacity working set ping-ponged hot resident pages");
+    for (std::int32_t id : original_resident) {
+        failures += expect(std::find(over_after.begin(), over_after.end(), id) != over_after.end(),
+                           "over-capacity rebalance evicted a hot resident page");
+    }
+    failures += expect(!tables.prioritize_active_residency(pool, context.stream),
+                       "over-capacity second call moved pages");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -434,6 +712,7 @@ int main() {
     try {
         ninfer::DeviceContext context(0);
         int failures = exercise_reservation_and_mapping(context);
+        failures += exercise_active_residency(context, device_count);
         failures += exercise_layout_and_transfer(
             context,
             ninfer::KVPageGeometry{

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/arena.h"
+#include "core/offload_buffer.h"
 #include "core/layout.h"
 #include "core/paged_kv_storage.h"
 #include "core/tensor.h"
@@ -17,6 +18,20 @@ namespace ninfer {
 
 inline constexpr std::int32_t kPagedKVPageSize = 64;
 
+// GPU-local staging for the secondary-resident suffix of an execution page pool.
+// Empty on the ordinary all-local route. These are never peer-device pointers.
+struct PagedKVStagedPlanes {
+    Tensor k;
+    Tensor v;
+    Tensor k_scale;
+    Tensor v_scale;
+
+    [[nodiscard]] bool enabled() const noexcept { return k.data != nullptr; }
+};
+
+void validate_staged_kv_planes(const PagedKVStagedPlanes& staged, KvCacheStorage storage,
+                               std::int32_t kv_heads);
+
 /** Non-owning, single-sequence view consumed by growing-cache Ops. */
 struct PagedKVLayerView {
     Tensor k_pages;
@@ -27,6 +42,7 @@ struct PagedKVLayerView {
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
+    PagedKVStagedPlanes staged;
 };
 
 /** Non-owning multi-sequence view consumed by batched growing-cache Ops. */
@@ -39,6 +55,7 @@ struct PagedKVBatchLayerView {
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
+    PagedKVStagedPlanes staged;
 };
 
 /** Rebinds one checked single-sequence table row as a one-row batched view. */
@@ -70,6 +87,10 @@ struct KVPageGeometry {
 struct DeviceKVPagePoolSpec {
     std::uint32_t page_group_count = 0;
     KVPageGeometry geometry;
+    // Execution-page IDs span the local prefix and optional secondary suffix.
+    // Zero resident_page_group_count means the ordinary all-local pool.
+    std::uint32_t resident_page_group_count = 0;
+    std::optional<int> overflow_device;
 };
 
 struct KVExecutionTableSpec {
@@ -85,6 +106,9 @@ struct DeviceKVPlaneLayout {
 struct DeviceKVPagePoolLayout {
     DeviceKVPagePoolSpec spec;
     std::vector<DeviceKVPlaneLayout> planes;
+    std::vector<DeviceKVPlaneLayout> overflow_planes;
+    TensorRegion residency_scratch;
+    std::size_t overflow_bytes = 0;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept;
 };
@@ -105,6 +129,7 @@ struct KVExecutionTableLayout {
 class DeviceKVPagePool;
 class KVExecutionTablePool;
 class HostKVAllocationView;
+struct HostKVPageLayout;
 class HostKVAllocationConstView;
 
 /** Copyable, non-owning physical-page capability minted by one DeviceKVPagePool. */
@@ -203,6 +228,19 @@ public:
     [[nodiscard]] std::uint32_t available_pages() const noexcept;
     [[nodiscard]] std::size_t plane_count() const noexcept;
     [[nodiscard]] const Tensor& plane(std::size_t index) const;
+
+    [[nodiscard]] std::uint32_t resident_capacity_pages() const noexcept {
+        return spec_.resident_page_group_count ? spec_.resident_page_group_count : capacity_pages();
+    }
+
+    [[nodiscard]] const Tensor& overflow_plane(std::size_t index) const {
+        return overflow_planes_.at(index);
+    }
+
+    [[nodiscard]] const OffloadBuffer* overflow_buffer() const noexcept {
+        return overflow_ ? &*overflow_ : nullptr;
+    }
+
     [[nodiscard]] std::uint32_t
     contiguous_run_count(std::span<const DeviceKVPageHandle> pages) const;
 
@@ -250,6 +288,11 @@ private:
     void release_free_page(std::int32_t index) noexcept;
     void release_page(std::int32_t index, std::uint32_t generation) noexcept;
     void release_reservation(std::uint32_t pages) noexcept;
+    void copy_offload(std::span<const DeviceKVPageHandle> pages, const OffloadBuffer& buffer,
+                      std::size_t buffer_offset, const HostKVPageLayout& layout, bool to_buffer,
+                      cudaStream_t stream) const;
+    void exchange_residency(std::int32_t local, std::int32_t remote, std::uint32_t count,
+                            bool occupied_local, cudaStream_t stream);
 
     struct FreePageRun {
         std::int32_t begin  = 0;
@@ -258,6 +301,14 @@ private:
 
     DeviceKVPagePoolSpec spec_;
     std::vector<Tensor> planes_;
+    std::optional<OffloadBuffer> overflow_;
+    std::vector<Tensor> overflow_planes_;
+    Tensor residency_scratch_;
+    // Handle slots stay stable when their physical payloads change tiers.
+    std::vector<std::int32_t> slot_to_physical_;
+    std::vector<std::int32_t> physical_to_slot_;
+    std::vector<std::int32_t> residency_remap_;
+    std::vector<bool> active_physical_pages_;
     std::vector<FreePageRun> free_page_runs_;
     std::vector<std::uint32_t> page_generations_;
     std::vector<bool> page_allocated_;
@@ -353,6 +404,12 @@ public:
 
     [[nodiscard]] const Tensor& matrix() const noexcept { return block_tables_; }
 
+    [[nodiscard]] std::span<const std::int32_t> host_row(std::int32_t row) const;
+
+    // Called at a quiescent execution boundary; all live rows are protected.
+    bool prioritize_active_residency(DeviceKVPagePool& pages, cudaStream_t stream);
+    void truncate(KVExecutionRowHandle row, std::uint32_t count);
+
 private:
     friend class KVExecutionRowLease;
 
@@ -367,6 +424,7 @@ private:
     PinnedHostBuffer host_shadow_;
     std::vector<bool> row_in_use_;
     std::vector<std::uint32_t> row_generations_;
+    std::vector<std::uint32_t> row_extents_;
 };
 
 } // namespace ninfer

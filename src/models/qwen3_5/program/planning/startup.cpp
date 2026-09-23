@@ -124,18 +124,29 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     LayoutBuilder builder;
     PersistentLayout out;
     out.decoder = qwen3_5::plan_decoder_state(
-        builder, qwen3_5::DecoderStateSpec{
-                     .full_attention_layers     = config.full_attention_layers,
-                     .mtp_layers                = 1,
-                     .capacity                  = plan.capacity,
-                     .kv_heads                  = dimension(config.attention->num_key_value_heads),
-                     .attention_head_dim        = dimension(config.attention->head_dim),
-                     .kv_storage                = plan.kv_storage,
-                     .enable_mtp                = plan.features.mtp(),
-                     .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
-                     .text_physical_page_groups = physical_pages,
-                     .mtp_physical_page_groups  = mtp_physical_pages,
-                 });
+        builder,
+        qwen3_5::DecoderStateSpec{
+            .full_attention_layers     = config.full_attention_layers,
+            .mtp_layers                = 1,
+            .capacity                  = plan.capacity,
+            .kv_heads                  = dimension(config.attention->num_key_value_heads),
+            .attention_head_dim        = dimension(config.attention->head_dim),
+            .kv_storage                = plan.kv_storage,
+            .enable_mtp                = plan.features.mtp(),
+            .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
+            .text_physical_page_groups = physical_pages,
+            .mtp_physical_page_groups  = mtp_physical_pages,
+            .text_resident_page_groups =
+                plan.active_kv.secondary_device
+                    ? plan.active_kv.resident_tokens / static_cast<std::uint32_t>(kPagedKVPageSize)
+                    : 0,
+            .text_overflow_device = plan.active_kv.secondary_device,
+            .active_step_capacity = static_cast<std::uint32_t>(checked_i32(
+                static_cast<std::uint64_t>(std::max(
+                    effective_prefill_chunk, static_cast<std::int32_t>(plan.draft_window + 1))) *
+                    plan.max_concurrency,
+                "active KV step metadata capacity exceeds int32")),
+        });
     qwen3_5::StateImageSpec state_image_spec{
         .linear =
             {
@@ -227,8 +238,8 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             dflash.pending_features  = add_tensor(
                 builder, DType::BF16,
                 {dimension(config.hidden_size * std::uint64_t(draft->target_layer_ids.size())),
-                  static_cast<std::int32_t>(plan.draft_window + 1U),
-                  static_cast<std::int32_t>(plan.max_concurrency)},
+                 static_cast<std::int32_t>(plan.draft_window + 1U),
+                 static_cast<std::int32_t>(plan.max_concurrency)},
                 "DFlash pending target features");
         }
     }
@@ -251,10 +262,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     }
     qwen3_5::complete_round_state_layout(builder, out.round);
     if (!plan.causal_scoring) {
-        out.token_counts        = add_tensor(builder, DType::I32,
-                                             {dimension(parameters.model.resources().public_token_count),
-                                              static_cast<std::int32_t>(plan.max_concurrency)},
-                                             "sampling token counts");
+        out.token_counts = add_tensor(builder, DType::I32,
+                                      {dimension(parameters.model.resources().public_token_count),
+                                       static_cast<std::int32_t>(plan.max_concurrency)},
+                                      "sampling token counts");
         const auto config_words = static_cast<std::int32_t>(
             (sizeof(ops::SamplingConfig) + sizeof(std::int32_t) - 1) / sizeof(std::int32_t));
         out.sampling_config = add_tensor(
@@ -283,7 +294,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const ops::CausalAttentionExecutionEnvelope text_envelope{1, plan.capacity};
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
-                           std::int32_t tokens) { (void)layout.alloc(dtype, {rows, tokens}); };
+                            std::int32_t tokens) { (void)layout.alloc(dtype, {rows, tokens}); };
     const auto scratch = [](WorkspaceLayoutBuilder& layout, std::size_t bytes) {
         if (bytes == 0) { return; }
         auto scope = layout.scope();
@@ -828,6 +839,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->causal_scoring      = inputs.causal_scoring;
     impl->device              = inputs.device;
     impl->context_cache       = inputs.context_cache;
+    impl->active_kv           = inputs.active_kv;
     impl->kv_storage          = inputs.kv_storage;
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
@@ -899,25 +911,36 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .causal_scoring      = options.purpose == EnginePurpose::CausalScoring,
         .device              = options.device,
         .context_cache       = options.context_cache,
+        .active_kv           = options.active_kv,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
-    const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
+    std::uint32_t minimum_pages       = std::max(logical_pages, inputs.max_concurrency);
     const std::uint64_t maximum_pages64 =
         static_cast<std::uint64_t>(inputs.max_concurrency) * logical_pages;
     if (maximum_pages64 > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("maximum Main KV page count exceeds uint32");
     }
-    const auto maximum_pages = static_cast<std::uint32_t>(maximum_pages64);
+    auto maximum_pages = static_cast<std::uint32_t>(maximum_pages64);
+    if (options.active_kv.secondary_device) {
+        const auto fixed_pages = page_count(options.kv_capacity.explicit_tokens);
+        if (fixed_pages < minimum_pages || fixed_pages > maximum_pages) {
+            throw std::invalid_argument(
+                "active KV total capacity is outside the supported request envelope");
+        }
+        // Split residency is not an affine local-memory curve. Its explicit total,
+        // local pages and double-buffer workspace are planned as one fixed budget.
+        minimum_pages = maximum_pages = fixed_pages;
+    }
 
     auto planner     = std::make_unique<qwen3_5::detail::SequencePlannerImpl>();
     planner->inputs  = inputs;
     planner->minimum = build_sequence_candidate(inputs, minimum_pages);
     planner->curve   = runtime::SequenceCapacityCurve{
-          .main_page_tokens                     = static_cast<std::uint32_t>(kPagedKVPageSize),
-          .minimum_main_page_groups             = minimum_pages,
-          .maximum_main_page_groups             = maximum_pages,
-          .minimum_device_reservation_bytes     = planner->minimum->device_reservation_bytes,
-          .bytes_per_additional_main_page_group = 0,
+        .main_page_tokens                     = static_cast<std::uint32_t>(kPagedKVPageSize),
+        .minimum_main_page_groups             = minimum_pages,
+        .maximum_main_page_groups             = maximum_pages,
+        .minimum_device_reservation_bytes     = planner->minimum->device_reservation_bytes,
+        .bytes_per_additional_main_page_group = 0,
     };
     if (minimum_pages < maximum_pages) {
         auto adjacent = build_sequence_candidate(inputs, minimum_pages + 1U);

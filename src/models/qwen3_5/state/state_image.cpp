@@ -209,14 +209,15 @@ TransferWork dflash_local_transfer_work(const StateImageHostLayout& layout) {
                         .copy_operations = static_cast<std::uint32_t>(operations)};
 }
 
-HostStatePool::HostStatePool(StateImageHostLayout layout, std::uint32_t capacity)
+HostStatePool::HostStatePool(StateImageHostLayout layout, std::uint32_t capacity,
+                             std::optional<int> secondary_device)
     : layout_(std::move(layout)), slots_(capacity), free_slots_(capacity), free_count_(capacity) {
     if (!same_host_layout(layout_, plan_host_state_image(layout_.spec))) {
         throw std::invalid_argument("HostStatePool image layout is invalid");
     }
     const std::size_t bytes =
         checked_mul(layout_.image_bytes, capacity, "HostStatePool backing size overflow");
-    if (bytes != 0) { backing_.emplace(bytes); }
+    if (bytes != 0) { backing_.emplace(bytes, secondary_device); }
     for (std::uint32_t index = 0; index < capacity; ++index) {
         free_slots_[index] = capacity - 1U - index;
     }
@@ -243,12 +244,12 @@ bool HostStatePool::release(HostStateSlotHandle handle) noexcept {
 
 HostStateImageView HostStatePool::writable_view(HostStateSlotHandle handle) {
     if (!valid(handle)) { throw std::invalid_argument("HostStatePool handle is stale"); }
-    return {.data = slot_data(handle.index), .layout = &layout_};
+    return {.data = slot_data(handle.index), .layout = &layout_, .backing = &*backing_};
 }
 
 HostStateImageConstView HostStatePool::view(HostStateSlotHandle handle) const {
     if (!valid(handle)) { throw std::invalid_argument("HostStatePool handle is stale"); }
-    return {.data = slot_data(handle.index), .layout = &layout_};
+    return {.data = slot_data(handle.index), .layout = &layout_, .backing = &*backing_};
 }
 
 std::uint32_t HostStatePool::capacity() const noexcept {
@@ -382,6 +383,34 @@ void StateImageDevicePool::copy_to_host(std::int32_t source, HostStateImageView 
                                         cudaStream_t stream) const {
     validate_slot(source, slot_count(), "StateImage copy-to-host source is out of range");
     validate_host_layout(destination.layout, destination.data);
+    if (destination.backing && destination.backing->secondary()) {
+        const auto base = static_cast<std::size_t>(
+            destination.data - static_cast<std::byte*>(destination.backing->data()));
+        const auto copy = [&](std::size_t offset, const Tensor& tensor) {
+            destination.backing->copy_from_device_2d(base + offset, tensor.bytes(), tensor.data,
+                                                     tensor.bytes(), tensor.bytes(), 1, stream);
+        };
+        for (std::uint32_t layer = 0; layer < linear_.layer_count(); ++layer) {
+            copy(host_layout_.linear_conv.offset + layer * host_layout_.linear_conv_layer_bytes,
+                 linear_.conv_slot(layer, source));
+            copy(host_layout_.linear_recurrent.offset +
+                     layer * host_layout_.linear_recurrent_layer_bytes,
+                 linear_.recurrent_slot(layer, source));
+        }
+        copy(host_layout_.continuation_hidden.offset, continuation_hidden_slot(source));
+        if (dflash_local_) {
+            for (std::uint32_t layer = 0; layer < dflash_local_->layer_count(); ++layer) {
+                const auto view = dflash_local_->layer_view(layer);
+                copy(host_layout_.dflash_local_k->offset +
+                         layer * host_layout_.dflash_local_layer_bytes,
+                     view.k.slice(3, source, 1));
+                copy(host_layout_.dflash_local_v->offset +
+                         layer * host_layout_.dflash_local_layer_bytes,
+                     view.v.slice(3, source, 1));
+            }
+        }
+        return;
+    }
     for (std::uint32_t layer = 0; layer < linear_.layer_count(); ++layer) {
         const Tensor conv = linear_.conv_slot(layer, source);
         CUDA_CHECK(cudaMemcpyAsync(
@@ -420,6 +449,34 @@ void StateImageDevicePool::copy_from_host(HostStateImageConstView source, std::i
     validate_slot(destination, slot_count(),
                   "StateImage copy-from-host destination is out of range");
     validate_host_layout(source.layout, source.data);
+    if (source.backing && source.backing->secondary()) {
+        const auto base = static_cast<std::size_t>(
+            source.data - static_cast<const std::byte*>(source.backing->data()));
+        const auto copy = [&](std::size_t offset, const Tensor& tensor) {
+            source.backing->copy_to_device_2d(base + offset, tensor.bytes(), tensor.data,
+                                              tensor.bytes(), tensor.bytes(), 1, stream);
+        };
+        for (std::uint32_t layer = 0; layer < linear_.layer_count(); ++layer) {
+            copy(host_layout_.linear_conv.offset + layer * host_layout_.linear_conv_layer_bytes,
+                 linear_.conv_slot(layer, destination));
+            copy(host_layout_.linear_recurrent.offset +
+                     layer * host_layout_.linear_recurrent_layer_bytes,
+                 linear_.recurrent_slot(layer, destination));
+        }
+        copy(host_layout_.continuation_hidden.offset, continuation_hidden_slot(destination));
+        if (dflash_local_) {
+            for (std::uint32_t layer = 0; layer < dflash_local_->layer_count(); ++layer) {
+                const auto view = dflash_local_->layer_view(layer);
+                copy(host_layout_.dflash_local_k->offset +
+                         layer * host_layout_.dflash_local_layer_bytes,
+                     view.k.slice(3, destination, 1));
+                copy(host_layout_.dflash_local_v->offset +
+                         layer * host_layout_.dflash_local_layer_bytes,
+                     view.v.slice(3, destination, 1));
+            }
+        }
+        return;
+    }
     for (std::uint32_t layer = 0; layer < linear_.layer_count(); ++layer) {
         const Tensor conv = linear_.conv_slot(layer, destination);
         CUDA_CHECK(cudaMemcpyAsync(

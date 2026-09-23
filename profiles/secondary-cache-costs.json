@@ -1,0 +1,32 @@
+{
+  "schema_version": 3,
+  "artifact_type": "ninfer_context_cost_presets",
+  "machines": [
+    {
+      "hardware_class": "nvidia-geforce-rtx-5090-sm120",
+      "transfer": {
+        "d2h": {
+          "batch_ns": 100000,
+          "operation_ns": 100000,
+          "ns_per_byte_q32": 1526747071
+        },
+        "h2d": {
+          "batch_ns": 100000,
+          "operation_ns": 100000,
+          "ns_per_byte_q32": 1463699936
+        },
+        "d2d": {
+          "batch_ns": 3343,
+          "operation_ns": 9520,
+          "ns_per_byte_q32": 2658314
+        }
+      },
+      "prefill": [],
+      "transfer_provenance": {
+        "scope": "Initial secondary-device cold-tier estimates for this host only; host-staged 64MiB payload throughput measured, 100us operation/batch overhead conservative uncalibrated; d2d retained from compiled RTX5090 preset. Not an integrated-cache timing claim.",
+        "secondary_gpu": "RTX3070",
+        "peer_access": false
+      }
+    }
+  ]
+}

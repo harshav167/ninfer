@@ -74,6 +74,9 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-request-mib N] [--media-cache-mib N] [--media-live-mib N] "
            "[--media-preprocess-threads N] "
            "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] "
+           "[--secondary-cache-device N] [--secondary-cache-state-slots N] "
+           "[--secondary-cache-kv-mib N] "
+           "[--active-kv-secondary-device N] [--active-kv-local-tokens N] "
            "[--max-private-continuations N] [--max-shared-prefixes N] "
            "[--max-long-anchors-per-continuation N] "
            "[--request-log-jsonl FILE] "
@@ -224,6 +227,30 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             options.context_cache.host_kv_capacity_bytes = static_cast<std::size_t>(mib << 20);
             context_capacity_explicit                    = true;
+        } else if (arg == "--secondary-cache-device") {
+            options.context_cache.secondary_cache_device = parse_nonnegative_int(
+                require_value("--secondary-cache-device"), "secondary-cache-device");
+            context_capacity_explicit = true;
+        } else if (arg == "--secondary-cache-state-slots") {
+            options.context_cache.secondary_cache_state_slots =
+                static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--secondary-cache-state-slots"), "secondary-cache-state-slots"));
+            context_capacity_explicit = true;
+        } else if (arg == "--secondary-cache-kv-mib") {
+            const std::uint64_t mib =
+                parse_u64(require_value("--secondary-cache-kv-mib"), "secondary-cache-kv-mib");
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--secondary-cache-kv-mib is out of range");
+            }
+            options.context_cache.secondary_cache_kv_capacity_bytes =
+                static_cast<std::size_t>(mib << 20);
+            context_capacity_explicit = true;
+        } else if (arg == "--active-kv-secondary-device") {
+            options.active_kv.secondary_device = parse_nonnegative_int(
+                require_value("--active-kv-secondary-device"), "active-kv-secondary-device");
+        } else if (arg == "--active-kv-local-tokens") {
+            options.active_kv.resident_tokens = static_cast<std::uint32_t>(parse_nonnegative_int(
+                require_value("--active-kv-local-tokens"), "active-kv-local-tokens"));
         } else if (arg == "--max-private-continuations") {
             options.context_cache.max_private_continuations =
                 static_cast<std::uint32_t>(parse_nonnegative_int(

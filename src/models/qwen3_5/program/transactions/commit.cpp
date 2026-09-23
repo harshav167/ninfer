@@ -205,8 +205,8 @@ void ProgramImpl::commit_generated_prefix_identity(
     }
     const bool already_appended = sequence.prefix_identity.size() == sequence.ledger.size() &&
                                   sequence.prefix_digests.size() == sequence.ledger.size();
-    const bool awaits_append = sequence.prefix_identity.size() == base_ledger_frontier &&
-                               sequence.prefix_digests.size() == base_ledger_frontier;
+    const bool awaits_append    = sequence.prefix_identity.size() == base_ledger_frontier &&
+                                  sequence.prefix_digests.size() == base_ledger_frontier;
     if (!already_appended && !awaits_append) {
         throw std::logic_error("generated-prefix identity is not at its base or committed extent");
     }
@@ -318,6 +318,7 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                 timing.resume_submit();
             }
 
+            bind_scalar_prefill(sequence);
             ensure_sequence_kv_mapped(sequence, end, backend_kv_cache() ? end : 0U);
 
             sequence.ledger.insert(sequence.ledger.end(), forced.begin(), forced.end());
@@ -325,23 +326,6 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                 throw std::logic_error("forced-token continuation ledger has an invalid shape");
             }
 
-            if (is_masked_draft_backend(speculative_backend)) {
-                if (!dflash || !io.dflash_decode || !sequence.kv ||
-                    (backend_kv_cache() && !sequence.kv->backend)) {
-                    throw std::logic_error("DFlash forced continuation state is incomplete");
-                }
-                *dflash_host_ingress                            = {};
-                dflash_host_ingress->active_lanes[0]            = static_cast<std::int32_t>(lane);
-                const StateImageSelectors selectors             = state_selectors(sequence);
-                dflash_host_ingress->state_source_slots[0]      = selectors.source;
-                dflash_host_ingress->state_destination_slots[0] = selectors.destination;
-                dflash_host_ingress->dflash_kv_table_rows[0] =
-                    sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
-                                         : 0;
-                CUDA_CHECK(cudaMemcpyAsync(io.dflash_decode->ingress.data, dflash_host_ingress,
-                                           sizeof(qwen3_5::DFlashDecodeIngress),
-                                           cudaMemcpyHostToDevice, device.stream));
-            }
 
             std::uint32_t cursor = base;
             while (cursor < end) {
@@ -511,9 +495,9 @@ CommitResult ProgramImpl::commit(PendingBatch&& pending,
                 invalidate_lane(lanes[row]);
                 released_resource = true;
                 out.rows[row]     = CommitRowResult{
-                        .disposition = runtime::CommitDisposition::CancelledReleased,
-                        .timings     = timings[row],
-                        .speculative = std::move(speculative[row]),
+                    .disposition = runtime::CommitDisposition::CancelledReleased,
+                    .timings     = timings[row],
+                    .speculative = std::move(speculative[row]),
                 };
             } else if (decisions[row].terminal) {
                 out.rows[row].disposition = runtime::CommitDisposition::Finishable;
@@ -689,7 +673,7 @@ ReleaseResult ProgramImpl::release_continuation(ContinuationHandle&& continuatio
     ReleaseResult out;
     const std::uint32_t index      = ContractAccess::index(continuation);
     const std::uint64_t generation = ContractAccess::epoch(continuation);
-    const bool valid               = !has_context_transaction() && !pending_transaction_ &&
+    const bool valid = !has_context_transaction() && !pending_transaction_ &&
                        valid_continuation(continuation) && !materialization_pins(index, generation);
     if (!valid) { return out; }
     try {

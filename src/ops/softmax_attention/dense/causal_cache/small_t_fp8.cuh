@@ -8,6 +8,7 @@
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
 #include "ops/softmax_attention/dense/causal_cache/small_t.cuh"
+#include "ops/kernel/tiered_kv_pointer.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -32,11 +33,12 @@ __device__ __forceinline__ int4 causal_small_t_fp8_dequant_f16x8(const std::uint
 }
 
 template <typename Geometry, int TokenTile, int WarpsPerCta, int MinBlocksPerSm, int KeyBlock,
-          bool DynamicArena, bool MultiBatch, bool Masked, typename CacheInput>
+          bool DynamicArena, bool MultiBatch, bool Masked, typename CacheInput, bool Tiered>
 __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     void causal_attention_small_t_fp8_tiled_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* positions,
-        std::uint8_t* cache_k, std::uint8_t* cache_v, __half* cache_k_scale, __half* cache_v_scale,
+        KVPlanePointer<std::uint8_t, Tiered> cache_k, KVPlanePointer<std::uint8_t, Tiered> cache_v,
+        KVPlanePointer<__half, Tiered> cache_k_scale, KVPlanePointer<__half, Tiered> cache_v_scale,
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t column_begin, std::int32_t logical_capacity, float attention_scale,

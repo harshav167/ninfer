@@ -11,27 +11,27 @@
 namespace ninfer::ops::detail {
 namespace {
 
-template <typename Geometry, typename CacheView, typename Metadata>
+template <typename Geometry, bool Tiered, typename CacheView, typename Metadata>
 void causal_attention_prompt_fp8_attention_launch_for(const Tensor& q, const Tensor& positions,
                                                       float scale, const CacheView& cache,
                                                       Metadata metadata, Tensor& out,
                                                       cudaStream_t stream) {
     static const cudaError_t attr = cudaFuncSetAttribute(
-        causal_attention_prompt_fp8_kernel<Geometry, Metadata>,
+        causal_attention_prompt_fp8_kernel<Geometry, Metadata, Tiered>,
         cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptFp8SmemBytes);
     CUDA_CHECK(attr);
 
     const auto tokens = static_cast<std::int32_t>(q.ne[2]);
     const dim3 grid(static_cast<unsigned>(div_up(tokens, kCausalPromptFp8Br)),
                     static_cast<unsigned>(Geometry::QHeads), 1u);
-    causal_attention_prompt_fp8_kernel<Geometry, Metadata>
+    causal_attention_prompt_fp8_kernel<Geometry, Metadata, Tiered>
         <<<grid, kCausalPromptFp8Threads, kCausalPromptFp8SmemBytes, stream>>>(
             static_cast<const __nv_bfloat16*>(q.data),
-            static_cast<const std::uint8_t*>(cache.k_pages.data),
-            static_cast<const std::uint8_t*>(cache.v_pages.data),
-            static_cast<const __half*>(cache.k_scale_pages.data),
-            static_cast<const __half*>(cache.v_scale_pages.data), metadata,
-            static_cast<const std::int32_t*>(positions.data), scale,
+            kv_plane_pointer<const std::uint8_t, Tiered>(cache.k_pages, cache.staged.k),
+            kv_plane_pointer<const std::uint8_t, Tiered>(cache.v_pages, cache.staged.v),
+            kv_plane_pointer<const __half, Tiered>(cache.k_scale_pages, cache.staged.k_scale),
+            kv_plane_pointer<const __half, Tiered>(cache.v_scale_pages, cache.staged.v_scale),
+            metadata, static_cast<const std::int32_t*>(positions.data), scale,
             static_cast<__nv_bfloat16*>(out.data), tokens);
     CUDA_CHECK(cudaGetLastError());
 }
@@ -41,13 +41,20 @@ void causal_attention_prompt_fp8_attention_dispatch(const Tensor& q, const Tenso
                                                     float scale, const CacheView& cache,
                                                     Metadata metadata, Tensor& out,
                                                     cudaStream_t stream) {
+    const auto launch = [&]<typename Geometry>() {
+        if (cache.staged.enabled()) {
+            causal_attention_prompt_fp8_attention_launch_for<Geometry, true>(
+                q, positions, scale, cache, metadata, out, stream);
+        } else {
+            causal_attention_prompt_fp8_attention_launch_for<Geometry, false>(
+                q, positions, scale, cache, metadata, out, stream);
+        }
+    };
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
-        causal_attention_prompt_fp8_attention_launch_for<CausalD256H24Kv4>(
-            q, positions, scale, cache, metadata, out, stream);
-        return;
+        launch.template operator()<CausalD256H24Kv4>();
+    } else {
+        launch.template operator()<CausalD256H16Kv2>();
     }
-    causal_attention_prompt_fp8_attention_launch_for<CausalD256H16Kv2>(q, positions, scale, cache,
-                                                                       metadata, out, stream);
 }
 
 } // namespace

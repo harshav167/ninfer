@@ -168,8 +168,8 @@ select_kv_pressure_actions(const KVAddressSpaceStore& addresses, LogicalKVPageSt
                            ProtectedPage&& protected_page) {
     KVPressureSelection selection;
     selection.host_bytes_remaining = requested_host_bytes;
-    const std::uint32_t mapped     = std::min(addresses.mapped_pages(address),
-                                              mapped_limit.value_or(addresses.mapped_pages(address)));
+    const std::uint32_t mapped = std::min(addresses.mapped_pages(address),
+                                          mapped_limit.value_or(addresses.mapped_pages(address)));
     std::vector<std::uint8_t> selected(mapped, 0);
     const HostKVPageLayout layout = plan_host_kv_page_layout(pages.physical_pool().geometry());
 
@@ -255,10 +255,10 @@ select_kv_pressure_actions(const KVAddressSpaceStore& addresses, LogicalKVPageSt
                 if (selected[page] != 0) { return false; }
                 const LogicalKVPageHandle logical = addresses.logical_page(address, page);
                 const bool replica_safe = require_host ? pages.can_drop_device_replica(logical)
-                                                        : !pages.host_resident(logical);
+                                                       : !pages.host_resident(logical);
                 const qwen3_5::detail::PressureKVDecisionKind action =
                     require_host ? qwen3_5::detail::PressureKVDecisionKind::DropDeviceDuplicate
-                                  : qwen3_5::detail::PressureKVDecisionKind::DemoteToHost;
+                                 : qwen3_5::detail::PressureKVDecisionKind::DemoteToHost;
                 return pages.device_resident(logical) && pages.writer_references(logical) == 0 &&
                        pages.source_pins(logical) == 0 && replica_safe &&
                        !addresses.has_active_reference(logical) &&
@@ -270,10 +270,10 @@ select_kv_pressure_actions(const KVAddressSpaceStore& addresses, LogicalKVPageSt
             while (begin != 0 && eligible(begin - 1U)) { --begin; }
             const std::uint32_t count = std::min(device_remaining, end - begin);
             qwen3_5::detail::PressureKVDecision action{
-                 .begin_page = end - count,
-                 .page_count = count,
-                 .kind = require_host ? qwen3_5::detail::PressureKVDecisionKind::DropDeviceDuplicate
-                                      : qwen3_5::detail::PressureKVDecisionKind::DemoteToHost,
+                .begin_page = end - count,
+                .page_count = count,
+                .kind = require_host ? qwen3_5::detail::PressureKVDecisionKind::DropDeviceDuplicate
+                                     : qwen3_5::detail::PressureKVDecisionKind::DemoteToHost,
             };
             mark_action(action);
             selection.removed_device_pages += count;
@@ -293,7 +293,7 @@ select_kv_pressure_actions(const KVAddressSpaceStore& addresses, LogicalKVPageSt
                 selection.transfer_requirements.push_back(kv_transfer_requirement(
                     resource, runtime::ContextTransferDirection::DeviceToHost, layout, count,
                     physical_kv_runs(addresses, pages, address, action.begin_page,
-                                      action.page_count)));
+                                     action.page_count)));
             }
         }
     };
@@ -533,8 +533,8 @@ std::optional<qwen3_5::detail::PressureDecision> ProgramImpl::inspect_shared_pre
     const std::size_t initial_actions = option.state_changes.size() +
                                         option.main_kv_changes.size() +
                                         option.backend_kv_changes.size();
-    std::uint64_t identity = 1099511628211ULL;
-    const auto mix         = [&](std::uint64_t value) {
+    std::uint64_t identity            = 1099511628211ULL;
+    const auto mix                    = [&](std::uint64_t value) {
         identity ^= value;
         identity *= 1469598103934665603ULL;
     };
@@ -721,13 +721,13 @@ ProgramImpl::inspect_pressure_option(const SequenceState& sequence,
         option.backend_kv_changes = current->backend_kv_changes;
         option.effect.removed     = checked_resource_difference(
             current->effect.removed, current->checkpoint_drop_effect.removed);
-        option.effect.added          = checked_resource_difference(current->effect.added,
-                                                                   current->checkpoint_drop_effect.added);
+        option.effect.added = checked_resource_difference(current->effect.added,
+                                                          current->checkpoint_drop_effect.added);
         option.transfer_requirements = current->transfer_requirements;
     }
-    const std::size_t initial_actions = option.state_changes.size() +
-                                        option.main_kv_changes.size() +
-                                        option.backend_kv_changes.size();
+    const std::size_t initial_actions          = option.state_changes.size() +
+                                                 option.main_kv_changes.size() +
+                                                 option.backend_kv_changes.size();
     const detail::PhysicalDelta initial_effect = option.effect;
     std::uint64_t identity                     = 1469598103934665603ULL;
     const auto mix                             = [&](std::uint64_t value) {
@@ -1350,8 +1350,8 @@ std::optional<detail::PressureTargetProjection> ProgramImpl::evaluate_pressure_t
                 .state  = *state,
                 .device = residency == StateReplicaResidency::DeviceOnly ||
                           residency == StateReplicaResidency::Both,
-                .host = residency == StateReplicaResidency::HostOnly ||
-                        residency == StateReplicaResidency::Both,
+                .host   = residency == StateReplicaResidency::HostOnly ||
+                          residency == StateReplicaResidency::Both,
             };
             if (pressure_state_drops_host(change)) {
                 selected.host = false;
@@ -1787,13 +1787,13 @@ std::optional<detail::PressureTargetProjection> ProgramImpl::evaluate_pressure_t
     const auto append_state                             = [&](StateImageHandle state) {
         const auto selected =
             std::find_if(selected_states.begin(), selected_states.end(),
-                                                     [&](const PressureSelectedState& item) { return item.state == state; });
+                         [&](const PressureSelectedState& item) { return item.state == state; });
         if (state_store->valid(state) && selected == selected_states.end()) {
             const auto [device_resident, host_resident] = final_state_placement(state);
             selected_states.push_back(PressureSelectedState{
-                                            .state  = state,
-                                            .device = device_resident,
-                                            .host   = host_resident,
+                .state  = state,
+                .device = device_resident,
+                .host   = host_resident,
             });
         }
     };
@@ -2229,12 +2229,12 @@ bool ProgramImpl::compose_pressure_candidate(
         const bool device_resident     = pages.device_resident(tail);
         if (!device_resident && !pages.host_resident(tail)) { return false; }
 
-        std::uint32_t& added  = resource == runtime::ContextResourceClass::MainKV
-                                    ? details.demand.reservation_added.device.main_kv_pages
-                                    : details.demand.reservation_added.device.backend_kv_pages;
-        std::uint32_t& peak   = resource == runtime::ContextResourceClass::MainKV
-                                    ? details.demand.physical_peak_additional.device.main_kv_pages
-                                    : details.demand.physical_peak_additional.device.backend_kv_pages;
+        std::uint32_t& added = resource == runtime::ContextResourceClass::MainKV
+                                   ? details.demand.reservation_added.device.main_kv_pages
+                                   : details.demand.reservation_added.device.backend_kv_pages;
+        std::uint32_t& peak = resource == runtime::ContextResourceClass::MainKV
+                                  ? details.demand.physical_peak_additional.device.main_kv_pages
+                                  : details.demand.physical_peak_additional.device.backend_kv_pages;
         std::uint32_t& credit = resource == runtime::ContextResourceClass::MainKV
                                     ? details.demand.reservation_credit.device.main_kv_pages
                                     : details.demand.reservation_credit.device.backend_kv_pages;
@@ -2581,7 +2581,7 @@ bool ProgramImpl::isolated_request_feasible(const RequestBasePlan& base) const n
     if (base.impl_ == nullptr) { return false; }
     const detail::PhysicalResources capacity = admission_capacity();
     const auto fits                          = [](detail::PhysicalResources value,
-                         detail::PhysicalResources limit) noexcept {
+                                                  detail::PhysicalResources limit) noexcept {
         return value.device.active_lanes <= limit.device.active_lanes &&
                value.device.state_slots <= limit.device.state_slots &&
                value.device.main_kv_pages <= limit.device.main_kv_pages &&
@@ -2619,7 +2619,7 @@ bool ProgramImpl::persistent_backfill_safe(
 
     const detail::PhysicalResources capacity = admission_capacity();
     const auto fits                          = [](detail::PhysicalResources value,
-                         detail::PhysicalResources limit) noexcept {
+                                                  detail::PhysicalResources limit) noexcept {
         return value.device.active_lanes <= limit.device.active_lanes &&
                value.device.state_slots <= limit.device.state_slots &&
                value.device.main_kv_pages <= limit.device.main_kv_pages &&
@@ -2641,6 +2641,8 @@ qwen3_5::PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {
         .device_main_kv_pages    = usage.device.main_kv_pages,
         .device_backend_kv_pages = usage.device.backend_kv_pages,
         .host_kv_bytes           = usage.host.kv_bytes,
+        .active_kv_read_bytes    = decoder->text_kv.active_read_bytes(),
+        .active_kv_write_bytes   = decoder->text_kv.active_write_bytes(),
     };
 }
 

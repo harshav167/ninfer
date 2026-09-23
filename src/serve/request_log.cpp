@@ -437,19 +437,19 @@ std::string format_server_start_json(
              {"default_thinking_budget", std::move(default_thinking_budget)},
              {"default_preserve_thinking",
               options.preserve_thinking ? Json(*options.preserve_thinking) : Json(nullptr)}};
-    record["artifact"]                             = Json{{"path", options.artifact_path},
-                                                          {"size_bytes", std::move(artifact_size)},
-                                                          {"architecture", load.architecture},
-                                                          {"name", load.model_name},
-                                                          {"formats", load.weight_formats},
-                                                          {"prefill_signature", load.prefill_signature},
-                                                          {"bytes_read", load.artifact_bytes_read},
-                                                          {"host_to_device_bytes", load.host_to_device_bytes},
-                                                          {"peak_staging_bytes", load.peak_staging_bytes},
-                                                          {"device_object_count", load.device_object_count},
-                                                          {"host_object_count", load.host_object_count},
-                                                          {"load_seconds", load.load_seconds},
-                                                          {"upload_seconds", load.upload_seconds}};
+    record["artifact"] = Json{{"path", options.artifact_path},
+                              {"size_bytes", std::move(artifact_size)},
+                              {"architecture", load.architecture},
+                              {"name", load.model_name},
+                              {"formats", load.weight_formats},
+                              {"prefill_signature", load.prefill_signature},
+                              {"bytes_read", load.artifact_bytes_read},
+                              {"host_to_device_bytes", load.host_to_device_bytes},
+                              {"peak_staging_bytes", load.peak_staging_bytes},
+                              {"device_object_count", load.device_object_count},
+                              {"host_object_count", load.host_object_count},
+                              {"load_seconds", load.load_seconds},
+                              {"upload_seconds", load.upload_seconds}};
     const ninfer::ContextCacheOptions& cache       = engine_options.context_cache;
     const ninfer::ContextCostSummary& context_cost = load.context_cost;
     const std::uint64_t total_device_state_slots =
@@ -488,6 +488,9 @@ std::string format_server_start_json(
                    {"total_device_state_slots", total_device_state_slots},
                    {"host_state_slots", cache.host_state_slots},
                    {"host_kv_capacity_bytes", cache.host_kv_capacity_bytes},
+                   {"secondary_cache_device", cache.secondary_cache_device.value_or(-1)},
+                   {"secondary_cache_state_slots", cache.secondary_cache_state_slots},
+                   {"secondary_cache_kv_capacity_bytes", cache.secondary_cache_kv_capacity_bytes},
                    {"max_private_continuations", cache.max_private_continuations.value()},
                    {"max_shared_prefixes", cache.max_shared_prefixes.value()},
                    {"max_long_anchors_per_continuation",
@@ -516,6 +519,17 @@ std::string format_server_start_json(
              {"host_state_occupied_slots", memory.host_state_occupied_slots},
              {"host_kv_capacity_bytes", memory.host_kv_capacity_bytes},
              {"host_kv_occupied_bytes", memory.host_kv_occupied_bytes}};
+    record["memory"]["secondary_cache_device"]         = memory.secondary_cache_device;
+    record["memory"]["secondary_state_capacity_slots"] = memory.secondary_state_capacity_slots;
+    record["memory"]["secondary_state_occupied_slots"] = memory.secondary_state_occupied_slots;
+    record["memory"]["secondary_kv_capacity_bytes"]    = memory.secondary_kv_capacity_bytes;
+    record["memory"]["secondary_kv_occupied_bytes"]    = memory.secondary_kv_occupied_bytes;
+    record["memory"]["secondary_staging_bytes"]        = memory.secondary_staging_bytes;
+    record["memory"]["active_kv_secondary_device"]     = memory.active_kv_secondary_device;
+    record["memory"]["active_kv_resident_tokens"]      = memory.active_kv_resident_tokens;
+    record["memory"]["active_kv_secondary_bytes"]      = memory.active_kv_secondary_bytes;
+    record["memory"]["active_kv_device_staging_bytes"] = memory.active_kv_device_staging_bytes;
+    record["memory"]["active_kv_host_staging_bytes"]   = memory.active_kv_host_staging_bytes;
     record["environment"] =
         Json{{"device", environment.device},
              {"gpu_name", environment.gpu_name},
@@ -626,42 +640,42 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                                   {"row_rounds", report.decode_row_rounds},
                                   {"average_size", std::move(average_batch)}};
     record["host_work"]    = Json{
-           {"elapsed_seconds",
-            Json{{"engine_boundary", nanoseconds_to_seconds(host.engine_boundary_ns)},
-                 {"program_submit", nanoseconds_to_seconds(host.program_submit_ns)},
-                 {"program_post", nanoseconds_to_seconds(host.program_post_ns)},
-                 {"engine_commit_output", nanoseconds_to_seconds(host.engine_commit_output_ns)},
-                 {"engine_maintenance", nanoseconds_to_seconds(host.engine_maintenance_ns)},
-                 {"total", nanoseconds_to_seconds(active_host)}}},
-           {"device_wait_seconds", nanoseconds_to_seconds(host.device_wait_ns)},
-           {"work_class_seconds",
-            Json{{"decode_host", nanoseconds_to_seconds(host.decode_host_ns)},
-                 {"decode_device_wait", nanoseconds_to_seconds(host.decode_device_wait_ns)},
-                 {"prefill_host", nanoseconds_to_seconds(host.prefill_host_ns)},
-                 {"prefill_device_wait", nanoseconds_to_seconds(host.prefill_device_wait_ns)},
-                 {"control_host", nanoseconds_to_seconds(host.control_host_ns)},
-                 {"control_device_wait", nanoseconds_to_seconds(host.control_device_wait_ns)}}},
-           {"detail_subset_seconds",
-            Json{{"admission_policy", nanoseconds_to_seconds(host.admission_policy_ns)},
-                 {"context_progress", nanoseconds_to_seconds(host.context_progress_ns)},
-                 {"stats_publication", nanoseconds_to_seconds(host.stats_publication_ns)}}},
-           {"detail_invocations", Json{{"admission_policy", host.admission_policy_invocations},
-                                       {"context_progress", host.context_progress_invocations},
-                                       {"stats_publication", host.stats_publication_invocations}}},
-           {"units", Json{{"prefill", host.prefill_units}, {"control", host.control_units}}},
-           {"decode_host_microseconds_per_round",
-            microseconds_per(host.decode_host_ns, report.decode_rounds)},
-           {"decode_host_microseconds_per_row_round",
-            microseconds_per(host.decode_host_ns, report.decode_row_rounds)},
-           {"decode_device_wait_microseconds_per_round",
-            microseconds_per(host.decode_device_wait_ns, report.decode_rounds)},
-           {"detail_microseconds_per_invocation",
-            Json{{"admission_policy",
-                  microseconds_per(host.admission_policy_ns, host.admission_policy_invocations)},
-                 {"context_progress",
-                  microseconds_per(host.context_progress_ns, host.context_progress_invocations)},
-                 {"stats_publication",
-                  microseconds_per(host.stats_publication_ns, host.stats_publication_invocations)}}},
+        {"elapsed_seconds",
+         Json{{"engine_boundary", nanoseconds_to_seconds(host.engine_boundary_ns)},
+              {"program_submit", nanoseconds_to_seconds(host.program_submit_ns)},
+              {"program_post", nanoseconds_to_seconds(host.program_post_ns)},
+              {"engine_commit_output", nanoseconds_to_seconds(host.engine_commit_output_ns)},
+              {"engine_maintenance", nanoseconds_to_seconds(host.engine_maintenance_ns)},
+              {"total", nanoseconds_to_seconds(active_host)}}},
+        {"device_wait_seconds", nanoseconds_to_seconds(host.device_wait_ns)},
+        {"work_class_seconds",
+         Json{{"decode_host", nanoseconds_to_seconds(host.decode_host_ns)},
+              {"decode_device_wait", nanoseconds_to_seconds(host.decode_device_wait_ns)},
+              {"prefill_host", nanoseconds_to_seconds(host.prefill_host_ns)},
+              {"prefill_device_wait", nanoseconds_to_seconds(host.prefill_device_wait_ns)},
+              {"control_host", nanoseconds_to_seconds(host.control_host_ns)},
+              {"control_device_wait", nanoseconds_to_seconds(host.control_device_wait_ns)}}},
+        {"detail_subset_seconds",
+         Json{{"admission_policy", nanoseconds_to_seconds(host.admission_policy_ns)},
+              {"context_progress", nanoseconds_to_seconds(host.context_progress_ns)},
+              {"stats_publication", nanoseconds_to_seconds(host.stats_publication_ns)}}},
+        {"detail_invocations", Json{{"admission_policy", host.admission_policy_invocations},
+                                    {"context_progress", host.context_progress_invocations},
+                                    {"stats_publication", host.stats_publication_invocations}}},
+        {"units", Json{{"prefill", host.prefill_units}, {"control", host.control_units}}},
+        {"decode_host_microseconds_per_round",
+         microseconds_per(host.decode_host_ns, report.decode_rounds)},
+        {"decode_host_microseconds_per_row_round",
+         microseconds_per(host.decode_host_ns, report.decode_row_rounds)},
+        {"decode_device_wait_microseconds_per_round",
+         microseconds_per(host.decode_device_wait_ns, report.decode_rounds)},
+        {"detail_microseconds_per_invocation",
+         Json{{"admission_policy",
+               microseconds_per(host.admission_policy_ns, host.admission_policy_invocations)},
+              {"context_progress",
+               microseconds_per(host.context_progress_ns, host.context_progress_invocations)},
+              {"stats_publication",
+               microseconds_per(host.stats_publication_ns, host.stats_publication_invocations)}}},
     };
     record["context_cache"] = Json{
         {"captures", Json{{"completed", monotonic_delta(previous.active_captures_completed,
@@ -776,6 +790,25 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                            {"shared_active_references", current.shared_active_references}}},
         {"actual_transfer_seconds", monotonic_delta(previous.actual_context_transfer_seconds,
                                                     current.actual_context_transfer_seconds)}};
+    record["context_cache"]["secondary_cache_device"] = current.secondary_cache_device;
+    record["context_cache"]["occupancy"]["secondary_state_slots"] =
+        current.secondary_state_occupied_slots;
+    record["context_cache"]["occupancy"]["secondary_kv_bytes"] =
+        current.secondary_kv_occupied_bytes;
+    record["active_kv_overflow"] = {
+        {"read_bytes",
+         monotonic_delta(previous.active_kv_read_bytes, current.active_kv_read_bytes)},
+        {"write_bytes",
+         monotonic_delta(previous.active_kv_write_bytes, current.active_kv_write_bytes)}};
+    if (current.secondary_cache_device >= 0) {
+        for (const char* group : {"state_transfers", "main_kv_transfers", "backend_kv_transfers"}) {
+            auto& transfers             = record["context_cache"][group];
+            transfers["to_secondary"]   = std::move(transfers["d2h"]);
+            transfers["from_secondary"] = std::move(transfers["h2d"]);
+            transfers.erase("d2h");
+            transfers.erase("h2d");
+        }
+    }
     return record.dump();
 }
 

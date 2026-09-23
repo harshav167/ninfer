@@ -26,7 +26,8 @@ struct OpenAIPromptCachePolicy {
 [[nodiscard]] bool parse_openai_prompt_cache_breakpoint(const RequestJson& value,
                                                         std::string_view param);
 [[nodiscard]] OpenAIPromptCachePolicy parse_openai_prompt_cache_policy(const RequestJson& body);
-void apply_openai_prompt_cache_policy(GenerationRequest& request, OpenAIPromptCachePolicy policy);
+void apply_openai_prompt_cache_policy(GenerationRequest& request, std::vector<ChatTurn>& messages,
+                                      OpenAIPromptCachePolicy policy);
 
 std::string make_models_list(const std::string& model_id, std::int64_t created,
                              std::uint32_t max_model_len);

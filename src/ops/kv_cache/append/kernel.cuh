@@ -4,6 +4,7 @@
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
+#include "ops/kernel/tiered_kv_pointer.cuh"
 #include "ops/kv_cache/append/geometry.cuh"
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
 #include "ops/kv_cache/int8_g64_codec.cuh"
@@ -16,13 +17,12 @@
 
 namespace ninfer::ops {
 
-template <typename Geometry>
-__device__ __forceinline__ void
-kv_cache_append_full_fp8_row(const __nv_bfloat16* __restrict__ k,
-                             const __nv_bfloat16* __restrict__ v,
-                             std::uint8_t* __restrict__ cache_k, std::uint8_t* __restrict__ cache_v,
-                             __half* __restrict__ scale_k, __half* __restrict__ scale_v, int token,
-                             int kv_head, int physical_page, int page_off, int lane) {
+template <typename Geometry, bool Tiered>
+__device__ __forceinline__ void kv_cache_append_full_fp8_row(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    KVPlanePointer<std::uint8_t, Tiered> cache_k, KVPlanePointer<std::uint8_t, Tiered> cache_v,
+    KVPlanePointer<__half, Tiered> scale_k, KVPlanePointer<__half, Tiered> scale_v, int token,
+    int kv_head, int physical_page, int page_off, int lane) {
     constexpr unsigned FullMask = 0xffffffffU;
     float values[8];
     float local_absmax = 0.0F;
@@ -77,7 +77,7 @@ __global__ void kv_cache_append_full_bf16_kernel(const __nv_bfloat16* __restrict
     const int tokens       = metadata.valid_tokens(width);
     const std::int64_t idx = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::int64_t n   = static_cast<std::int64_t>(tokens) * Geometry::KVHeads *
-                           (kKVCacheAppendFullHeadDim / VecElems);
+                             (kKVCacheAppendFullHeadDim / VecElems);
     if (idx >= n) return;
 
     const int vec      = static_cast<int>(idx % (kKVCacheAppendFullHeadDim / VecElems));
@@ -102,15 +102,13 @@ __global__ void kv_cache_append_full_bf16_kernel(const __nv_bfloat16* __restrict
     store_vec(&cache_v[cache_off], v_value);
 }
 
-template <typename Geometry, typename Metadata>
-__launch_bounds__(256) __global__
-    void kv_cache_append_full_fp8_kernel(const __nv_bfloat16* __restrict__ k,
-                                         const __nv_bfloat16* __restrict__ v,
-                                         const std::int32_t* __restrict__ positions,
-                                         Metadata metadata, std::uint8_t* __restrict__ cache_k,
-                                         std::uint8_t* __restrict__ cache_v,
-                                         __half* __restrict__ scale_k, __half* __restrict__ scale_v,
-                                         std::int32_t width) {
+template <typename Geometry, typename Metadata, bool Tiered>
+__launch_bounds__(256) __global__ void kv_cache_append_full_fp8_kernel(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const std::int32_t* __restrict__ positions, Metadata metadata,
+    KVPlanePointer<std::uint8_t, Tiered> cache_k, KVPlanePointer<std::uint8_t, Tiered> cache_v,
+    KVPlanePointer<__half, Tiered> scale_k, KVPlanePointer<__half, Tiered> scale_v,
+    std::int32_t width) {
     constexpr int Warps         = 8;
     constexpr unsigned FullMask = 0xffffffffU;
     const int tokens            = metadata.valid_tokens(width);
@@ -126,19 +124,18 @@ __launch_bounds__(256) __global__
     const std::int32_t* block_table = metadata.block_table();
     int physical_page               = lane == 0 ? paged_kv_physical_page(block_table, position) : 0;
     physical_page                   = __shfl_sync(FullMask, physical_page, 0);
-    kv_cache_append_full_fp8_row<Geometry>(k, v, cache_k, cache_v, scale_k, scale_v, token, kv_head,
-                                           physical_page, position & kPagedKVPageMask, lane);
+    kv_cache_append_full_fp8_row<Geometry, Tiered>(k, v, cache_k, cache_v, scale_k, scale_v, token,
+                                                   kv_head, physical_page,
+                                                   position & kPagedKVPageMask, lane);
 }
 
-template <typename Geometry, typename Metadata>
-__launch_bounds__(256) __global__
-    void kv_cache_append_full_fp8_page_kernel(const __nv_bfloat16* __restrict__ k,
-                                              const __nv_bfloat16* __restrict__ v,
-                                              const std::int32_t* __restrict__ positions,
-                                              Metadata metadata, std::uint8_t* __restrict__ cache_k,
-                                              std::uint8_t* __restrict__ cache_v,
-                                              __half* __restrict__ scale_k,
-                                              __half* __restrict__ scale_v, std::int32_t width) {
+template <typename Geometry, typename Metadata, bool Tiered>
+__launch_bounds__(256) __global__ void kv_cache_append_full_fp8_page_kernel(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const std::int32_t* __restrict__ positions, Metadata metadata,
+    KVPlanePointer<std::uint8_t, Tiered> cache_k, KVPlanePointer<std::uint8_t, Tiered> cache_v,
+    KVPlanePointer<__half, Tiered> scale_k, KVPlanePointer<__half, Tiered> scale_v,
+    std::int32_t width) {
     constexpr int TokensPerTile = 8;
     constexpr unsigned FullMask = 0xffffffffU;
     const int tokens            = metadata.valid_tokens(width);
@@ -159,8 +156,9 @@ __launch_bounds__(256) __global__
     int physical_page               = lane == 0 ? block_table[logical_page] : 0;
     physical_page                   = __shfl_sync(FullMask, physical_page, 0);
     const int position              = base_position + token;
-    kv_cache_append_full_fp8_row<Geometry>(k, v, cache_k, cache_v, scale_k, scale_v, token, kv_head,
-                                           physical_page, position & kPagedKVPageMask, lane);
+    kv_cache_append_full_fp8_row<Geometry, Tiered>(k, v, cache_k, cache_v, scale_k, scale_v, token,
+                                                   kv_head, physical_page,
+                                                   position & kPagedKVPageMask, lane);
 }
 
 template <typename Geometry, typename Metadata>

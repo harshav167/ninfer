@@ -16,6 +16,7 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <memory>
 #include "core/decode_graph.h"
 #include "core/device.h"
 #include <span>
@@ -471,9 +472,9 @@ std::uint8_t encode_e2m1_rne_satfinite(float value) {
             const float lower_value  = decode_e2m1(lower);
             const float lower_error  = magnitude - lower_value;
             const float upper_error  = upper_value - magnitude;
-            selected                 = lower_error < upper_error   ? lower
-                                       : upper_error < lower_error ? upper
-                                                                   : ((lower & 1U) == 0U ? lower : upper);
+            selected = lower_error < upper_error   ? lower
+                       : upper_error < lower_error ? upper
+                                                   : ((lower & 1U) == 0U ? lower : upper);
             break;
         }
     }
@@ -698,8 +699,8 @@ HostCache make_cache(const Geometry& geometry, KvCacheStorage storage, std::int3
                     cache_index(geometry, logical_capacity, head, position, 0);
                 const std::size_t k_scale =
                     fp8_scale_index(geometry, logical_capacity, head, position);
-                const std::size_t v_code  = logical_plane_index(kNvfp4CodeBytes, geometry,
-                                                                logical_capacity, head, position, 0);
+                const std::size_t v_code = logical_plane_index(kNvfp4CodeBytes, geometry,
+                                                               logical_capacity, head, position, 0);
                 const std::size_t v_scale = logical_plane_index(
                     kNvfp4QuantGroups, geometry, logical_capacity, head, position, 0);
                 encode_fp8_rotated_row(logical_k, source, cache.k_fp8, source, cache.k_scale,
@@ -1064,19 +1065,19 @@ public:
         if (storage_ == KvCacheStorage::BFloat16) {
             const auto k_physical = copy_from_guarded<std::uint16_t>(k_, k_code_elements_);
             const auto v_physical = copy_from_guarded<std::uint16_t>(v_, v_code_elements_);
-            cache.k_bf16          = gather_paged<std::uint16_t>(k_physical, kHeadDim, geometry_,
-                                                                logical_capacity_, block_table_host_);
-            cache.v_fp16          = gather_paged<std::uint16_t>(v_physical, kHeadDim, geometry_,
-                                                                logical_capacity_, block_table_host_);
+            cache.k_bf16 = gather_paged<std::uint16_t>(k_physical, kHeadDim, geometry_,
+                                                       logical_capacity_, block_table_host_);
+            cache.v_fp16 = gather_paged<std::uint16_t>(v_physical, kHeadDim, geometry_,
+                                                       logical_capacity_, block_table_host_);
         } else if (storage_ == KvCacheStorage::Int8Group64) {
             const auto k_physical  = copy_from_guarded<std::int8_t>(k_, k_code_elements_);
             const auto v_physical  = copy_from_guarded<std::int8_t>(v_, v_code_elements_);
             const auto ks_physical = copy_from_guarded<std::uint16_t>(k_scale_, k_scale_elements_);
             const auto vs_physical = copy_from_guarded<std::uint16_t>(v_scale_, v_scale_elements_);
-            cache.k_i8             = gather_paged<std::int8_t>(k_physical, kHeadDim, geometry_,
-                                                               logical_capacity_, block_table_host_);
-            cache.v_i8             = gather_paged<std::int8_t>(v_physical, kHeadDim, geometry_,
-                                                               logical_capacity_, block_table_host_);
+            cache.k_i8    = gather_paged<std::int8_t>(k_physical, kHeadDim, geometry_,
+                                                      logical_capacity_, block_table_host_);
+            cache.v_i8    = gather_paged<std::int8_t>(v_physical, kHeadDim, geometry_,
+                                                      logical_capacity_, block_table_host_);
             cache.k_scale = gather_paged<std::uint16_t>(ks_physical, kQuantGroups, geometry_,
                                                         logical_capacity_, block_table_host_);
             cache.v_scale = gather_paged<std::uint16_t>(vs_physical, kQuantGroups, geometry_,
@@ -1086,10 +1087,10 @@ public:
             const auto v_physical  = copy_from_guarded<std::uint8_t>(v_, v_code_elements_);
             const auto ks_physical = copy_from_guarded<std::uint16_t>(k_scale_, k_scale_elements_);
             const auto vs_physical = copy_from_guarded<std::uint16_t>(v_scale_, v_scale_elements_);
-            cache.k_fp8            = gather_paged<std::uint8_t>(k_physical, kHeadDim, geometry_,
-                                                                logical_capacity_, block_table_host_);
-            cache.v_fp8            = gather_paged<std::uint8_t>(v_physical, kHeadDim, geometry_,
-                                                                logical_capacity_, block_table_host_);
+            cache.k_fp8   = gather_paged<std::uint8_t>(k_physical, kHeadDim, geometry_,
+                                                       logical_capacity_, block_table_host_);
+            cache.v_fp8   = gather_paged<std::uint8_t>(v_physical, kHeadDim, geometry_,
+                                                       logical_capacity_, block_table_host_);
             cache.k_scale = gather_paged<std::uint16_t>(ks_physical, kFp8QuantGroups, geometry_,
                                                         logical_capacity_, block_table_host_);
             cache.v_scale = gather_paged<std::uint16_t>(vs_physical, kFp8QuantGroups, geometry_,
@@ -1099,8 +1100,8 @@ public:
             const auto v_physical  = copy_from_guarded<std::uint8_t>(v_, v_code_elements_);
             const auto ks_physical = copy_from_guarded<std::uint16_t>(k_scale_, k_scale_elements_);
             const auto vs_physical = copy_from_guarded<std::uint8_t>(v_scale_, v_scale_elements_);
-            cache.k_fp8            = gather_paged<std::uint8_t>(k_physical, kHeadDim, geometry_,
-                                                                logical_capacity_, block_table_host_);
+            cache.k_fp8   = gather_paged<std::uint8_t>(k_physical, kHeadDim, geometry_,
+                                                       logical_capacity_, block_table_host_);
             cache.v_nvfp4 = gather_paged<std::uint8_t>(v_physical, kNvfp4CodeBytes, geometry_,
                                                        logical_capacity_, block_table_host_);
             cache.k_scale = gather_paged<std::uint16_t>(ks_physical, kFp8QuantGroups, geometry_,
@@ -1717,18 +1718,88 @@ void inject_codec_edges(const Geometry& geometry, std::int32_t tokens, std::vect
     v[kv_input_index(geometry, geometry.kv_heads - 1, 0, tokens - 1)] = 1.0f;
 }
 
+// Separate allocations make an accidentally unstaged read fail the independent
+// attention oracle instead of aliasing the original contiguous backing.
+class StagedCache {
+public:
+    explicit StagedCache(PagedKVBatchLayerView full) : original_(full), view_(full) {
+        if ((full.storage != KvCacheStorage::Fp8KeyNvfp4Value &&
+             full.storage != KvCacheStorage::Fp8E4M3Row256) ||
+            full.k_pages.ne[3] < 2) {
+            throw std::invalid_argument("staged test requires multiple FP8 or K8V4 pages");
+        }
+        full_            = {full.k_pages, full.v_pages, full.k_scale_pages, full.v_scale_pages};
+        const auto split = full.k_pages.ne[3] / 2;
+        for (std::size_t p = 0; p < 4; ++p) {
+            resident_[p]       = full_[p].slice(3, 0, split);
+            tail_[p]           = full_[p].slice(3, split, full.k_pages.ne[3] - split);
+            local_storage_[p]  = std::make_unique<GuardedDeviceBuffer>(resident_[p].bytes());
+            staged_storage_[p] = std::make_unique<GuardedDeviceBuffer>(tail_[p].bytes());
+            CUDA_CHECK(cudaMemcpy(local_storage_[p]->data(), resident_[p].data,
+                                  resident_[p].bytes(), cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(staged_storage_[p]->data(), tail_[p].data, tail_[p].bytes(),
+                                  cudaMemcpyDeviceToDevice));
+            resident_[p].data = local_storage_[p]->data();
+            tail_[p].data     = staged_storage_[p]->data();
+        }
+        view_.k_pages       = resident_[0];
+        view_.v_pages       = resident_[1];
+        view_.k_scale_pages = resident_[2];
+        view_.v_scale_pages = resident_[3];
+        view_.staged        = {tail_[0], tail_[1], tail_[2], tail_[3]};
+    }
+
+    PagedKVBatchLayerView batch_view() const { return view_; }
+
+    PagedKVLayerView view() const {
+        return {.k_pages       = view_.k_pages,
+                .v_pages       = view_.v_pages,
+                .k_scale_pages = view_.k_scale_pages,
+                .v_scale_pages = view_.v_scale_pages,
+                .block_table   = view_.block_tables.view({view_.block_tables.ne[0]}),
+                .head_dim      = view_.head_dim,
+                .num_kv_heads  = view_.num_kv_heads,
+                .storage       = view_.storage,
+                .staged        = view_.staged};
+    }
+
+    void merge() const {
+        cuda_synchronize();
+        for (std::size_t p = 0; p < 4; ++p) {
+            CUDA_CHECK(cudaMemcpy(full_[p].data, resident_[p].data, resident_[p].bytes(),
+                                  cudaMemcpyDeviceToDevice));
+            CUDA_CHECK(cudaMemcpy(static_cast<std::byte*>(full_[p].data) + resident_[p].bytes(),
+                                  tail_[p].data, tail_[p].bytes(), cudaMemcpyDeviceToDevice));
+        }
+        cuda_synchronize();
+    }
+
+    int guards(const std::string& label) const {
+        int failures = 0;
+        for (std::size_t p = 0; p < 4; ++p) {
+            failures += local_storage_[p]->verify_guards((label + " resident").c_str());
+            failures += staged_storage_[p]->verify_guards((label + " staged").c_str());
+        }
+        return failures;
+    }
+private:
+    PagedKVBatchLayerView original_, view_;
+    std::array<Tensor, 4> full_, resident_, tail_;
+    std::array<std::unique_ptr<GuardedDeviceBuffer>, 4> local_storage_, staged_storage_;
+};
+
 int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const AttentionCase& test_case,
-                MappingPattern mapping) {
+                MappingPattern mapping, bool use_staging = false) {
     const std::int32_t total       = test_case.base + test_case.tokens;
     const std::int32_t max_context = static_cast<std::int32_t>(
         std::max<std::uint32_t>(static_cast<std::uint32_t>(total + 3), test_case.envelope_max));
-    const std::size_t q_elements = static_cast<std::size_t>(kHeadDim) *
-                                   static_cast<std::size_t>(geometry.q_heads) *
-                                   static_cast<std::size_t>(test_case.tokens);
+    const std::size_t q_elements  = static_cast<std::size_t>(kHeadDim) *
+                                    static_cast<std::size_t>(geometry.q_heads) *
+                                    static_cast<std::size_t>(test_case.tokens);
     const std::size_t kv_elements = static_cast<std::size_t>(kHeadDim) *
                                     static_cast<std::size_t>(geometry.kv_heads) *
                                     static_cast<std::size_t>(test_case.tokens);
-    std::vector<float> q = make_bf16_values(q_elements, test_case.seed, -0.25f, 0.25f);
+    std::vector<float> q          = make_bf16_values(q_elements, test_case.seed, -0.25f, 0.25f);
     if (test_case.zero_q) std::fill(q.begin(), q.end(), 0.0f);
     std::vector<float> k = make_bf16_values(kv_elements, test_case.seed + 1u, -0.25f, 0.25f);
     std::vector<float> v = make_bf16_values(kv_elements, test_case.seed + 2u, -1.0f, 1.0f);
@@ -1745,6 +1816,8 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     append_cache(expected, k, v, positions);
     const std::vector<double> reference = ideal_attention(q, expected, positions);
     DeviceCache cache(initial, mapping);
+    std::optional<StagedCache> staged;
+    if (use_staging) { staged.emplace(cache.batch_view()); }
 
     const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
     const std::vector<std::uint16_t> k_bits = to_bf16_bits(k);
@@ -1779,9 +1852,11 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
         [&](cudaStream_t stream) {
             ops::causal_softmax_attention(tq, tk, tv, tp, Tensor{}, ttable_row,
                                           op_geometry(geometry), kAttentionScale,
-                                          cache.batch_view(), envelope, workspace, tout, stream);
+                                          staged ? staged->batch_view() : cache.batch_view(),
+                                          envelope, workspace, tout, stream);
         },
         test_case.graph_replay);
+    if (staged) { staged->merge(); }
 
     const std::string label =
         case_label("causal_softmax_attention", geometry, storage, test_case, mapping);
@@ -1813,18 +1888,19 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
         ++failures;
     }
     failures += cache.verify_guards(label);
+    if (staged) { failures += staged->guards(label); }
     return failures;
 }
 
 int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const AttentionCase& test_case,
-                MappingPattern mapping) {
+                MappingPattern mapping, bool use_staging = false) {
     const std::int32_t total       = test_case.base + test_case.tokens;
     const std::int32_t max_context = static_cast<std::int32_t>(
         std::max<std::uint32_t>(static_cast<std::uint32_t>(total + 3), test_case.envelope_max));
     const std::size_t q_elements = static_cast<std::size_t>(kHeadDim) *
                                    static_cast<std::size_t>(geometry.q_heads) *
                                    static_cast<std::size_t>(test_case.tokens);
-    std::vector<float> q = make_bf16_values(q_elements, test_case.seed, -0.25f, 0.25f);
+    std::vector<float> q         = make_bf16_values(q_elements, test_case.seed, -0.25f, 0.25f);
     if (test_case.zero_q) std::fill(q.begin(), q.end(), 0.0f);
     std::vector<std::int32_t> positions(static_cast<std::size_t>(test_case.tokens));
     for (std::int32_t token = 0; token < test_case.tokens; ++token) {
@@ -1836,6 +1912,8 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     const HostCache cache_host = make_cache(geometry, storage, max_context, test_case.seed + 10u);
     const std::vector<double> reference = ideal_attention(q, cache_host, positions);
     DeviceCache cache(cache_host, mapping);
+    std::optional<StagedCache> staged;
+    if (use_staging) { staged.emplace(cache.batch_view()); }
 
     const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
     GuardedDeviceBuffer dq(q_bits.size() * sizeof(std::uint16_t));
@@ -1857,9 +1935,11 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     launch_attention_case(
         [&](cudaStream_t stream) {
             ops::causal_softmax_attention_cached(tq, tp, op_geometry(geometry), kAttentionScale,
-                                                 cache.view(), envelope, workspace, tout, stream);
+                                                 staged ? staged->view() : cache.view(), envelope,
+                                                 workspace, tout, stream);
         },
         test_case.graph_replay);
+    if (staged) { staged->merge(); }
 
     const std::string label =
         case_label("causal_softmax_attention_cached", geometry, storage, test_case, mapping);
@@ -1877,6 +1957,7 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
         ++failures;
     }
     failures += cache.verify_guards(label);
+    if (staged) { failures += staged->guards(label); }
     return failures;
 }
 
@@ -1931,7 +2012,7 @@ int verify_invalid_columns_zero(const std::string& label, std::span<const std::u
 }
 
 int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
-                   const BatchAttentionCase& test_case) {
+                   const BatchAttentionCase& test_case, bool use_staging = false) {
     const int batch = test_case.contexts.size(), width = test_case.width;
     const int pool_rows = std::max(
         batch, *std::max_element(test_case.table_rows.begin(), test_case.table_rows.end()) + 1);
@@ -1955,6 +2036,13 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
             make_cache(geometry, storage, maximum_visible + 3, test_case.seed + 20u + 3u * row));
     auto expected = initial;
     BatchDeviceCache cache(initial, test_case.mapping);
+    std::optional<StagedCache> staged;
+    if (use_staging) {
+        if (test_case.graph_replay) {
+            throw std::invalid_argument("active staging test uses eager execution");
+        }
+        staged.emplace(cache.view());
+    }
     std::optional<BatchDeviceCache> control;
     if (test_case.graph_replay) control.emplace(initial, test_case.mapping);
     GuardedDeviceBuffer dq(q.size() * 2), dk(k.size() * 2), dv(v.size() * 2), dp(columns * 4),
@@ -1975,8 +2063,9 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
                                     [&](int count) { return count != width; });
     const auto launch = [&] {
         ops::causal_softmax_attention(tq, tk, tv, tp, masked ? tvalid : Tensor{}, tlanes,
-                                      op_geometry(geometry), kAttentionScale, cache.view(),
-                                      envelope, workspace, tout, device.stream);
+                                      op_geometry(geometry), kAttentionScale,
+                                      staged ? staged->batch_view() : cache.view(), envelope,
+                                      workspace, tout, device.stream);
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;
@@ -2037,10 +2126,11 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
         else
             launch();
         cuda_synchronize(device.stream);
+        if (staged) { staged->merge(); }
         const std::string label = std::string("causal batch ") + geometry.name + " " +
                                   cache_name(storage) + " W=" + std::to_string(width) +
                                   " B=" + std::to_string(batch) + " phase=" + std::to_string(phase);
-        const auto output = copy_from_guarded<std::uint16_t>(dout, q.size());
+        const auto output       = copy_from_guarded<std::uint16_t>(dout, q.size());
         failures += verify_attention(label, bf16_bits_to_double(output), reference,
                                      attention_criterion(storage));
         failures += verify_invalid_columns_zero(label, output, geometry, width, valid);
@@ -2072,6 +2162,7 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
                     verify_positions(label + " counts unchanged", dvalid, valid) +
                     verify_positions(label + " lanes unchanged", dlanes, lanes);
         failures += dout.verify_guards(label) + scratch.verify_guards(label);
+        if (staged) { failures += staged->guards(label); }
         if (workspace.used() != 0 || workspace.peak_used() != capacity) {
             std::cerr << label << ": workspace mismatch\n";
             ++failures;
@@ -2298,11 +2389,27 @@ int run_fp8_cases() {
                                 MappingPattern::Offset);
         failures += run_a1_case(geometry, KvCacheStorage::Fp8E4M3Row256, {6, 61, 192, 605u},
                                 MappingPattern::Fragmented);
+        failures += run_a1_case(geometry, KvCacheStorage::Fp8E4M3Row256, {8, 61, 192, 951u},
+                                MappingPattern::Fragmented, true);
+        failures += run_a1_case(geometry, KvCacheStorage::Fp8E4M3Row256, {129, 63, 256, 952u},
+                                MappingPattern::Fragmented, true);
+        failures += run_a3_case(geometry, KvCacheStorage::Fp8E4M3Row256, {65, 63, 192, 953u},
+                                MappingPattern::Offset, true);
     }
     failures += run_a3_case(kGeometries[0], KvCacheStorage::Fp8E4M3Row256, {3, 63, 192, 606u},
                             MappingPattern::Identity);
     failures += run_a1_case(kGeometries[0], KvCacheStorage::Fp8E4M3Row256, {1, 16384, 16385, 607u},
                             MappingPattern::Fragmented);
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::Fp8E4M3Row256, {1024, 0, 1088, 954u},
+                            MappingPattern::Fragmented, true);
+    failures += run_a3_case(kGeometries[0], KvCacheStorage::Fp8E4M3Row256, {1, 65535, 65536, 955u},
+                            MappingPattern::Fragmented, true);
+    failures +=
+        run_batch_case(kGeometries[0], KvCacheStorage::Fp8E4M3Row256,
+                       {8, {61, 4091}, {7, 5}, {1, 0}, MappingPattern::Fragmented, 956u}, true);
+    failures +=
+        run_batch_case(kGeometries[0], KvCacheStorage::Fp8E4M3Row256,
+                       {8, {63, 129}, {8, 0}, {0, 1}, MappingPattern::Fragmented, 957u}, true);
     return failures;
 }
 
@@ -2366,7 +2473,23 @@ int run_k8v4_cases() {
                                 MappingPattern::Offset);
         failures += run_a3_case(geometry, KvCacheStorage::Fp8KeyNvfp4Value, {1, 2048, 2049, 806u},
                                 MappingPattern::Fragmented);
+        failures += run_a1_case(geometry, KvCacheStorage::Fp8KeyNvfp4Value, {8, 61, 192, 901u},
+                                MappingPattern::Fragmented, true);
+        failures += run_a1_case(geometry, KvCacheStorage::Fp8KeyNvfp4Value, {129, 63, 256, 902u},
+                                MappingPattern::Fragmented, true);
+        failures += run_a3_case(geometry, KvCacheStorage::Fp8KeyNvfp4Value, {65, 63, 192, 903u},
+                                MappingPattern::Offset, true);
     }
+    failures += run_a1_case(kGeometries[0], KvCacheStorage::Fp8KeyNvfp4Value, {1024, 0, 1088, 904u},
+                            MappingPattern::Fragmented, true);
+    failures += run_a3_case(kGeometries[0], KvCacheStorage::Fp8KeyNvfp4Value,
+                            {1, 65535, 65536, 905u}, MappingPattern::Fragmented, true);
+    failures +=
+        run_batch_case(kGeometries[0], KvCacheStorage::Fp8KeyNvfp4Value,
+                       {8, {61, 4091}, {7, 5}, {1, 0}, MappingPattern::Fragmented, 906u}, true);
+    failures +=
+        run_batch_case(kGeometries[0], KvCacheStorage::Fp8KeyNvfp4Value,
+                       {8, {63, 129}, {8, 0}, {0, 1}, MappingPattern::Fragmented, 907u}, true);
     failures += run_a1_case(kGeometries[0], KvCacheStorage::Fp8KeyNvfp4Value,
                             {1, 64, 65, 807u, false, true}, MappingPattern::Fragmented);
     failures += run_a3_case(kGeometries[0], KvCacheStorage::Fp8KeyNvfp4Value,
@@ -2448,6 +2571,15 @@ int run_softmax_attention_k8v4_tests() {
     failures += report_quantization_quality(KvCacheStorage::Fp8KeyNvfp4Value, 819u);
     std::cout << (failures == 0 ? "PASS" : "FAIL")
               << " causal_softmax_attention k8v4 independent correctness\n";
+    return failures == 0 ? 0 : 1;
+}
+
+int run_softmax_attention_fp8_tests() {
+    if (cuda_unavailable()) { return 77; }
+    int failures = run_fp8_cases();
+    failures += run_quantized_batch_cases(KvCacheStorage::Fp8E4M3Row256, 960u);
+    std::cout << (failures == 0 ? "PASS" : "FAIL")
+              << " causal_softmax_attention fp8 independent correctness\n";
     return failures == 0 ? 0 : 1;
 }
 

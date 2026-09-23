@@ -145,8 +145,9 @@ HostKVAllocationView HostKVAllocationView::subview(std::uint32_t begin, std::uin
     if (!valid() || count == 0 || begin > page_count_ || count > page_count_ - begin) {
         throw std::out_of_range("Host KV subview is outside its allocation");
     }
-    return HostKVAllocationView(
-        handle_, data_ + static_cast<std::size_t>(begin) * layout_->page_stride, layout_, count);
+    return HostKVAllocationView(handle_,
+                                data_ + static_cast<std::size_t>(begin) * layout_->page_stride,
+                                layout_, count, backing_);
 }
 
 bool HostKVAllocationConstView::valid() const noexcept {
@@ -163,8 +164,9 @@ HostKVAllocationConstView HostKVAllocationConstView::subview(std::uint32_t begin
     if (!valid() || count == 0 || begin > page_count_ || count > page_count_ - begin) {
         throw std::out_of_range("Host KV subview is outside its allocation");
     }
-    return HostKVAllocationConstView(
-        handle_, data_ + static_cast<std::size_t>(begin) * layout_->page_stride, layout_, count);
+    return HostKVAllocationConstView(handle_,
+                                     data_ + static_cast<std::size_t>(begin) * layout_->page_stride,
+                                     layout_, count, backing_);
 }
 
 HostKVAllocation::~HostKVAllocation() { (void)release(); }
@@ -209,7 +211,8 @@ void HostKVAllocation::disarm() noexcept {
 }
 
 HostKVArena::HostKVArena(std::size_t capacity_bytes,
-                         std::span<const HostKVPageLayout> supported_layouts)
+                         std::span<const HostKVPageLayout> supported_layouts,
+                         std::optional<int> secondary_device)
     : capacity_bytes_(capacity_bytes),
       layouts_(supported_layouts.begin(), supported_layouts.end()) {
     for (std::size_t index = 0; index < layouts_.size(); ++index) {
@@ -228,7 +231,7 @@ HostKVArena::HostKVArena(std::size_t capacity_bytes,
         throw std::invalid_argument("Non-empty Host KV arena requires supported page layouts");
     }
 
-    backing_.emplace(capacity_bytes_);
+    backing_.emplace(capacity_bytes_, secondary_device);
     const auto smallest = std::min_element(
         layouts_.begin(), layouts_.end(), [](const HostKVPageLayout& a, const HostKVPageLayout& b) {
             return a.page_stride < b.page_stride;
@@ -325,7 +328,7 @@ std::optional<HostKVAllocationRecipe> HostKVArena::plan_after_releases(
     std::vector<FreeExtent> simulated = free_extents_;
     const auto insert_extent          = [&](FreeExtent extent) {
         const auto position = std::lower_bound(simulated.begin(), simulated.end(), extent.offset,
-                                                        [](const FreeExtent& candidate, std::size_t offset) {
+                                               [](const FreeExtent& candidate, std::size_t offset) {
                                                    return candidate.offset < offset;
                                                });
         auto inserted       = simulated.insert(position, extent);
@@ -392,7 +395,7 @@ bool HostKVArena::can_allocate_after_suballocation_releases(
     std::vector<FreeExtent> simulated = free_extents_;
     const auto insert_extent          = [&](FreeExtent extent) {
         const auto position = std::lower_bound(simulated.begin(), simulated.end(), extent.offset,
-                                                        [](const FreeExtent& candidate, std::size_t offset) {
+                                               [](const FreeExtent& candidate, std::size_t offset) {
                                                    return candidate.offset < offset;
                                                });
         auto inserted       = simulated.insert(position, extent);
@@ -584,7 +587,7 @@ HostKVAllocationView HostKVArena::writable_view(HostKVAllocation& allocation) {
     }
     const Descriptor& descriptor = descriptors_[allocation.descriptor_];
     return HostKVAllocationView(allocation.handle(), allocation_data(descriptor),
-                                &layouts_[descriptor.layout], descriptor.pages);
+                                &layouts_[descriptor.layout], descriptor.pages, &*backing_);
 }
 
 HostKVAllocationConstView HostKVArena::view(const HostKVAllocation& allocation) const {
@@ -593,7 +596,7 @@ HostKVAllocationConstView HostKVArena::view(const HostKVAllocation& allocation) 
     }
     const Descriptor& descriptor = descriptors_[allocation.descriptor_];
     return HostKVAllocationConstView(allocation.handle(), allocation_data(descriptor),
-                                     &layouts_[descriptor.layout], descriptor.pages);
+                                     &layouts_[descriptor.layout], descriptor.pages, &*backing_);
 }
 
 bool HostKVArena::valid_handle(HostKVAllocationHandle handle) const noexcept {

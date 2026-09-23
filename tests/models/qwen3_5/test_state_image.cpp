@@ -129,7 +129,8 @@ void expect_zero_slot(q36::StateImageDevicePool& pool, std::int32_t slot, std::s
     }
 }
 
-void test_host_roundtrip(bool dflash, ninfer::DeviceContext& device, bool dflash2 = false) {
+void test_host_roundtrip(bool dflash, ninfer::DeviceContext& device, bool dflash2 = false,
+                         std::optional<int> secondary_device = std::nullopt) {
     PlannedPool planned = plan_pool(dflash, 2, dflash2);
     if (dflash2) {
         expect(q36::dflash_local_transfer_work(planned.layout.host).payload_bytes ==
@@ -141,7 +142,7 @@ void test_host_roundtrip(bool dflash, ninfer::DeviceContext& device, bool dflash
     fill_slot(pool, 0, dflash ? 0x19 : 0x25);
     pool.zero_slot(1, device.stream);
 
-    q36::HostStatePool host(planned.layout.host, 1);
+    q36::HostStatePool host(planned.layout.host, 1, secondary_device);
     const auto handle = host.allocate();
     expect(handle.has_value(), "HostStatePool allocates its fixed slot");
     expect(!host.allocate().has_value(), "HostStatePool reports capacity exhaustion");
@@ -213,6 +214,13 @@ int main() {
     test_host_roundtrip(false, device);
     test_host_roundtrip(true, device);
     test_host_roundtrip(true, device, true);
+    if (count >= 2) {
+        test_host_roundtrip(false, device, false, 1);
+        test_host_roundtrip(true, device, true, 1);
+        int restored_device = -1;
+        CUDA_CHECK(cudaGetDevice(&restored_device));
+        expect(restored_device == 0, "secondary state transfers restore the inference device");
+    }
 
     return failures == 0 ? 0 : 1;
 }

@@ -106,7 +106,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     const auto logical_page_capacity = [&](const DeviceKVPagePool& pool) {
         const HostKVPageLayout host_layout = plan_host_kv_page_layout(pool.geometry());
         const std::uint64_t host_pages =
-            plan.context_cache.host_kv_capacity_bytes / host_layout.page_stride;
+            plan.context_cache.offload_kv_capacity_bytes() / host_layout.page_stride;
         const std::uint64_t total = static_cast<std::uint64_t>(pool.capacity_pages()) + host_pages;
         if (total > std::numeric_limits<std::uint32_t>::max()) {
             throw std::overflow_error("Qwen3.5 logical KV page capacity exceeds uint32");
@@ -124,19 +124,23 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         decoder->text_kv.execution_tables().logical_page_capacity());
     state_images =
         std::make_unique<qwen3_5::StateImageDevicePool>(backing, plan.persistent.state_images);
-    if (plan.context_cache.host_state_slots != 0) {
+    const StartupObserver silent_offload_observer;
+    const StartupObserver& offload_observer =
+        plan.context_cache.secondary_cache_device ? silent_offload_observer : startup_observer;
+    if (plan.context_cache.offload_state_slots() != 0) {
         const std::uint64_t host_state_bytes =
             static_cast<std::uint64_t>(state_images->host_layout().image_bytes) *
-            plan.context_cache.host_state_slots;
-        StartupPhaseScope host_state_phase(startup_observer, StartupPhase::HostStatePin,
+            plan.context_cache.offload_state_slots();
+        StartupPhaseScope host_state_phase(offload_observer, StartupPhase::HostStatePin,
                                            StartupProgressUnit::Bytes, host_state_bytes);
         host_state_images = std::make_unique<qwen3_5::HostStatePool>(
-            state_images->host_layout(), plan.context_cache.host_state_slots);
+            state_images->host_layout(), plan.context_cache.offload_state_slots(),
+            plan.context_cache.secondary_cache_device);
         host_state_phase.complete(host_state_bytes, host_state_bytes);
     }
     const std::uint64_t logical_state_capacity =
         static_cast<std::uint64_t>(state_images->slot_count()) +
-        plan.context_cache.host_state_slots;
+        plan.context_cache.offload_state_slots();
     if (logical_state_capacity > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("Qwen3.5 logical StateImage capacity exceeds uint32");
     }
@@ -184,7 +188,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         pressure_backend_page_scratch_.resize(backend_kv_pages->capacity());
         pressure_backend_selected_pages_.reserve(backend_kv_pages->capacity());
     }
-    if (plan.context_cache.host_kv_capacity_bytes != 0) {
+    if (plan.context_cache.offload_kv_capacity_bytes() != 0) {
         std::vector<HostKVPageLayout> layouts;
         layouts.push_back(plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry()));
         if (const qwen3_5::PagedKVCache* backend = backend_kv_cache()) {
@@ -193,20 +197,21 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             if (backend_layout != layouts.front()) { layouts.push_back(std::move(backend_layout)); }
         }
         StartupPhaseScope host_kv_phase(
-            startup_observer, StartupPhase::HostKvPin, StartupProgressUnit::Bytes,
-            static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes));
+            offload_observer, StartupPhase::HostKvPin, StartupProgressUnit::Bytes,
+            static_cast<std::uint64_t>(plan.context_cache.offload_kv_capacity_bytes()));
         host_kv_arena = std::make_unique<HostKVArena>(
-            plan.context_cache.host_kv_capacity_bytes,
-            std::span<const HostKVPageLayout>(layouts.data(), layouts.size()));
+            plan.context_cache.offload_kv_capacity_bytes(),
+            std::span<const HostKVPageLayout>(layouts.data(), layouts.size()),
+            plan.context_cache.secondary_cache_device);
         host_kv_phase.complete(
-            static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes),
-            static_cast<std::uint64_t>(plan.context_cache.host_kv_capacity_bytes));
+            static_cast<std::uint64_t>(plan.context_cache.offload_kv_capacity_bytes()),
+            static_cast<std::uint64_t>(plan.context_cache.offload_kv_capacity_bytes()));
         std::size_t minimum_stride = layouts.front().page_stride;
         for (const HostKVPageLayout& layout : layouts) {
             minimum_stride = std::min(minimum_stride, layout.page_stride);
         }
         const std::size_t extent_capacity =
-            plan.context_cache.host_kv_capacity_bytes / minimum_stride;
+            plan.context_cache.offload_kv_capacity_bytes() / minimum_stride;
         if (extent_capacity > std::numeric_limits<std::uint32_t>::max()) {
             throw std::overflow_error("Qwen3.5 Host KV extent capacity exceeds uint32");
         }
@@ -390,12 +395,12 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             Tensor hidden     = score_hidden->slice(1, 0, columns);
             execution::project(hidden, parameters.text.output_head, logits, work, device.stream);
             CUDA_CHECK(cudaMemcpyAsync(target_ids.data, staged_targets.data(), target_ids.bytes(),
-                                                    cudaMemcpyHostToDevice, device.stream));
+                                       cudaMemcpyHostToDevice, device.stream));
             ops::target_logprobs(logits, target_ids,
-                                              dimension(parameters.model.resources().public_token_count),
-                                              logprobs, device.stream);
+                                 dimension(parameters.model.resources().public_token_count),
+                                 logprobs, device.stream);
             CUDA_CHECK(cudaMemcpyAsync(score_logprobs_host->data(), logprobs.data, logprobs.bytes(),
-                                                    cudaMemcpyDeviceToHost, device.stream));
+                                       cudaMemcpyDeviceToHost, device.stream));
             device.synchronize();
             const auto* host = static_cast<const float*>(score_logprobs_host->data());
             output.insert(output.end(), host, host + staged_columns);
@@ -544,6 +549,14 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     out.workspace_logical_peak_bytes = workspace_logical_peak_bytes;
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
     out.kv_payload_bytes             = kv_payload_bytes;
+    out.active_kv_resident_tokens =
+        decoder->text_kv.page_pool().resident_capacity_pages() * kPagedKVPageSize;
+    if (const auto* overflow = decoder->text_kv.page_pool().overflow_buffer()) {
+        out.active_kv_secondary_device     = overflow->secondary_device();
+        out.active_kv_secondary_bytes      = overflow->size();
+        out.active_kv_device_staging_bytes = decoder->text_kv.active_staging_bytes();
+        out.active_kv_host_staging_bytes   = overflow->staging_bytes();
+    }
     if (host_state_images) {
         out.host_state_capacity_slots = host_state_images->capacity();
         out.host_state_occupied_slots = host_state_images->occupied();
@@ -551,6 +564,15 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     if (host_kv_arena) {
         out.host_kv_capacity_bytes = host_kv_arena->capacity_bytes();
         out.host_kv_occupied_bytes = host_kv_arena->occupied_bytes();
+    }
+    if (context_cache.secondary_cache_device) {
+        out.secondary_cache_device         = *context_cache.secondary_cache_device;
+        out.secondary_state_capacity_slots = std::exchange(out.host_state_capacity_slots, 0);
+        out.secondary_state_occupied_slots = std::exchange(out.host_state_occupied_slots, 0);
+        out.secondary_kv_capacity_bytes    = std::exchange(out.host_kv_capacity_bytes, 0);
+        out.secondary_kv_occupied_bytes    = std::exchange(out.host_kv_occupied_bytes, 0);
+        out.secondary_staging_bytes = (host_state_images ? host_state_images->staging_bytes() : 0) +
+                                      (host_kv_arena ? host_kv_arena->staging_bytes() : 0);
     }
     return out;
 }

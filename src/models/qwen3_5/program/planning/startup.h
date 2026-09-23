@@ -83,6 +83,7 @@ struct SequencePlanningInputs {
     bool causal_scoring = false;
     int device          = 0;
     ContextCacheOptions context_cache;
+    ActiveKvOverflowOptions active_kv;
 };
 
 } // namespace ninfer::models::qwen3_5::detail
@@ -105,6 +106,7 @@ struct SequencePlanImpl {
     bool causal_scoring = false;
     int device          = 0;
     ContextCacheOptions context_cache;
+    ActiveKvOverflowOptions active_kv;
     PersistentLayout persistent;
     WorkspacePlan workspace;
     std::size_t graph_allowance_bytes    = 0;

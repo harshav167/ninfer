@@ -530,6 +530,8 @@ struct FakePhysicalUsage {
     std::uint32_t device_main_kv_pages    = 0;
     std::uint32_t device_backend_kv_pages = 0;
     std::size_t host_kv_bytes             = 0;
+    std::uint64_t active_kv_read_bytes    = 0;
+    std::uint64_t active_kv_write_bytes   = 0;
 };
 
 class FakeProgram;
@@ -711,9 +713,9 @@ public:
             target_feasible(std::span<const FakeTargetDecision>{})
                 ? ninfer::runtime::MaterializationPhysicalStatus::Feasible
                 : ninfer::runtime::MaterializationPhysicalStatus::Infeasible;
-        plan.identity.source_mode = plan.source_mode;
-        plan.identity.expandable  = plan.identity.physical_status !=
-                                   ninfer::runtime::MaterializationPhysicalStatus::Feasible;
+        plan.identity.source_mode     = plan.source_mode;
+        plan.identity.expandable      = plan.identity.physical_status !=
+                                        ninfer::runtime::MaterializationPhysicalStatus::Feasible;
         plan.identity.projection_work = 1;
         plan.identity.assessment_digest =
             (static_cast<std::uint64_t>(plan.value.reusable_prompt_tokens) << 32U) ^
@@ -857,7 +859,7 @@ public:
                     if (!action.evicts_continuation) {
                         const std::uint32_t owner = pending_plan_->shared_owner_ids[index];
                         victim.final_summary      = FakeSharedPrefixSummary{
-                                 .checkpoint = shared_checkpoint(owner, finish_frontier),
+                            .checkpoint = shared_checkpoint(owner, finish_frontier),
                         };
                     }
                     result.shared_victims.push_back(std::move(victim));
@@ -880,13 +882,13 @@ public:
                     handle.id          = next_shared_id_++;
                     handle.content_key = capture_assessment.shortlist_key.digest;
                     result.shared      = FakeSharedPrefixPublication{
-                             .handle = std::move(handle),
-                             .summary =
+                        .handle = std::move(handle),
+                        .summary =
                             FakeSharedPrefixSummary{
-                                     .checkpoint =
+                                .checkpoint =
                                     shared_checkpoint(capture_assessment.shortlist_key.digest,
-                                                           capture_assessment.shortlist_key.frontier),
-                                     .active_references = 1,
+                                                      capture_assessment.shortlist_key.frontier),
+                                .active_references = 1,
                             },
                     };
                 }
@@ -1684,8 +1686,8 @@ FakePressurePlanningSession::commit_expansion(FakePreparedPressureExpansion&& pr
     committed_children_.clear();
     std::uint32_t new_count = 0;
     for (Target& child : expansion_scratch_) {
-        auto found          = std::find_if(targets_.begin(), targets_.end(),
-                                           [&](const Target& prior) { return same_target(prior, child); });
+        auto found = std::find_if(targets_.begin(), targets_.end(),
+                                  [&](const Target& prior) { return same_target(prior, child); });
         std::uint32_t index = 0;
         if (found == targets_.end()) {
             child.stable_ordinal = static_cast<std::uint32_t>(targets_.size());
@@ -2136,7 +2138,7 @@ void test_machine_cost_changes_selection_without_changing_physical_assessment() 
     };
     const auto pressure_inputs = [] { return Planner::PressureInputs{}; };
     const auto logical_goal    = [](PlanningCandidateId, PrivateSourceMode,
-                                 std::span<const ninfer::runtime::PressureOwnerOutcome>)
+                                    std::span<const ninfer::runtime::PressureOwnerOutcome>)
         -> std::optional<Planner::LogicalGoal> {
         return Planner::LogicalGoal{.publication_slot = 0};
     };
@@ -3019,11 +3021,11 @@ void test_shared_capture_combines_two_pressure_owners() {
     program.required_pressure_actions    = 2;
     program.pressure_action_immediate_ns = 0;
     program.capture_assessment           = FakeCaptureAssessment{
-                  .shortlist_key          = FakeShortlistKey{.digest = 43, .frontier = 64},
-                  .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
-                  .protected_rebuild_work = PrefillWork{.tokens = 64},
-                  .publishes_shared       = true,
-                  .physically_feasible    = false,
+        .shortlist_key          = FakeShortlistKey{.digest = 43, .frontier = 64},
+        .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .protected_rebuild_work = PrefillWork{.tokens = 64},
+        .publishes_shared       = true,
+        .physically_feasible    = false,
     };
 
     const auto reserved =
@@ -3061,11 +3063,11 @@ void test_aborted_shared_capture_start_rolls_back_logical_claims() {
     program.required_pressure_actions    = 2;
     program.pressure_action_immediate_ns = 0;
     program.capture_assessment           = FakeCaptureAssessment{
-                  .shortlist_key          = FakeShortlistKey{.digest = 143, .frontier = 64},
-                  .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
-                  .protected_rebuild_work = PrefillWork{.tokens = 64},
-                  .publishes_shared       = true,
-                  .physically_feasible    = false,
+        .shortlist_key          = FakeShortlistKey{.digest = 143, .frontier = 64},
+        .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .protected_rebuild_work = PrefillWork{.tokens = 64},
+        .publishes_shared       = true,
+        .physically_feasible    = false,
     };
     program.abort_capture_start = true;
 
@@ -3110,11 +3112,11 @@ void test_capture_result_is_validated_before_any_adoption() {
     program.required_pressure_actions    = 2;
     program.pressure_action_immediate_ns = 0;
     program.capture_assessment           = FakeCaptureAssessment{
-                  .shortlist_key          = FakeShortlistKey{.digest = 243, .frontier = 64},
-                  .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
-                  .protected_rebuild_work = PrefillWork{.tokens = 64},
-                  .publishes_shared       = true,
-                  .physically_feasible    = false,
+        .shortlist_key          = FakeShortlistKey{.digest = 243, .frontier = 64},
+        .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .protected_rebuild_work = PrefillWork{.tokens = 64},
+        .publishes_shared       = true,
+        .physically_feasible    = false,
     };
     program.malform_last_capture_private_victim = true;
 
@@ -3154,11 +3156,11 @@ void test_capture_result_is_adopted_by_owner_identity() {
     program.pressure_action_immediate_ns = 0;
     program.reverse_pressure_results     = true;
     program.capture_assessment           = FakeCaptureAssessment{
-                  .shortlist_key          = FakeShortlistKey{.digest = 253, .frontier = 64},
-                  .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
-                  .protected_rebuild_work = PrefillWork{.tokens = 64},
-                  .publishes_shared       = true,
-                  .physically_feasible    = false,
+        .shortlist_key          = FakeShortlistKey{.digest = 253, .frontier = 64},
+        .shared_evidence        = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+        .protected_rebuild_work = PrefillWork{.tokens = 64},
+        .publishes_shared       = true,
+        .physically_feasible    = false,
     };
 
     require(manager.reserve_active_capture(program, active.lane, FakeCaptureOffer{.id = 27}, 0,
@@ -3320,11 +3322,11 @@ void test_complete_search_against_small_exhaustive_oracle() {
                 std::array<ninfer::runtime::MaterializationCheckpointPolicy, 3> checkpoints;
                 const std::array<unsigned, 3> weights{1, 4, 16};
                 for (unsigned i = 0; i < 3; ++i) {
-                    handles[i]     = FakeContinuationHandle{i + 1, 0};
-                    owners[i]      = &handles[i];
-                    ids[i]         = {.value = i};
-                    policies[i]    = {.owner                    = ids[i],
-                                      .private_retention_weight = weights[(i + weight_rotation) % 3]};
+                    handles[i]  = FakeContinuationHandle{i + 1, 0};
+                    owners[i]   = &handles[i];
+                    ids[i]      = {.value = i};
+                    policies[i] = {.owner                    = ids[i],
+                                   .private_retention_weight = weights[(i + weight_rotation) % 3]};
                     checkpoints[i] = {.owner       = ids[i],
                                       .checkpoint  = {.kind     = CheckpointKind::SessionEndpoint,
                                                       .frontier = 16,

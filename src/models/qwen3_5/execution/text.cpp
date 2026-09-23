@@ -156,7 +156,7 @@ private:
 void DFlashFeatureSink::begin(const Tensor& value) {
     const bool prefill = features != nullptr && positions != nullptr && batch_features == nullptr;
     const bool batch   = batch_features != nullptr && batch_lanes != nullptr &&
-                       batch_valid_columns != nullptr && batch_width > 0 && batch_size > 0;
+                         batch_valid_columns != nullptr && batch_width > 0 && batch_size > 0;
     if ((!prefill && !batch) || layers.empty()) {
         throw std::logic_error("DFlash feature sink is incomplete");
     }
@@ -330,18 +330,18 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     const int T    = x.ne[1];
 
     const auto projection = workspace::mtp_attention_projection(work_, config_, T);
-    Tensor q              = projection.query.view({dimension(config_.attention->head_dim),
-                                                   dimension(config_.attention->num_attention_heads), T});
-    Tensor k              = projection.key.view({dimension(config_.attention->head_dim),
-                                                 dimension(config_.attention->num_key_value_heads), T});
-    Tensor gate           = projection.gate.view({dimension(config_.attention->head_dim),
-                                                  dimension(config_.attention->num_attention_heads), T});
-    Tensor v              = projection.value.view({dimension(config_.attention->head_dim),
-                                                   dimension(config_.attention->num_key_value_heads), T});
-    Tensor q_flat         = q.view({dimension(config_.attention->query_width()), T});
-    Tensor gate_flat      = gate.view({dimension(config_.attention->query_width()), T});
-    Tensor k_flat         = k.view({dimension(config_.attention->key_width()), T});
-    Tensor v_flat         = v.view({dimension(config_.attention->key_width()), T});
+    Tensor q      = projection.query.view({dimension(config_.attention->head_dim),
+                                           dimension(config_.attention->num_attention_heads), T});
+    Tensor k      = projection.key.view({dimension(config_.attention->head_dim),
+                                         dimension(config_.attention->num_key_value_heads), T});
+    Tensor gate   = projection.gate.view({dimension(config_.attention->head_dim),
+                                          dimension(config_.attention->num_attention_heads), T});
+    Tensor v      = projection.value.view({dimension(config_.attention->head_dim),
+                                           dimension(config_.attention->num_key_value_heads), T});
+    Tensor q_flat = q.view({dimension(config_.attention->query_width()), T});
+    Tensor gate_flat = gate.view({dimension(config_.attention->query_width()), T});
+    Tensor k_flat    = k.view({dimension(config_.attention->key_width()), T});
+    Tensor v_flat    = v.view({dimension(config_.attention->key_width()), T});
     mtp_projection(ah, mtp_->projection, *config_.attention, q_flat, gate_flat, k_flat, v_flat,
                    work_, s);
 
@@ -493,8 +493,8 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         if (final_chunk) {
             const std::size_t column_bytes =
                 static_cast<std::size_t>(dimension(config_.hidden_size)) * dtype_size(DType::BF16);
-            const auto* x_src = static_cast<const unsigned char*>(x.data) +
-                                static_cast<std::size_t>(T - 1) * column_bytes;
+            const auto* x_src  = static_cast<const unsigned char*>(x.data) +
+                                 static_cast<std::size_t>(T - 1) * column_bytes;
             const auto* ah_src = static_cast<const unsigned char*>(ah.data) +
                                  static_cast<std::size_t>(T - 1) * column_bytes;
             CUDA_CHECK(
@@ -527,7 +527,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
             for (int axis = 0; axis < 3; ++axis) {
                 const auto* src = static_cast<const std::int32_t*>(rope_positions.data) +
                                   static_cast<std::size_t>(axis) * T + (T - 1);
-                auto* dst = static_cast<std::int32_t*>(last_rope_position.data) + axis;
+                auto* dst       = static_cast<std::int32_t*>(last_rope_position.data) + axis;
                 CUDA_CHECK(
                     cudaMemcpyAsync(dst, src, sizeof(std::int32_t), cudaMemcpyDeviceToDevice, s));
             }
@@ -849,15 +849,15 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     Tensor h              = projection.hidden;
     ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
 
-    Tensor q         = projection.query.view({dimension(config_.attention->head_dim),
-                                              dimension(config_.attention->num_attention_heads), T});
-    Tensor gate      = projection.gate.view({dimension(config_.attention->head_dim),
-                                             dimension(config_.attention->num_attention_heads), T});
-    Tensor k         = projection.key.view({dimension(config_.attention->head_dim),
-                                            dimension(config_.attention->num_key_value_heads), T});
-    Tensor v         = projection.value.view({dimension(config_.attention->head_dim),
-                                              dimension(config_.attention->num_key_value_heads), T});
-    Tensor q_flat    = q.view({dimension(config_.attention->query_width()), T});
+    Tensor q      = projection.query.view({dimension(config_.attention->head_dim),
+                                           dimension(config_.attention->num_attention_heads), T});
+    Tensor gate   = projection.gate.view({dimension(config_.attention->head_dim),
+                                          dimension(config_.attention->num_attention_heads), T});
+    Tensor k      = projection.key.view({dimension(config_.attention->head_dim),
+                                         dimension(config_.attention->num_key_value_heads), T});
+    Tensor v      = projection.value.view({dimension(config_.attention->head_dim),
+                                           dimension(config_.attention->num_key_value_heads), T});
+    Tensor q_flat = q.view({dimension(config_.attention->query_width()), T});
     Tensor gate_flat = gate.view({dimension(config_.attention->query_width()), T});
     Tensor k_flat    = k.view({dimension(config_.attention->key_width()), T});
     Tensor v_flat    = v.view({dimension(config_.attention->key_width()), T});
@@ -901,24 +901,27 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
                                         active_sequence_batch_});
         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
+        const auto cache_view =
+            batch_text_kv_->prepare_layer(fidx, position_batch, valid, kv_table_rows, s);
         ops::causal_softmax_attention(
             q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
             {dimension(config_.attention->head_dim),
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_,
-            a_batch, s);
+            cache_view, *active_causal_attention_envelope_, work_, a_batch, s);
     } else {
+        const auto cache_view = batch_text_kv_->prepare_layer(fidx, cache_positions.view({T, 1}),
+                                                              Tensor{}, kv_table_rows, s);
         ops::causal_softmax_attention(
             qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
             {dimension(config_.attention->head_dim),
              dimension(config_.attention->num_attention_heads),
              dimension(config_.attention->num_key_value_heads)},
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_, a,
-            s);
+            cache_view, *active_causal_attention_envelope_, work_, a, s);
     }
+    batch_text_kv_->complete_layer(fidx, s);
     ops::sigmoid_mul(gate, a, s);
 
     ops::linear_add(a.view({dimension(config_.attention->query_width()), T}), p.output.weight, x,
@@ -1001,20 +1004,20 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     Tensor vv = vc.view({dimension(config_.gdn->linear_value_head_dim),
                          dimension(config_.gdn->linear_num_value_heads), T});
     Tensor o  = workspace::gdn_recurrent_output(work_, config_, T)
-                   .view({dimension(config_.gdn->linear_value_head_dim),
-                          dimension(config_.gdn->linear_num_value_heads), T});
+                    .view({dimension(config_.gdn->linear_value_head_dim),
+                           dimension(config_.gdn->linear_num_value_heads), T});
     if (ph == Phase::Verify) {
         Tensor recurrent_states  = state_.layer_view(static_cast<std::uint32_t>(gidx)).recurrent;
         const std::int32_t width = active_sequence_width_;
-        Tensor q_batch           = q_recurrent.view({dimension(config_.gdn->linear_key_head_dim),
-                                                     dimension(config_.gdn->linear_num_key_heads), width,
-                                                     active_sequence_batch_});
-        Tensor k_batch           = k_recurrent.view({dimension(config_.gdn->linear_key_head_dim),
-                                                     dimension(config_.gdn->linear_num_key_heads), width,
-                                                     active_sequence_batch_});
-        Tensor v_batch           = vv.view({dimension(config_.gdn->linear_value_head_dim),
-                                            dimension(config_.gdn->linear_num_value_heads), width,
-                                            active_sequence_batch_});
+        Tensor q_batch = q_recurrent.view({dimension(config_.gdn->linear_key_head_dim),
+                                           dimension(config_.gdn->linear_num_key_heads), width,
+                                           active_sequence_batch_});
+        Tensor k_batch = k_recurrent.view({dimension(config_.gdn->linear_key_head_dim),
+                                           dimension(config_.gdn->linear_num_key_heads), width,
+                                           active_sequence_batch_});
+        Tensor v_batch = vv.view({dimension(config_.gdn->linear_value_head_dim),
+                                  dimension(config_.gdn->linear_num_value_heads), width,
+                                  active_sequence_batch_});
         Tensor g_batch =
             g.view({dimension(config_.gdn->linear_num_value_heads), width, active_sequence_batch_});
         Tensor beta_batch = beta.view(
