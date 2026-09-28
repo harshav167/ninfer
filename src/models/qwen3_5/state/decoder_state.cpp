@@ -17,9 +17,14 @@ std::uint32_t page_count(std::uint32_t capacity) {
 PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std::uint32_t capacity,
                               std::int32_t kv_heads, std::int32_t head_dim, KvCacheStorage storage,
                               std::int32_t table_rows, std::uint32_t physical_page_groups,
-                              std::uint32_t resident_page_groups = 0,
-                              std::optional<int> overflow_device = std::nullopt,
-                              std::uint32_t active_step_capacity = 0) {
+                              std::uint32_t resident_page_groups         = 0,
+                              std::optional<int> overflow_device         = std::nullopt,
+                              std::uint32_t active_step_capacity         = 0,
+                              std::optional<int> static_secondary_device = std::nullopt,
+                              std::vector<std::uint32_t> static_secondary_plane_indices = {},
+                              std::int32_t attention_query_heads                        = 0,
+                              std::int32_t max_attention_width                          = 0,
+                              std::int32_t max_attention_batch                          = 0) {
     if (layers == 0 ||
         layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
@@ -53,29 +58,78 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
             builder, DeviceKVPagePoolSpec{.page_group_count          = physical_page_groups,
                                           .geometry                  = std::move(geometry),
                                           .resident_page_group_count = resident_page_groups,
-                                          .overflow_device           = overflow_device}),
+                                          .overflow_device           = overflow_device,
+                                          .static_secondary_device   = static_secondary_device,
+                                          .static_secondary_plane_indices =
+                                              std::move(static_secondary_plane_indices)}),
         .execution_tables = plan_kv_execution_tables(
             builder,
             KVExecutionTableSpec{.logical_page_capacity = logical_pages, .table_rows = table_rows}),
-        .layers               = layers,
-        .max_context          = capacity,
-        .kv_heads             = kv_heads,
-        .layer_storage        = layer_storage,
-        .active_step_capacity = active_step_capacity,
+        .layers                = layers,
+        .max_context           = capacity,
+        .kv_heads              = kv_heads,
+        .layer_storage         = layer_storage,
+        .active_step_capacity  = active_step_capacity,
+        .attention_query_heads = attention_query_heads,
+        .max_attention_width   = max_attention_width,
+        .max_attention_batch   = max_attention_batch,
     };
-    out.active_staging =
-        plan_active_kv_staging(builder, out.pages, layer_storage.planes_per_layer());
+    if (!static_secondary_device) {
+        out.active_staging =
+            plan_active_kv_staging(builder, out.pages, layer_storage.planes_per_layer());
+    }
     return out;
 }
 
 } // namespace
 
 DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderStateSpec& spec) {
+    std::optional<int> remote_device = spec.remote_attention_device;
+    std::vector<std::uint32_t> remote_planes;
+    if (spec.remote_full_attention_layers != 0) {
+        if (!remote_device || spec.remote_full_attention_layers > spec.full_attention_layers) {
+            throw std::invalid_argument("remote full-attention layer selection is invalid");
+        }
+        if (spec.text_overflow_device) {
+            throw std::invalid_argument(
+                "static remote attention cannot combine with active KV overflow");
+        }
+        if (spec.kv_storage != KvCacheStorage::Fp8E4M3Row256 || spec.attention_head_dim != 256 ||
+            !((spec.attention_query_heads == 24 && spec.kv_heads == 4) ||
+              (spec.attention_query_heads == 16 && spec.kv_heads == 2)) ||
+            spec.max_attention_width <= 0 ||
+            spec.max_attention_width >
+                static_cast<std::int32_t>(ops::kCausalAttentionMaximumVisibleKeys) ||
+            spec.max_attention_batch <= 0 || spec.max_attention_batch > 8 ||
+            spec.kv_table_rows < spec.max_attention_batch) {
+            throw std::invalid_argument("remote attention geometry is unsupported");
+        }
+        if (spec.capacity > ops::kCausalAttentionMaximumVisibleKeys) {
+            throw std::invalid_argument("remote attention context exceeds the supported envelope");
+        }
+        const std::uint32_t first = spec.full_attention_layers - spec.remote_full_attention_layers;
+        const std::size_t planes_per_layer =
+            paged_kv_storage_layout(spec.kv_storage, spec.attention_head_dim).planes_per_layer();
+        remote_planes.reserve(static_cast<std::size_t>(spec.remote_full_attention_layers) *
+                              planes_per_layer);
+        for (std::uint32_t layer = first; layer < spec.full_attention_layers; ++layer) {
+            const std::uint32_t base =
+                static_cast<std::uint32_t>(static_cast<std::size_t>(layer) * planes_per_layer);
+            for (std::size_t plane = 0; plane < planes_per_layer; ++plane) {
+                remote_planes.push_back(base + static_cast<std::uint32_t>(plane));
+            }
+        }
+    } else {
+        remote_device.reset();
+    }
+
     DecoderStateLayout layout;
     layout.text_kv = plan_cache(builder, spec.full_attention_layers, spec.capacity, spec.kv_heads,
                                 spec.attention_head_dim, spec.kv_storage, spec.kv_table_rows,
                                 spec.text_physical_page_groups, spec.text_resident_page_groups,
-                                spec.text_overflow_device, spec.active_step_capacity);
+                                spec.text_overflow_device, spec.active_step_capacity, remote_device,
+                                std::move(remote_planes), spec.attention_query_heads,
+                                spec.max_attention_width, spec.max_attention_batch);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_storage, spec.kv_table_rows,
@@ -91,6 +145,21 @@ PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
     if (pages_.plane_count() !=
         static_cast<std::size_t>(layers_) * layer_storage_.planes_per_layer()) {
         throw std::invalid_argument("Paged KV layer plane inventory is inconsistent");
+    }
+    if (pages_.has_static_secondary_planes()) {
+        if (pages_.overflow_buffer() != nullptr || layout.attention_query_heads <= 0 ||
+            layout.max_attention_width <= 0 || layout.max_attention_batch <= 0) {
+            throw std::invalid_argument("static remote attention resources are inconsistent");
+        }
+        int primary_device = 0;
+        CUDA_CHECK(cudaGetDevice(&primary_device));
+        remote_attention_ = std::make_unique<ops::DistributedAttention>(
+            primary_device, pages_.static_secondary_device(),
+            ops::AttentionHeadGeometry{layer_storage_.head_dim, layout.attention_query_heads,
+                                       kv_heads_},
+            layout.max_attention_width, layout.max_attention_batch,
+            layout.execution_tables.spec.table_rows,
+            static_cast<std::int32_t>((max_context_ + kPagedKVPageSize - 1U) / kPagedKVPageSize));
     }
     if (pages_.overflow_buffer()) {
         if (layout.active_step_capacity == 0) {
@@ -158,6 +227,32 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
         .num_kv_heads  = direct.num_kv_heads,
         .storage       = direct.storage,
         .staged        = direct.staged,
+    };
+}
+
+bool PagedKVCache::uses_remote_attention(std::uint32_t layer) const noexcept {
+    if (layer >= layers_ || !pages_.has_static_secondary_planes()) { return false; }
+    const std::size_t base = static_cast<std::size_t>(layer) * layer_storage_.planes_per_layer();
+    return pages_.plane(base).data == nullptr;
+}
+
+PagedKVStagedPlanes PagedKVCache::secondary_layer_planes(std::uint32_t layer) const {
+    if (layer >= layers_) { throw std::out_of_range("Paged KV layer is out of range"); }
+    if (!uses_remote_attention(layer)) {
+        throw std::invalid_argument("Paged KV layer is not on the static secondary device");
+    }
+    const std::size_t stride        = layer_storage_.planes_per_layer();
+    const std::size_t base          = static_cast<std::size_t>(layer) * stride;
+    const std::size_t k_scale_index = base + 2;
+    const std::size_t v_scale_index =
+        k_scale_index + static_cast<std::size_t>(layer_storage_.key.has_scale());
+    return PagedKVStagedPlanes{
+        .k = pages_.secondary_plane(base),
+        .v = pages_.secondary_plane(base + 1),
+        .k_scale =
+            layer_storage_.key.has_scale() ? pages_.secondary_plane(k_scale_index) : Tensor(),
+        .v_scale =
+            layer_storage_.value.has_scale() ? pages_.secondary_plane(v_scale_index) : Tensor(),
     };
 }
 

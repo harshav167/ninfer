@@ -462,6 +462,17 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
             product::format_pretty_bytes(memory.active_kv_host_staging_bytes),
             kv_cache_name(memory.kv_cache));
     }
+    if (engine.remote_attention.secondary_device) {
+        logger_->info(
+            "remote attention | {} full layers | CUDA device {} | static secondary KV {} | "
+            "wrapper primary {} + secondary {} | pinned host staging {} | eager execution",
+            product::format_pretty_count(engine.remote_attention.full_attention_layers),
+            *engine.remote_attention.secondary_device,
+            product::format_pretty_bytes(memory.static_secondary_kv_bytes),
+            product::format_pretty_bytes(memory.remote_attention_primary_bytes),
+            product::format_pretty_bytes(memory.remote_attention_secondary_bytes),
+            product::format_pretty_bytes(memory.remote_attention_host_staging_bytes));
+    }
 
     if (cache.enabled) {
         logger_->info(

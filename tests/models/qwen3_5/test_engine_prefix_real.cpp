@@ -9,6 +9,9 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <chrono>
+#include <thread>
+#include <cuda_runtime_api.h>
 #include <vector>
 
 namespace {
@@ -800,16 +803,16 @@ int exercise_anthropic_prefix_regression(const char* artifact) {
         input.context_cache.allow_engine_automatic_shared_prefixes = false;
         for (std::uint32_t count = 1; count <= input.options.tool_jsons.size(); ++count) {
             input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
-                   .kind             = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
-                   .evidence         = ninfer::SharedCandidateEvidence::ExplicitBoundary,
-                   .location         = ninfer::PromptCacheMarkerLocation::ToolBoundary,
-                   .after_tool_count = count,
+                .kind             = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                .evidence         = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+                .location         = ninfer::PromptCacheMarkerLocation::ToolBoundary,
+                .after_tool_count = count,
             });
         }
         ninfer::ChatMessage user;
         user.role = ninfer::ChatRole::User;
         user.parts.push_back(ninfer::MessagePart{
-               .kind = ninfer::MessagePartKind::Text, .text = std::move(question), .media = {}});
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(question), .media = {}});
         input.messages.push_back(std::move(user));
         return input;
     };
@@ -1317,8 +1320,8 @@ int exercise_rewrite_checkpoints(ninfer::Engine& engine, RewriteCheckpointCacheT
         const ninfer::RuntimeStats final_stats   = engine.runtime_stats();
         const std::uint64_t initial_degradations = initial_stats.pressure_private_owners_degraded +
                                                    initial_stats.pressure_shared_owners_degraded;
-        const std::uint64_t final_degradations = final_stats.pressure_private_owners_degraded +
-                                                 final_stats.pressure_shared_owners_degraded;
+        const std::uint64_t final_degradations   = final_stats.pressure_private_owners_degraded +
+                                                   final_stats.pressure_shared_owners_degraded;
         if (final_degradations <= initial_degradations ||
             final_stats.pressure_private_owners_evicted !=
                 initial_stats.pressure_private_owners_evicted ||
@@ -1728,8 +1731,8 @@ int exercise_pressure_partial_spill_and_resume(const char* artifact) {
         after_pressure.pressure_checkpoints_dropped - before_pressure.pressure_checkpoints_dropped;
     const std::uint64_t pressure_degraded = after_pressure.pressure_private_owners_degraded -
                                             before_pressure.pressure_private_owners_degraded;
-    const std::uint64_t pressure_evicted = after_pressure.pressure_private_owners_evicted -
-                                           before_pressure.pressure_private_owners_evicted;
+    const std::uint64_t pressure_evicted  = after_pressure.pressure_private_owners_evicted -
+                                            before_pressure.pressure_private_owners_evicted;
     if (short_b.generated_token_ids.size() != 1 || pressure_main_pages != 4 ||
         pressure_spill_pages != 4 || pressure_drops != 1 || pressure_degraded != 1 ||
         pressure_evicted != 0 ||
@@ -1968,7 +1971,7 @@ int exercise_concurrent_resource_settlement(const char* artifact) {
     const ninfer::RuntimeStats before_pressure = engine.runtime_stats();
     const ninfer::GenerationResult pressure    = engine.generate(
         engine.prepare(session_turn("publication-pressure",
-                                       "Give one deterministic token for the pressure request.")),
+                                    "Give one deterministic token for the pressure request.")),
         fixed_output(1));
     const ninfer::RuntimeStats after_pressure = engine.runtime_stats();
     if (pressure.generated_token_ids.size() != 1 ||
@@ -2065,6 +2068,606 @@ int verify_loaded_product(const ninfer::Engine& engine) {
     return 0;
 }
 
+int exercise_remote_attention(const char* artifact) {
+    int device_count                = 0;
+    const cudaError_t device_status = cudaGetDeviceCount(&device_count);
+    if (device_status == cudaErrorNoDevice || device_status == cudaErrorInsufficientDriver ||
+        (device_status == cudaSuccess && device_count < 2)) {
+        std::cout << "skip: remote-attention requires two CUDA devices\n";
+        return 77;
+    }
+    if (device_status != cudaSuccess) {
+        std::cerr << "cudaGetDeviceCount failed: " << cudaGetErrorString(device_status) << '\n';
+        return 1;
+    }
+
+    ninfer::EngineOptions options;
+    options.artifact_path                     = artifact;
+    options.max_context                       = 512;
+    options.kv_capacity                       = ninfer::KvCapacityPolicy::explicit_capacity(1024);
+    options.prefill_chunk                     = 128;
+    options.kv_cache                          = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    options.speculative.backend               = ninfer::SpeculativeBackend::None;
+    options.max_concurrency                   = 2;
+    options.max_pending_requests              = 2;
+    options.enable_vision                     = true;
+    options.use_cuda_graph                    = false;
+    options.remote_attention.secondary_device = 1;
+    options.remote_attention.full_attention_layers = 1;
+    ninfer::Engine engine(std::move(options));
+
+    const auto make_input = [](std::string session, std::string identity) {
+        std::string text = "Independently reason about " + identity + ". ";
+        for (std::uint32_t index = 0; index < 12; ++index) {
+            text += identity + " detail " + std::to_string(index) + ". ";
+        }
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        ninfer::PromptInput input;
+        input.messages.push_back(std::move(user));
+        input.context_cache.session_key = std::move(session);
+        input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
+        return input;
+    };
+
+    auto input_a                      = make_input("remote-attention-a", "amber");
+    auto input_b                      = make_input("remote-attention-b", "violet");
+    const ninfer::RuntimeStats before = engine.runtime_stats();
+    auto first  = engine.submit(engine.prepare(std::move(input_a)), fixed_output(64, false));
+    auto second = engine.submit(engine.prepare(std::move(input_b)), fixed_output(64, false));
+
+    bool observed_batched_decode   = false;
+    bool observed_request_activity = false;
+    const auto deadline            = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const ninfer::RuntimeStats current = engine.runtime_stats();
+        observed_request_activity = observed_request_activity || current.running_requests != 0 ||
+                                    current.waiting_requests != 0;
+        if (current.running_requests >= 2 && current.decode_ready_requests >= 2 &&
+            current.decode_row_rounds - before.decode_row_rounds >
+                current.decode_rounds - before.decode_rounds) {
+            observed_batched_decode = true;
+            break;
+        }
+        if (observed_request_activity && current.running_requests == 0 &&
+            current.waiting_requests == 0) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    const ninfer::GenerationResult result_a = first.wait();
+    const ninfer::GenerationResult result_b = second.wait();
+    if (!observed_batched_decode) {
+        std::cerr << "remote-attention did not batch decode rows while both requests were active\n";
+        return 1;
+    }
+    if (result_a.generated_token_ids.size() != 64 || result_b.generated_token_ids.size() != 64 ||
+        result_a.generated_token_ids == result_b.generated_token_ids ||
+        (result_a.content.empty() && result_a.reasoning.empty()) ||
+        (result_b.content.empty() && result_b.reasoning.empty())) {
+        std::cerr << "remote-attention did not return distinct complete outputs for both requests"
+                  << " tokens_a=" << result_a.generated_token_ids.size()
+                  << " tokens_b=" << result_b.generated_token_ids.size() << " token_ids_equal="
+                  << (result_a.generated_token_ids == result_b.generated_token_ids)
+                  << " content_a=" << result_a.content.size()
+                  << " content_b=" << result_b.content.size()
+                  << " reasoning_a=" << result_a.reasoning.size()
+                  << " reasoning_b=" << result_b.reasoning.size()
+                  << " finish_a=" << static_cast<unsigned>(result_a.finish_reason)
+                  << " finish_b=" << static_cast<unsigned>(result_b.finish_reason) << '\n';
+        return 1;
+    }
+
+    ninfer::PromptInput followup;
+    followup.context_cache.session_key = "remote-attention-a";
+    followup.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
+    ninfer::ChatMessage user;
+    user.role = ninfer::ChatRole::User;
+    user.parts.push_back(ninfer::MessagePart{.kind  = ninfer::MessagePartKind::Text,
+                                             .text  = "Continue the amber context briefly.",
+                                             .media = {}});
+    followup.messages.push_back(std::move(user));
+    ninfer::ChatMessage assistant;
+    assistant.role              = ninfer::ChatRole::Assistant;
+    assistant.reasoning_content = result_a.reasoning;
+    if (!result_a.content.empty()) {
+        assistant.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = result_a.content, .media = {}});
+    }
+    followup.messages.push_back(std::move(assistant));
+    ninfer::ChatMessage next;
+    next.role = ninfer::ChatRole::User;
+    next.parts.push_back(ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text,
+                                             .text = "Summarize the amber details in one sentence.",
+                                             .media = {}});
+    followup.messages.push_back(std::move(next));
+    const ninfer::GenerationResult continued =
+        engine.generate(engine.prepare(std::move(followup)), fixed_output(8));
+    if (continued.generated_token_ids.size() != 8 ||
+        (continued.content.empty() && continued.reasoning.empty())) {
+        std::cerr << "remote-attention follow-up did not continue a usable context\n";
+        return 1;
+    }
+    return 0;
+}
+
+int exercise_remote_attention_lifecycle(const char* artifact) {
+    int device_count                = 0;
+    const cudaError_t device_status = cudaGetDeviceCount(&device_count);
+    if (device_status == cudaErrorNoDevice || device_status == cudaErrorInsufficientDriver ||
+        (device_status == cudaSuccess && device_count < 2)) {
+        std::cout << "skip: remote-attention-lifecycle requires two CUDA devices\n";
+        return 77;
+    }
+    if (device_status != cudaSuccess) {
+        std::cerr << "cudaGetDeviceCount failed: " << cudaGetErrorString(device_status) << '\n';
+        return 1;
+    }
+
+    ninfer::EngineOptions options;
+    options.artifact_path                     = artifact;
+    options.max_context                       = 1024;
+    options.kv_capacity                       = ninfer::KvCapacityPolicy::explicit_capacity(2048);
+    options.prefill_chunk                     = 128;
+    options.kv_cache                          = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    options.max_concurrency                   = 2;
+    options.max_pending_requests              = 2;
+    options.enable_vision                     = false;
+    options.use_cuda_graph                    = true;
+    options.remote_attention.secondary_device = 1;
+    options.remote_attention.full_attention_layers          = 2;
+    options.speculative.backend                             = ninfer::SpeculativeBackend::DFlash2;
+    options.speculative.draft_tokens                        = 7;
+    options.speculative.proposal_head                       = ninfer::ProposalHead::Full;
+    options.context_cache.device_state_slots                = 4;
+    options.context_cache.host_state_slots                  = 0;
+    options.context_cache.host_kv_capacity_bytes            = 0;
+    options.context_cache.max_private_continuations         = 2;
+    options.context_cache.max_shared_prefixes               = 1;
+    options.context_cache.max_long_anchors_per_continuation = 0;
+    std::string graph_rejection_error;
+    try {
+        ninfer::Engine graph_engine(options);
+    } catch (const std::invalid_argument& error) {
+        graph_rejection_error = error.what();
+    } catch (const std::exception& error) {
+        graph_rejection_error = std::string("unexpected exception type: ") + error.what();
+    }
+    if (graph_rejection_error.find("host-mediated two-device attention") == std::string::npos) {
+        std::cerr << "remote-attention-lifecycle expected explicit CUDA Graph rejection; "
+                  << (graph_rejection_error.empty() ? "Engine construction succeeded"
+                                                    : graph_rejection_error)
+                  << '\n';
+        return 1;
+    }
+    options.use_cuda_graph = false;
+    ninfer::Engine engine(std::move(options));
+
+    const ninfer::MemorySummary memory = engine.memory_summary();
+    const auto& effective              = engine.options();
+    if (memory.max_context != 1024 || memory.kv_capacity != 2048 ||
+        memory.kv_cache != ninfer::KvCacheStorage::Fp8E4M3Row256 ||
+        !effective.remote_attention.secondary_device ||
+        *effective.remote_attention.secondary_device != 1 ||
+        effective.remote_attention.full_attention_layers != 2 ||
+        effective.speculative.backend != ninfer::SpeculativeBackend::DFlash2 ||
+        effective.speculative.draft_tokens != 7 || effective.use_cuda_graph ||
+        memory.remote_attention_primary_bytes == 0 ||
+        memory.remote_attention_secondary_bytes == 0 ||
+        memory.remote_attention_host_staging_bytes == 0 || memory.active_kv_secondary_bytes != 0 ||
+        memory.active_kv_secondary_device >= 0) {
+        std::cerr << "remote-attention-lifecycle did not establish the requested FP8 remote layout"
+                  << " primary_bytes=" << memory.remote_attention_primary_bytes
+                  << " secondary_bytes=" << memory.remote_attention_secondary_bytes
+                  << " staging_bytes=" << memory.remote_attention_host_staging_bytes
+                  << " legacy_secondary_bytes=" << memory.active_kv_secondary_bytes
+                  << " legacy_secondary_device=" << memory.active_kv_secondary_device << '\n';
+        return 1;
+    }
+
+    std::string shared_instruction;
+    for (std::uint32_t index = 0; index < 16; ++index) {
+        shared_instruction +=
+            "This shared instruction is stable across independent contexts and must be retained. ";
+    }
+    const auto lane_prompt = [&](std::string session, std::string text) {
+        ninfer::ChatMessage system;
+        system.role = ninfer::ChatRole::System;
+        system.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = shared_instruction, .media = {}});
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        ninfer::PromptInput input;
+        input.messages.push_back(std::move(system));
+        input.messages.push_back(std::move(user));
+        input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
+            .after_message_count = 1,
+            .kind                = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+            .evidence            = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .location            = ninfer::PromptCacheMarkerLocation::MessageBoundary,
+        });
+        input.context_cache.allow_engine_automatic_shared_prefixes = false;
+        if (!session.empty()) {
+            input.context_cache.session_key = std::move(session);
+            input.context_cache.retention   = ninfer::CacheRetentionHint::LiveSession;
+        } else {
+            input.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+        }
+        return input;
+    };
+    const ninfer::PromptInput shared_seed =
+        lane_prompt("", "Seed the common stable instruction prefix with one short response.");
+    const ninfer::GenerationResult shared_seed_first =
+        engine.generate(engine.prepare(shared_seed), fixed_output(1));
+    const ninfer::GenerationResult shared_seed_second =
+        engine.generate(engine.prepare(shared_seed), fixed_output(1));
+    std::uint32_t filler_index            = 0;
+    const auto displace_private_endpoints = [&] {
+        for (std::uint32_t slot = 0; slot < 2; ++slot) {
+            ninfer::PromptInput filler;
+            ninfer::ChatMessage user;
+            user.role = ninfer::ChatRole::User;
+            user.parts.push_back(
+                ninfer::MessagePart{.kind  = ninfer::MessagePartKind::Text,
+                                    .text  = "Displace disposable private endpoint " +
+                                             std::to_string(filler_index++) + '.',
+                                    .media = {}});
+            filler.messages.push_back(std::move(user));
+            filler.context_cache.retention = ninfer::CacheRetentionHint::Disposable;
+            const ninfer::GenerationResult result =
+                engine.generate(engine.prepare(std::move(filler)), fixed_output(1));
+            if (result.generated_token_ids.size() != 1) { return false; }
+        }
+        return true;
+    };
+    const bool seed_private_endpoints_displaced = displace_private_endpoints();
+    const ninfer::PromptInput shared_prefix_probe =
+        lane_prompt("", "Probe the retained stable instruction with a distinct short query.");
+    const ninfer::GenerationResult shared_prefix_probe_result =
+        engine.generate(engine.prepare(shared_prefix_probe), fixed_output(1));
+    if (shared_seed_first.generated_token_ids.size() != 1 ||
+        shared_seed_second.generated_token_ids.size() != 1 || !seed_private_endpoints_displaced ||
+        shared_prefix_probe_result.generated_token_ids.size() != 1 ||
+        shared_prefix_probe_result.prefix_reuse_path !=
+            ninfer::PrefixReusePath::SharedStablePrefix ||
+        shared_prefix_probe_result.reused_prompt_tokens == 0) {
+        std::cerr << "remote-attention-lifecycle did not reuse its explicit shared prefix for a "
+                     "different query"
+                  << " path=" << static_cast<int>(shared_prefix_probe_result.prefix_reuse_path)
+                  << " reused=" << shared_prefix_probe_result.reused_prompt_tokens << '\n';
+        return 1;
+    }
+    const auto append_assistant = [](ninfer::PromptInput& input,
+                                     const ninfer::GenerationResult& result) {
+        ninfer::ChatMessage assistant;
+        assistant.role              = ninfer::ChatRole::Assistant;
+        assistant.reasoning_content = result.reasoning;
+        if (!result.content.empty()) {
+            assistant.parts.push_back(ninfer::MessagePart{
+                .kind = ninfer::MessagePartKind::Text, .text = result.content, .media = {}});
+        }
+        input.messages.push_back(std::move(assistant));
+    };
+    const auto append_user = [](ninfer::PromptInput& input, std::string text) {
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        input.messages.push_back(std::move(user));
+    };
+    const auto from_retained_turn = [&](std::string session, const std::string& root_text,
+                                        const ninfer::GenerationResult& root_result,
+                                        std::string question) {
+        ninfer::PromptInput input = lane_prompt(std::move(session), root_text);
+        append_assistant(input, root_result);
+        append_user(input, std::move(question));
+        return input;
+    };
+    const auto output_complete = [](const ninfer::GenerationResult& result,
+                                    std::uint32_t expected_tokens) {
+        return result.generated_token_ids.size() == expected_tokens &&
+               result.finish_reason == ninfer::FinishReason::OutputLimit &&
+               result.speculative.backend == ninfer::SpeculativeBackend::DFlash2 &&
+               result.speculative.draft_window == 7 &&
+               (expected_tokens <= 1 ||
+                result.speculative.rounds + result.speculative.fallback_steps != 0);
+    };
+    const auto reusable = [](const ninfer::GenerationResult& result) {
+        return result.reused_prompt_tokens != 0 &&
+               result.prefix_reuse_path != ninfer::PrefixReusePath::Root;
+    };
+    const auto requests_settled = [](const ninfer::RuntimeStats& stats) {
+        return stats.running_requests == 0 && stats.waiting_requests == 0 &&
+               stats.materializing_requests == 0 && stats.prefilling_requests == 0 &&
+               stats.decode_ready_requests == 0 && stats.capture_pending_requests == 0 &&
+               stats.terminal_pending_requests == 0;
+    };
+
+    constexpr std::string_view kSessionA = "remote-attention-lifecycle-amber";
+    constexpr std::string_view kSessionB = "remote-attention-lifecycle-violet";
+    const std::string root_text_a =
+        "Keep the amber record independent. Its private marker is copper and it is a lifecycle "
+        "test context.";
+    const std::string root_text_b =
+        "Keep the violet record independent. Its private marker is indigo and it is a separate "
+        "lifecycle test context.";
+    auto root_a = engine.submit(engine.prepare(lane_prompt(std::string(kSessionA), root_text_a)),
+                                fixed_output(8));
+    auto root_b = engine.submit(engine.prepare(lane_prompt(std::string(kSessionB), root_text_b)),
+                                fixed_output(8));
+    const ninfer::GenerationResult root_result_a = root_a.wait();
+    const ninfer::GenerationResult root_result_b = root_b.wait();
+    if (!output_complete(root_result_a, 8) || !output_complete(root_result_b, 8) ||
+        root_result_a.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
+        root_result_b.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
+        root_result_a.reused_prompt_tokens == 0 || root_result_b.reused_prompt_tokens == 0) {
+        std::cerr << "remote-attention-lifecycle independent roots did not reuse their shared "
+                     "stable instruction prefix"
+                  << " paths=" << static_cast<int>(root_result_a.prefix_reuse_path) << '/'
+                  << static_cast<int>(root_result_b.prefix_reuse_path)
+                  << " reused=" << root_result_a.reused_prompt_tokens << '/'
+                  << root_result_b.reused_prompt_tokens << '\n';
+        return 1;
+    }
+
+    ninfer::PromptInput branch_a1_input =
+        from_retained_turn(std::string(kSessionA), root_text_a, root_result_a,
+                           "Open one continuation branch for the amber record.");
+    const ninfer::GenerationResult branch_a1 =
+        engine.generate(engine.prepare(branch_a1_input), fixed_output(8));
+    const bool branch_private_endpoints_displaced = displace_private_endpoints();
+    if (!branch_private_endpoints_displaced) {
+        std::cerr << "remote-attention-lifecycle branch private endpoint eviction did not "
+                     "complete\n";
+        return 1;
+    }
+    const ninfer::RuntimeStats before_branch_a2 = engine.runtime_stats();
+    ninfer::PromptInput branch_a2_input =
+        from_retained_turn(std::string(kSessionA), root_text_a, root_result_a,
+                           "Open a different continuation branch for the same amber record.");
+    const ninfer::GenerationResult branch_a2 =
+        engine.generate(engine.prepare(branch_a2_input), fixed_output(8));
+    const ninfer::RuntimeStats after_branch_a2 = engine.runtime_stats();
+    if (!output_complete(branch_a1, 8) || !reusable(branch_a1) || !output_complete(branch_a2, 8) ||
+        branch_a2.prefix_reuse_path != ninfer::PrefixReusePath::SharedStablePrefix ||
+        branch_a2.reused_prompt_tokens == 0 ||
+        after_branch_a2.shared_stable_prefix_selections <=
+            before_branch_a2.shared_stable_prefix_selections) {
+        std::cerr << "remote-attention-lifecycle did not create two independent warm branches "
+                     "from the promoted shared prefix"
+                  << " paths=" << static_cast<int>(branch_a1.prefix_reuse_path) << '/'
+                  << static_cast<int>(branch_a2.prefix_reuse_path)
+                  << " reused=" << branch_a1.reused_prompt_tokens << '/'
+                  << branch_a2.reused_prompt_tokens
+                  << " shared_selections=" << before_branch_a2.shared_stable_prefix_selections
+                  << '/' << after_branch_a2.shared_stable_prefix_selections << '\n';
+        return 1;
+    }
+
+
+    ninfer::PromptInput cancelled_input = branch_a2_input;
+    append_assistant(cancelled_input, branch_a2);
+    std::string cancelled_question = "Keep this amber request active long enough to cancel it: ";
+    for (std::uint32_t index = 0; index < 48; ++index) {
+        cancelled_question += "amber-cancellation-detail ";
+    }
+    append_user(cancelled_input, std::move(cancelled_question));
+    ninfer::PromptInput survivor_input =
+        from_retained_turn(std::string(kSessionB), root_text_b, root_result_b,
+                           "Continue only the violet record and preserve its identity.");
+
+    std::optional<ninfer::GenerationHandle> cancelled;
+    cancelled.emplace(engine.submit(engine.prepare(std::move(cancelled_input)), fixed_output(96)));
+    auto survivor              = engine.submit(engine.prepare(survivor_input), fixed_output(32));
+    const auto active_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    bool observed_two_active_lanes = false;
+    while (std::chrono::steady_clock::now() < active_deadline) {
+        const ninfer::RuntimeStats current = engine.runtime_stats();
+        if (current.running_requests >= 2 && current.decode_ready_requests >= 2) {
+            observed_two_active_lanes = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!observed_two_active_lanes) {
+        std::cerr << "remote-attention-lifecycle did not observe both cancellation/survivor lanes "
+                     "active together\n";
+        return 1;
+    }
+    cancelled.reset();
+    const ninfer::GenerationResult survivor_result = survivor.wait();
+    if (!output_complete(survivor_result, 32) || !reusable(survivor_result)) {
+        std::cerr << "remote-attention-lifecycle cancellation disrupted the violet survivor"
+                  << " tokens=" << survivor_result.generated_token_ids.size()
+                  << " reused=" << survivor_result.reused_prompt_tokens
+                  << " finish=" << static_cast<unsigned>(survivor_result.finish_reason) << '\n';
+        return 1;
+    }
+
+    ninfer::RuntimeStats settled = engine.runtime_stats();
+    const auto settle_deadline   = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (!requests_settled(settled) && std::chrono::steady_clock::now() < settle_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        settled = engine.runtime_stats();
+    }
+    const std::uint32_t device_state_capacity =
+        effective.max_concurrency + effective.context_cache.device_state_slots.value_or(0);
+    if (!requests_settled(settled) || settled.device_state_occupied_slots == 0 ||
+        settled.device_state_occupied_slots > device_state_capacity ||
+        settled.device_main_kv_occupied_pages == 0 ||
+        settled.device_backend_kv_occupied_pages != 0) {
+        std::cerr << "remote-attention-lifecycle did not settle with bounded resident cache "
+                     "resources"
+                  << " running=" << settled.running_requests
+                  << " waiting=" << settled.waiting_requests
+                  << " materializing=" << settled.materializing_requests
+                  << " prefill=" << settled.prefilling_requests
+                  << " decode=" << settled.decode_ready_requests
+                  << " capture=" << settled.capture_pending_requests
+                  << " terminal=" << settled.terminal_pending_requests
+                  << " state_slots=" << settled.device_state_occupied_slots << '/'
+                  << device_state_capacity
+                  << " main_kv_pages=" << settled.device_main_kv_occupied_pages
+                  << " backend_kv_pages=" << settled.device_backend_kv_occupied_pages << '\n';
+        return 1;
+    }
+
+    append_assistant(survivor_input, survivor_result);
+    append_user(survivor_input, "Continue the settled violet context with one more short turn.");
+    const ninfer::GenerationResult reused_survivor =
+        engine.generate(engine.prepare(std::move(survivor_input)), fixed_output(8));
+    const ninfer::RuntimeStats after_reuse = engine.runtime_stats();
+    if (!output_complete(reused_survivor, 8) || !reusable(reused_survivor) ||
+        reused_survivor.prefix_reuse_path == ninfer::PrefixReusePath::SharedStablePrefix ||
+        !requests_settled(after_reuse) || after_reuse.device_state_occupied_slots == 0 ||
+        after_reuse.device_main_kv_occupied_pages == 0) {
+        std::cerr << "remote-attention-lifecycle failed to reuse the settled private survivor "
+                     "context"
+                  << " tokens=" << reused_survivor.generated_token_ids.size()
+                  << " reused=" << reused_survivor.reused_prompt_tokens
+                  << " path=" << static_cast<int>(reused_survivor.prefix_reuse_path)
+                  << " running=" << after_reuse.running_requests
+                  << " state_slots=" << after_reuse.device_state_occupied_slots
+                  << " main_kv_pages=" << after_reuse.device_main_kv_occupied_pages << '\n';
+        return 1;
+    }
+
+    std::cout << "ok remote-attention-lifecycle"
+              << " reused_branches=" << branch_a1.reused_prompt_tokens << '/'
+              << branch_a2.reused_prompt_tokens
+              << " survivor_reuse=" << reused_survivor.reused_prompt_tokens
+              << " resident_state_slots=" << after_reuse.device_state_occupied_slots
+              << " resident_main_kv_pages=" << after_reuse.device_main_kv_occupied_pages << '\n';
+    return 0;
+}
+
+int exercise_remote_attention_capacity(const char* artifact) {
+    int device_count                = 0;
+    const cudaError_t device_status = cudaGetDeviceCount(&device_count);
+    if (device_status == cudaErrorNoDevice || device_status == cudaErrorInsufficientDriver ||
+        (device_status == cudaSuccess && device_count < 2)) {
+        std::cout << "skip: remote-attention-capacity requires two CUDA devices\n";
+        return 77;
+    }
+    if (device_status != cudaSuccess) {
+        std::cerr << "cudaGetDeviceCount failed: " << cudaGetErrorString(device_status) << '\n';
+        return 1;
+    }
+
+    ninfer::EngineOptions options;
+    options.artifact_path                     = artifact;
+    options.max_context                       = 250000;
+    options.kv_capacity                       = ninfer::KvCapacityPolicy::explicit_capacity(500096);
+    options.prefill_chunk                     = 128;
+    options.kv_cache                          = ninfer::KvCacheStorage::Fp8E4M3Row256;
+    options.max_concurrency                   = 2;
+    options.max_pending_requests              = 2;
+    options.enable_vision                     = true;
+    options.use_cuda_graph                    = false;
+    options.remote_attention.secondary_device = 1;
+    options.remote_attention.full_attention_layers          = 6;
+    options.speculative.backend                             = ninfer::SpeculativeBackend::DFlash2;
+    options.speculative.draft_tokens                        = 7;
+    options.speculative.proposal_head                       = ninfer::ProposalHead::Full;
+    options.context_cache.device_state_slots                = 2;
+    options.context_cache.host_state_slots                  = 0;
+    options.context_cache.host_kv_capacity_bytes            = 0;
+    options.context_cache.secondary_cache_device            = 1;
+    options.context_cache.secondary_cache_state_slots       = 1;
+    options.context_cache.secondary_cache_kv_capacity_bytes = 64ULL << 20;
+    ninfer::Engine engine(std::move(options));
+
+    const ninfer::MemorySummary memory = engine.memory_summary();
+    if (memory.max_context != 250000 || memory.kv_capacity != 500096 ||
+        memory.static_secondary_kv_bytes == 0 || memory.remote_attention_primary_bytes == 0 ||
+        memory.remote_attention_secondary_bytes == 0 ||
+        memory.remote_attention_host_staging_bytes == 0 || memory.active_kv_secondary_bytes != 0 ||
+        memory.active_kv_secondary_device >= 0) {
+        std::cerr << "remote-attention-capacity memory layout is incomplete or uses legacy overflow"
+                  << " max_context=" << memory.max_context << " kv_capacity=" << memory.kv_capacity
+                  << " static_secondary_kv_bytes=" << memory.static_secondary_kv_bytes
+                  << " primary_bytes=" << memory.remote_attention_primary_bytes
+                  << " secondary_bytes=" << memory.remote_attention_secondary_bytes
+                  << " staging_bytes=" << memory.remote_attention_host_staging_bytes
+                  << " legacy_secondary_bytes=" << memory.active_kv_secondary_bytes
+                  << " legacy_secondary_device=" << memory.active_kv_secondary_device << '\n';
+        return 1;
+    }
+
+    const auto make_input = [](std::string text) {
+        ninfer::ChatMessage user;
+        user.role = ninfer::ChatRole::User;
+        user.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = std::move(text), .media = {}});
+        ninfer::PromptInput input;
+        input.messages.push_back(std::move(user));
+        return input;
+    };
+    const ninfer::RuntimeStats before = engine.runtime_stats();
+    auto first =
+        engine.submit(engine.prepare(make_input(
+                          "For the amber capacity lane, explain one simple arithmetic fact.")),
+                      fixed_output(24, false));
+    auto second =
+        engine.submit(engine.prepare(make_input(
+                          "For the violet capacity lane, explain one simple geometry fact.")),
+                      fixed_output(24, false));
+
+    bool observed_batched_decode   = false;
+    bool observed_request_activity = false;
+    const auto deadline            = std::chrono::steady_clock::now() + std::chrono::seconds(120);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const ninfer::RuntimeStats current = engine.runtime_stats();
+        observed_request_activity = observed_request_activity || current.running_requests != 0 ||
+                                    current.waiting_requests != 0;
+        if (current.running_requests >= 2 && current.decode_ready_requests >= 2 &&
+            current.decode_row_rounds - before.decode_row_rounds >
+                current.decode_rounds - before.decode_rounds) {
+            observed_batched_decode = true;
+            break;
+        }
+        if (observed_request_activity && current.running_requests == 0 &&
+            current.waiting_requests == 0) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const ninfer::GenerationResult result_a = first.wait();
+    const ninfer::GenerationResult result_b = second.wait();
+    if (!observed_batched_decode || result_a.generated_token_ids.size() != 24 ||
+        result_b.generated_token_ids.size() != 24 ||
+        result_a.finish_reason != ninfer::FinishReason::OutputLimit ||
+        result_b.finish_reason != ninfer::FinishReason::OutputLimit ||
+        (result_a.content.empty() && result_a.reasoning.empty()) ||
+        (result_b.content.empty() && result_b.reasoning.empty())) {
+        std::cerr << "remote-attention-capacity concurrent generations failed"
+                  << " batched_decode=" << observed_batched_decode
+                  << " tokens_a=" << result_a.generated_token_ids.size()
+                  << " tokens_b=" << result_b.generated_token_ids.size()
+                  << " finish_a=" << static_cast<unsigned>(result_a.finish_reason)
+                  << " finish_b=" << static_cast<unsigned>(result_b.finish_reason)
+                  << " content_a=" << result_a.content.size()
+                  << " content_b=" << result_b.content.size()
+                  << " reasoning_a=" << result_a.reasoning.size()
+                  << " reasoning_b=" << result_b.reasoning.size() << '\n';
+        return 1;
+    }
+
+    std::cout << "ok remote-attention-capacity"
+              << " primary_wrapper_bytes=" << memory.remote_attention_primary_bytes
+              << " secondary_wrapper_bytes=" << memory.remote_attention_secondary_bytes
+              << " static_secondary_kv_bytes=" << memory.static_secondary_kv_bytes
+              << " pinned_staging_bytes=" << memory.remote_attention_host_staging_bytes
+              << " kv_capacity=" << memory.kv_capacity
+              << " available_after_startup_bytes=" << memory.available_after_startup_bytes << '\n';
+    return 0;
+}
+
 } // namespace
 
 int exercise_artifact(const char* artifact) {
@@ -2137,6 +2740,12 @@ int main() {
         result = exercise_artifact(artifact);
     } else if (scenario == "concurrent") {
         result = exercise_concurrent_resource_settlement(artifact);
+    } else if (scenario == "remote-attention") {
+        result = exercise_remote_attention(artifact);
+    } else if (scenario == "remote-attention-lifecycle") {
+        result = exercise_remote_attention_lifecycle(artifact);
+    } else if (scenario == "remote-attention-capacity") {
+        result = exercise_remote_attention_capacity(artifact);
     } else if (scenario == "anthropic-prefix-regression") {
         result = exercise_anthropic_prefix_regression(artifact);
     } else if (scenario == "shared-rewrite-materialization") {

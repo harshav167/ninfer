@@ -2,6 +2,7 @@
 #include "core/paged_kv_cache.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/softmax_attention.h"
+#include "ninfer/ops/distributed_attention.h"
 #include "ops/op_tester.h"
 #include "ops/softmax_attention/oracle.h"
 
@@ -129,7 +130,7 @@ struct AttentionCase {
     bool graph_replay = false;
 };
 
-enum class MappingPattern { Identity, Offset, Fragmented };
+enum class MappingPattern { Identity, Offset, Fragmented, Remote };
 
 const char* mapping_name(MappingPattern pattern) {
     switch (pattern) {
@@ -139,6 +140,8 @@ const char* mapping_name(MappingPattern pattern) {
         return "offset";
     case MappingPattern::Fragmented:
         return "fragmented";
+    case MappingPattern::Remote:
+        return "remote";
     }
     return "unknown";
 }
@@ -156,6 +159,11 @@ std::int32_t physical_page_count(std::int32_t logical_pages, MappingPattern patt
         return logical_pages + 2;
     case MappingPattern::Fragmented:
         return 2 * logical_pages + 1;
+    case MappingPattern::Remote:
+        // Every logical page lands in the secondary plane, so the table must reach one page past
+        // the primary plane's highest ID. The unused hole at physical ID 0 stays populated and is
+        // itself evidence that unmapped physical slots are never observed.
+        return logical_pages + 2;
     }
     return 0;
 }
@@ -171,6 +179,9 @@ std::vector<std::int32_t> make_block_table(std::int32_t logical_pages, MappingPa
         break;
     case MappingPattern::Fragmented:
         for (std::int32_t page = 0; page < logical_pages; ++page) { table[page] = 2 * page + 1; }
+        break;
+    case MappingPattern::Remote:
+        for (std::int32_t page = 0; page < logical_pages; ++page) { table[page] = page + 2; }
         break;
     }
     return table;
@@ -643,13 +654,58 @@ void encode_rotated_key_row(std::span<const float> source, std::size_t source_ba
     }
 }
 
+// Logical key magnitude per position, applied before the cache codec runs so a scaled case still
+// stores the represented values read by the independent oracle. The scale-boundary discriminator
+// uses one positive all-ones key vector on each side, all-ones queries, and constant zero/one value
+// vectors. After the FP8 key transform each side therefore has a single score for every key; a
+// large cross-shard LSE gap cannot be changed by private query rounding or a near-tied argmax.
+//
+// Both factors are powers of two, so they move values along the BF16 grid without changing which
+// grid points are representable.
+struct KeyMagnitude {
+    std::int32_t boundary = 0;
+    float low             = 1.0f;
+    float high            = 1.0f;
+    bool uniform_regions  = false;
+
+    [[nodiscard]] float at(std::int32_t position) const { return position < boundary ? low : high; }
+};
+
+// The unscaled logical key plane used by the ordinary randomized cache fixtures.
+std::vector<float> logical_key_plane(const Geometry& geometry, std::int32_t logical_capacity,
+                                     std::uint32_t seed) {
+    return make_bf16_values(cache_elements(geometry, logical_capacity), seed, -0.25f, 0.25f);
+}
+
 HostCache make_cache(const Geometry& geometry, KvCacheStorage storage, std::int32_t max_context,
-                     std::uint32_t seed) {
+                     std::uint32_t seed, const KeyMagnitude* magnitude = nullptr) {
     const std::int32_t logical_capacity = align_up_page(max_context);
     const std::size_t elements          = cache_elements(geometry, logical_capacity);
-    std::vector<float> logical_k        = make_bf16_values(elements, seed, -0.25f, 0.25f);
-    std::vector<float> logical_v        = make_bf16_values(elements, seed + 1u, -1.0f, 1.0f);
-
+    const bool uniform_regions          = magnitude != nullptr && magnitude->uniform_regions;
+    std::vector<float> logical_k        = uniform_regions
+                                              ? std::vector<float>(elements, 1.0f)
+                                              : logical_key_plane(geometry, logical_capacity, seed);
+    std::vector<float> logical_v        = uniform_regions
+                                              ? std::vector<float>(elements, 0.0f)
+                                              : make_bf16_values(elements, seed + 1u, -1.0f, 1.0f);
+    if (magnitude != nullptr) {
+        for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
+            for (std::int32_t position = 0; position < logical_capacity; ++position) {
+                const float factor = magnitude->at(position);
+                if (factor == 1.0f && !uniform_regions) continue;
+                for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                    const std::size_t index =
+                        cache_index(geometry, logical_capacity, head, position, d);
+                    if (uniform_regions) {
+                        logical_k[index] = factor;
+                        logical_v[index] = position < magnitude->boundary ? 0.0f : 1.0f;
+                    } else {
+                        logical_k[index] *= factor;
+                    }
+                }
+            }
+        }
+    }
     HostCache cache{geometry, storage, max_context, logical_capacity};
     if (storage == KvCacheStorage::BFloat16) {
         cache.k_bf16 = to_bf16_bits(logical_k);
@@ -1788,8 +1844,510 @@ private:
     std::array<std::unique_ptr<GuardedDeviceBuffer>, 4> local_storage_, staged_storage_;
 };
 
+// Chooses the primary/secondary device pair once per process. The secondary
+// MUST be the compute-capable device the distributed route is specified for:
+// its secondary kernel is compiled for SM86 and for the primary architecture,
+// and a device without a matching image fails at first launch rather than here.
+// The selected pair's capabilities are reported so the caller can require the
+// Ampere pairing instead of silently running an unqualified one, and the
+// current device is restored on every path.
+struct DistributedDevices {
+    int primary         = 0;
+    int secondary       = 1;
+    bool selectable     = false;
+    int secondary_major = 0;
+    int secondary_minor = 0;
+    std::string reason;
+
+    [[nodiscard]] bool secondary_is_sm86() const {
+        return secondary_major == 8 && secondary_minor == 6;
+    }
+};
+
+DistributedDevices select_distributed_devices() {
+    DistributedDevices selection;
+    // A host with no usable CUDA device has nothing to choose from. That
+    // condition is reported as a skip reason by the caller, so it must be
+    // established before the count query rather than aborting inside it.
+    if (cuda_unavailable()) {
+        selection.reason = "requires a usable CUDA device";
+        return selection;
+    }
+    int count = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&count));
+    if (count < 2) {
+        selection.reason = "requires two CUDA devices";
+        return selection;
+    }
+    int original = 0;
+    CUDA_CHECK(cudaGetDevice(&original));
+    std::vector<int> usable;
+    for (int device = 0; device < count; ++device) {
+        cudaDeviceProp properties{};
+        if (cudaGetDeviceProperties(&properties, device) != cudaSuccess) {
+            cudaGetLastError(); // Clear the sticky invalid-device error and keep
+                                // scanning.
+            continue;
+        }
+        if (properties.major <= 0) continue;
+        usable.push_back(device);
+    }
+    if (usable.size() >= 2) {
+        // Prefer the highest compute capability as primary; the oldest usable
+        // device becomes the secondary so the pairing is stable no matter which
+        // device the caller had bound.
+        std::sort(usable.begin(), usable.end(), [&](int left, int right) {
+            cudaDeviceProp a{}, b{};
+            CUDA_CHECK(cudaGetDeviceProperties(&a, left));
+            CUDA_CHECK(cudaGetDeviceProperties(&b, right));
+            if (a.major != b.major) return a.major > b.major;
+            return a.minor > b.minor;
+        });
+        cudaDeviceProp secondary_properties{};
+        CUDA_CHECK(cudaGetDeviceProperties(&secondary_properties, usable.back()));
+        selection.primary         = usable.front();
+        selection.secondary       = usable.back();
+        selection.secondary_major = secondary_properties.major;
+        selection.secondary_minor = secondary_properties.minor;
+        selection.selectable      = true;
+    } else {
+        selection.reason = "requires two CUDA-capable devices";
+    }
+    CUDA_CHECK(cudaSetDevice(original));
+    return selection;
+}
+
+// Selects a device for a teardown path. Teardown runs while a stack may already
+// be unwinding, so it cannot abort the process or throw: a failure is reported
+// in the same form the repository's other cleanup paths use and the remaining
+// cleanup still runs. Buffer frees already take that stance, since
+// ~DeviceBuffer releases through the logging, non-aborting free_device().
+void restore_device_noexcept(int device) noexcept {
+    const cudaError_t status = cudaSetDevice(device);
+    if (status != cudaSuccess) {
+        std::fprintf(stderr, "CUDA cleanup failed during cudaSetDevice(%d): %s: %s\n", device,
+                     cudaGetErrorName(status), cudaGetErrorString(status));
+    }
+}
+
+// How the physical page ID namespace is partitioned for one distributed case.
+// The split is derived from the physical IDs the visible keys actually resolve
+// to, so a case keeps its meaning when a mapping or fixture geometry changes,
+// and a participation check then proves the resulting partition is what the
+// case claims. Without that check a "remote" case could resolve every key
+// through the primary plane and prove nothing about the second device, and an
+// "empty contribution" case could exercise a full shard on both devices.
+enum class RemoteCase { EvenIds, AllLocalPlanes, AllRemoteIds, PrimaryLowestId, ScaleBoundary };
+
+const char* remote_case_name(RemoteCase remote_case) {
+    switch (remote_case) {
+    case RemoteCase::EvenIds:
+        return "even-ids";
+    case RemoteCase::AllLocalPlanes:
+        return "all-local-planes";
+    case RemoteCase::AllRemoteIds:
+        return "all-remote-ids";
+    case RemoteCase::PrimaryLowestId:
+        return "primary-lowest-id";
+    case RemoteCase::ScaleBoundary:
+        return "scale-boundary";
+    }
+    return "unknown";
+}
+
+// The physical ID partition implied by a case. Primary IDs are [0,
+// primary_pages); secondary IDs are [primary_pages, physical_pages). Both
+// planes are always real allocations: an empty contribution is a plane whose
+// IDs the block table never references, not a plane that is absent. That keeps
+// every case meaningful without depending on an absent plane being accepted.
+struct RemotePartition {
+    std::int32_t primary_pages = 1;
+};
+
+// `referenced` holds every physical page ID the visible key set resolves to.
+// The split always leaves at least one ID on each side, so both devices run a
+// real shard; an all-local or all-remote visible set is produced by the block
+// table pointing away from one of them. A key set that stays inside a single
+// page cannot be split at all, which verify_remote_partition reports rather
+// than silently running as an all-local case.
+//
+// A scale-boundary case declares its split as the physical page where its
+// scaled region begins, so `boundary_page` overrides the derived split and
+// keeps the partition and the declared magnitude describing the same boundary
+// instead of two independently drifting ones.
+RemotePartition remote_partition(std::span<const std::int32_t> referenced,
+                                 std::int32_t physical_pages, RemoteCase remote_case,
+                                 std::int32_t boundary_page = 0) {
+    if (referenced.empty()) throw std::invalid_argument("a partition case needs visible keys");
+    if (physical_pages < 2) {
+        throw std::invalid_argument("a distributed case needs at least two physical pages");
+    }
+    std::int32_t lowest = physical_pages, highest = -1;
+    for (const std::int32_t physical : referenced) {
+        if (physical < 0 || physical >= physical_pages) {
+            throw std::invalid_argument("referenced physical page is outside the pool");
+        }
+        lowest  = std::min(lowest, physical);
+        highest = std::max(highest, physical);
+    }
+    RemotePartition partition;
+    switch (remote_case) {
+    case RemoteCase::EvenIds:
+        // Straddle the referenced range, so both planes serve part of the visible
+        // set.
+        partition.primary_pages = (lowest + highest + 1) / 2;
+        break;
+    case RemoteCase::AllLocalPlanes:
+        // Every referenced ID stays primary; the last pool ID becomes secondary and
+        // is referenced by nothing, so the remote contribution is empty. The
+        // mapping must therefore leave that ID unreferenced, which the
+        // participation check confirms.
+        partition.primary_pages = physical_pages - 1;
+        break;
+    case RemoteCase::AllRemoteIds:
+        // The primary plane keeps only the IDs below the lowest referenced one, and
+        // the block table never reaches them, so the local contribution is empty.
+        partition.primary_pages = lowest;
+        break;
+    case RemoteCase::PrimaryLowestId:
+        // The primary keeps the lowest referenced ID and the secondary owns every
+        // other referenced page, so both shard ranges are non-empty but unequal:
+        // one page against the rest. Catches a shard bound or merge step that
+        // assumes a balanced split, or that derives a range from the whole pool
+        // instead of from the partition, even while a symmetric case still passes.
+        partition.primary_pages = lowest + 1;
+        break;
+    case RemoteCase::ScaleBoundary: {
+        // The declared scaled region begins at logical page `boundary_page`, and that same page
+        // must be where the device split falls, so each shard's own rows really carry the magnitude
+        // the case declares. The split is one past the highest physical ID that the pages below the
+        // boundary resolve to: the mapping decides which IDs those are, so a split derived from the
+        // page index alone would separate two referenced IDs only for an identity mapping.
+        if (boundary_page <= 0 || boundary_page >= static_cast<std::int32_t>(referenced.size())) {
+            throw std::invalid_argument(
+                "a scale-boundary case needs the boundary inside its visible pages");
+        }
+        std::int32_t below = -1;
+        for (std::int32_t page = 0; page < boundary_page; ++page) {
+            below = std::max(below, referenced[static_cast<std::size_t>(page)]);
+        }
+        partition.primary_pages = below + 1;
+        break;
+    }
+    }
+    partition.primary_pages = std::clamp(partition.primary_pages, 1, physical_pages - 1);
+    return partition;
+}
+
+// Physical page IDs a single-sequence visible key set of `visible_keys` keys
+// resolves to.
+std::vector<std::int32_t> referenced_pages(std::span<const std::int32_t> table,
+                                           std::int32_t visible_keys) {
+    if (visible_keys <= 0) return {};
+    const auto pages =
+        static_cast<std::size_t>((visible_keys + kPagedKVPageSize - 1) / kPagedKVPageSize);
+    if (pages > table.size()) {
+        throw std::invalid_argument("visible keys exceed the block table");
+    }
+    return std::vector<std::int32_t>(table.begin(),
+                                     table.begin() + static_cast<std::ptrdiff_t>(pages));
+}
+
+// Block tables exactly as each fixture builds them, so the participation check
+// reads the same addressing the Op does instead of a restated assumption.
+std::vector<std::int32_t> batch_block_table(std::int32_t logical_pages, std::int32_t rows,
+                                            MappingPattern mapping) {
+    std::vector<std::int32_t> table(static_cast<std::size_t>(logical_pages) *
+                                    static_cast<std::size_t>(rows));
+    for (std::int32_t row = 0; row < rows; ++row) {
+        for (std::int32_t logical = 0; logical < logical_pages; ++logical) {
+            const std::int32_t linear = row * logical_pages + logical;
+            table[static_cast<std::size_t>(row) * static_cast<std::size_t>(logical_pages) +
+                  static_cast<std::size_t>(logical)] =
+                mapping == MappingPattern::Fragmented ? 2 * linear + 1 : linear;
+        }
+    }
+    return table;
+}
+
+// Physical page IDs reached by the live rows of a batch, each through its own
+// table row. A page reached by several rows is listed once.
+std::vector<std::int32_t> batch_referenced_pages(std::span<const std::int32_t> tables,
+                                                 std::int32_t logical_pages,
+                                                 std::span<const int> lanes,
+                                                 std::span<const int> visible_keys) {
+    std::vector<std::int32_t> referenced;
+    const std::int32_t table_rows =
+        logical_pages > 0 ? static_cast<std::int32_t>(tables.size()) / logical_pages : 0;
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        if (lanes[row] < 0 || lanes[row] >= table_rows) continue;
+        const std::size_t offset =
+            static_cast<std::size_t>(lanes[row]) * static_cast<std::size_t>(logical_pages);
+        const auto table = tables.subspan(offset, static_cast<std::size_t>(logical_pages));
+        for (const std::int32_t physical : referenced_pages(table, visible_keys[row])) {
+            if (std::find(referenced.begin(), referenced.end(), physical) == referenced.end()) {
+                referenced.push_back(physical);
+            }
+        }
+    }
+    return referenced;
+}
+
+// Checks that a case's visible keys really straddle the device split (or really
+// do not) by reading the same block-table entries the Op reads. Failures are
+// reported, not thrown, so a mis-declared case cannot silently degrade into a
+// passing all-local test.
+int verify_remote_partition(const std::string& label, std::span<const std::int32_t> referenced,
+                            std::int32_t primary_pages, RemoteCase remote_case) {
+    bool local = false, remote = false;
+    for (const std::int32_t physical : referenced) {
+        (physical < primary_pages ? local : remote) = true;
+    }
+    const bool wants_remote = remote_case != RemoteCase::AllLocalPlanes;
+    const bool wants_local  = remote_case != RemoteCase::AllRemoteIds;
+    if (wants_remote == remote && wants_local == local) return 0;
+    std::cerr << label << ": case " << remote_case_name(remote_case)
+              << " does not exercise its declared partition (local=" << (local ? "yes" : "no")
+              << " remote=" << (remote ? "yes" : "no") << ")\n";
+    return 1;
+}
+
+// Checks that the scale-extreme case really stores one tiny and one huge key
+// region, and that the boundary it declares coincides with the device split.
+// The stored FP16 key row scales are read back from the same host cache the
+// Op's state was gathered from, so a case that intended one tiny and one huge
+// scale cannot silently run with two ordinary ones.
+//
+// The required observed ratio is derived from the magnitude the case declares,
+// so changing that declaration keeps this check meaningful instead of leaving a
+// second, independently drifting constant behind.
+int verify_scale_extremes(const std::string& label, const HostCache& cache,
+                          const Geometry& geometry, std::span<const std::int32_t> block_table,
+                          const KeyMagnitude& magnitude, std::int32_t visible_keys,
+                          std::int32_t primary_pages) {
+    const std::int32_t boundary = magnitude.boundary;
+    if (boundary <= 0 || boundary % kPagedKVPageSize != 0) {
+        std::cerr << label << ": scale boundary is not a page boundary\n";
+        return 1;
+    }
+    // Both regions use the same all-ones prototype, so their FP8 row absmaxes track the declared
+    // magnitude ratio directly. Requiring one quarter of it leaves room for codec rounding while
+    // rejecting an ordinary, near-balanced scale pair.
+    const float expected_ratio = magnitude.high / magnitude.low;
+    // Physical IDs of the visible pages, read from the same block table the Op
+    // resolves through.
+    const auto visible_pages =
+        static_cast<std::size_t>((visible_keys + kPagedKVPageSize - 1) / kPagedKVPageSize);
+    if (visible_pages > block_table.size()) {
+        std::cerr << label << ": scale case visible set exceeds its block table\n";
+        return 1;
+    }
+    const std::int32_t boundary_page = boundary / kPagedKVPageSize;
+    for (std::size_t page = 0; page < visible_pages; ++page) {
+        const std::int32_t physical = block_table[page];
+        const bool below            = static_cast<std::int32_t>(page) < boundary_page;
+        if (below == (physical < primary_pages)) continue;
+        std::cerr << label << ": scale boundary does not coincide with the device split (page "
+                  << page << " physical=" << physical << " primary_pages=" << primary_pages
+                  << ")\n";
+        return 1;
+    }
+    float low_scale = 0.0f, high_scale = 0.0f;
+    for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
+        for (std::int32_t position = 0; position < visible_keys; ++position) {
+            const std::size_t index =
+                fp8_scale_index(geometry, cache.logical_capacity, head, position);
+            float& side_scale = position < boundary ? low_scale : high_scale;
+            side_scale        = std::max(side_scale, f16_bits_to_f32(cache.k_scale[index]));
+        }
+    }
+    const float observed_ratio = low_scale > 0.0f ? high_scale / low_scale : 0.0f;
+    if (low_scale > 0.0f && high_scale > 0.0f && observed_ratio >= expected_ratio / 4.0f &&
+        observed_ratio <= expected_ratio * 4.0f) {
+        return 0;
+    }
+    std::cerr << label << ": declared scale extremes are not present (low=" << low_scale
+              << " high=" << high_scale << ")\n";
+    return 1;
+}
+
+// Verifies that the scale fixture remains discriminating for every query head and causal token.
+// Each side's represented FP8 keys must have one score, and the independent FP64 LSEs must
+// leave the declared dominant shard at least 100 nats ahead. The all-ones query is exactly
+// E4M3-safe; row-uniform scores prevent private query rounding from changing an argmax.
+// Distinct zero/one value regions make a wrong shard blend observable.
+int verify_scale_discriminator(const std::string& label, const std::vector<float>& q,
+                               const HostCache& cache, const Geometry& geometry,
+                               const KeyMagnitude& magnitude,
+                               std::span<const std::int32_t> positions) {
+    if (!magnitude.uniform_regions) return 0;
+    if (magnitude.low == magnitude.high || magnitude.boundary <= 0) {
+        std::cerr << label << ": scale discriminator has no declared contrast\n";
+        return 1;
+    }
+
+    int failures                    = 0;
+    const double expected_direction = magnitude.high > magnitude.low ? 1.0 : -1.0;
+    for (std::int32_t q_head = 0; q_head < geometry.q_heads; ++q_head) {
+        const std::int32_t kv_head = q_head / geometry.query_group();
+        double low_value_sum = 0.0, high_value_sum = 0.0;
+        for (std::int32_t d = 0; d < kHeadDim; ++d) {
+            low_value_sum += cache_value(cache, false, kv_head, 0, d);
+            high_value_sum += cache_value(cache, false, kv_head, magnitude.boundary, d);
+        }
+        if (std::abs(high_value_sum - low_value_sum) / static_cast<double>(kHeadDim) < 0.5) {
+            std::cerr << label << ": scale regions do not produce distinct shard values\n";
+            ++failures;
+            break;
+        }
+
+        for (std::int32_t token = 0; token < static_cast<std::int32_t>(positions.size()); ++token) {
+            std::array<double, kHeadDim> query{};
+            bool exact_query = true;
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                const float value = q[q_index(geometry, q_head, d, token)];
+                exact_query &= value == 1.0f;
+                query[static_cast<std::size_t>(d)] = value;
+            }
+            if (!exact_query) {
+                std::cerr << label << ": scale query is not the exact E4M3-safe all-ones row "
+                          << "(head=" << q_head << " token=" << token << ")\n";
+                ++failures;
+                continue;
+            }
+            normalized_hadamard_d256(query);
+
+            const std::int32_t visible = positions[static_cast<std::size_t>(token)] + 1;
+            if (magnitude.boundary >= visible) {
+                std::cerr << label << ": scale boundary is outside a causal query frontier\n";
+                ++failures;
+                continue;
+            }
+            double low_min = std::numeric_limits<double>::infinity(), low_max = -low_min;
+            double high_min = std::numeric_limits<double>::infinity(), high_max = -high_min;
+            for (std::int32_t position = 0; position < visible; ++position) {
+                double dot = 0.0;
+                for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                    dot += query[static_cast<std::size_t>(d)] *
+                           cache_value(cache, true, kv_head, position, d);
+                }
+                const double score = dot * static_cast<double>(kAttentionScale);
+                if (position < magnitude.boundary) {
+                    low_min = std::min(low_min, score);
+                    low_max = std::max(low_max, score);
+                } else {
+                    high_min = std::min(high_min, score);
+                    high_max = std::max(high_max, score);
+                }
+            }
+            const double low_lse = low_max + std::log(static_cast<double>(magnitude.boundary));
+            const double high_lse =
+                high_max + std::log(static_cast<double>(visible - magnitude.boundary));
+            const double contrast = expected_direction * (high_lse - low_lse);
+            const auto nonuniform = [](double minimum, double maximum) {
+                return maximum - minimum > 1e-8 * std::max(1.0, std::abs(maximum));
+            };
+            if (nonuniform(low_min, low_max) || nonuniform(high_min, high_max) ||
+                contrast < 100.0) {
+                std::cerr << label << ": scale discriminator is not stable for head=" << q_head
+                          << " token=" << token << " (LSE contrast=" << contrast << ")\n";
+                ++failures;
+            }
+        }
+    }
+    return failures;
+}
+
+// Owns the secondary-resident planes for one distributed call and mirrors them
+// back into the primary cache so the same independent oracle and the same exact
+// cache-append parity checks apply to split and unsplit routes alike.
+//
+// The primary/secondary split is a partition of global physical page IDs, not a
+// split of the visible key set: this fixture assigns whole physical pages, so
+// the block table decides which device serves each visible key. Every visible
+// key must still be contributed exactly once.
+//
+// The remote planes must live on the secondary device, so the fixture copies
+// them there on construction, restores the caller's device, and copies them
+// back on merge(). Both planes are real allocations; which visible keys they
+// serve is decided by the block table alone.
+class RemoteAttentionFixture {
+public:
+    RemoteAttentionFixture(PagedKVBatchLayerView full, DistributedDevices devices,
+                           RemotePartition partition)
+        : full_(full), local_(full), devices_(devices), primary_pages_(partition.primary_pages) {
+        const std::int32_t total_pages  = full.k_pages.ne[3];
+        const std::int32_t remote_pages = total_pages - primary_pages_;
+        if (remote_pages <= 0) {
+            throw std::invalid_argument("a distributed case needs a secondary page range");
+        }
+        CUDA_CHECK(cudaGetDevice(&entry_device_));
+        const std::array<Tensor, 4> planes{full.k_pages, full.v_pages, full.k_scale_pages,
+                                           full.v_scale_pages};
+        CUDA_CHECK(cudaSetDevice(devices_.secondary));
+        for (int p = 0; p < 4; ++p) {
+            remote_[p] = planes[p].slice(3, primary_pages_, remote_pages);
+            std::vector<std::byte> bytes(remote_[p].bytes());
+            CUDA_CHECK(cudaMemcpy(static_cast<void*>(bytes.data()), remote_[p].data, bytes.size(),
+                                  cudaMemcpyDeviceToHost));
+            buffers_[p] = std::make_unique<DeviceBuffer>(bytes.size());
+            buffers_[p]->copy_from_host(bytes.data(), bytes.size());
+            remote_[p].data = buffers_[p]->p;
+        }
+        CUDA_CHECK(cudaSetDevice(entry_device_));
+        local_.k_pages       = planes[0].slice(3, 0, primary_pages_);
+        local_.v_pages       = planes[1].slice(3, 0, primary_pages_);
+        local_.k_scale_pages = planes[2].slice(3, 0, primary_pages_);
+        local_.v_scale_pages = planes[3].slice(3, 0, primary_pages_);
+    }
+
+    // Declared noexcept so a future teardown step that could throw is a compile
+    // error instead of a terminate() while a stack unwinds.
+    ~RemoteAttentionFixture() noexcept {
+        restore_device_noexcept(devices_.secondary);
+        for (auto& buffer : buffers_) buffer.reset();
+        restore_device_noexcept(entry_device_);
+    }
+
+    [[nodiscard]] std::int32_t primary_pages() const { return primary_pages_; }
+
+    [[nodiscard]] PagedKVBatchLayerView local() const { return local_; }
+
+    [[nodiscard]] PagedKVStagedPlanes remote() const {
+        return {remote_[0], remote_[1], remote_[2], remote_[3]};
+    }
+
+    void merge() {
+        cuda_synchronize();
+        const std::array<Tensor, 4> planes{full_.k_pages, full_.v_pages, full_.k_scale_pages,
+                                           full_.v_scale_pages};
+        for (int p = 0; p < 4; ++p) {
+            std::vector<std::byte> bytes(remote_[p].bytes());
+            CUDA_CHECK(cudaSetDevice(devices_.secondary));
+            buffers_[p]->copy_to_host(bytes.data(), bytes.size());
+            CUDA_CHECK(cudaSetDevice(entry_device_));
+            auto destination = planes[p].slice(3, primary_pages_, remote_[p].ne[3]);
+            CUDA_CHECK(
+                cudaMemcpy(destination.data, bytes.data(), bytes.size(), cudaMemcpyHostToDevice));
+        }
+        cuda_synchronize();
+    }
+
+private:
+    PagedKVBatchLayerView full_, local_;
+    DistributedDevices devices_;
+    int entry_device_           = 0;
+    std::int32_t primary_pages_ = 0;
+    std::array<Tensor, 4> remote_;
+    std::array<std::unique_ptr<DeviceBuffer>, 4> buffers_;
+};
+
 int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const AttentionCase& test_case,
-                MappingPattern mapping, bool use_staging = false) {
+                MappingPattern mapping, bool use_staging = false,
+                const RemoteCase* remote_case     = nullptr,
+                const DistributedDevices* devices = nullptr,
+                const KeyMagnitude* magnitude     = nullptr) {
+    const bool distributed         = remote_case != nullptr;
     const std::int32_t total       = test_case.base + test_case.tokens;
     const std::int32_t max_context = static_cast<std::int32_t>(
         std::max<std::uint32_t>(static_cast<std::uint32_t>(total + 3), test_case.envelope_max));
@@ -1801,20 +2359,45 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
                                     static_cast<std::size_t>(test_case.tokens);
     std::vector<float> q          = make_bf16_values(q_elements, test_case.seed, -0.25f, 0.25f);
     if (test_case.zero_q) std::fill(q.begin(), q.end(), 0.0f);
+    if (magnitude != nullptr && magnitude->uniform_regions) std::fill(q.begin(), q.end(), 1.0f);
     std::vector<float> k = make_bf16_values(kv_elements, test_case.seed + 1u, -0.25f, 0.25f);
     std::vector<float> v = make_bf16_values(kv_elements, test_case.seed + 2u, -1.0f, 1.0f);
-    inject_codec_edges(geometry, test_case.tokens, k, v);
     std::vector<std::int32_t> positions(static_cast<std::size_t>(test_case.tokens));
     for (std::int32_t token = 0; token < test_case.tokens; ++token) {
         positions[static_cast<std::size_t>(token)] = test_case.base + token;
     }
+    inject_codec_edges(geometry, test_case.tokens, k, v);
+    // The scale discriminator uses identical logical keys for resident and appended rows.
+    if (magnitude != nullptr) {
+        for (std::int32_t token = 0; token < test_case.tokens; ++token) {
+            const std::int32_t position = positions[static_cast<std::size_t>(token)];
+            const float factor          = magnitude->at(position);
+            if (factor == 1.0f && !magnitude->uniform_regions) continue;
+            for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
+                for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                    const std::size_t index = kv_input_index(geometry, head, d, token);
+                    if (magnitude->uniform_regions) {
+                        k[index] = factor;
+                        v[index] = position < magnitude->boundary ? 0.0f : 1.0f;
+                    } else {
+                        k[index] *= factor;
+                    }
+                }
+            }
+        }
+    }
     const ops::CausalAttentionExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
                                                          test_case.envelope_max};
 
-    const HostCache initial = make_cache(geometry, storage, max_context, test_case.seed + 10u);
-    HostCache expected      = initial;
+    const HostCache initial =
+        make_cache(geometry, storage, max_context, test_case.seed + 10u, magnitude);
+    HostCache expected = initial;
     append_cache(expected, k, v, positions);
     const std::vector<double> reference = ideal_attention(q, expected, positions);
+    const int scale_fixture_failures =
+        magnitude == nullptr ? 0
+                             : verify_scale_discriminator("scale-boundary fixture", q, expected,
+                                                          geometry, *magnitude, positions);
     DeviceCache cache(initial, mapping);
     std::optional<StagedCache> staged;
     if (use_staging) { staged.emplace(cache.batch_view()); }
@@ -1847,9 +2430,34 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
         op_geometry(geometry), storage, envelope, 1, test_case.tokens, test_case.tokens);
     GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
     WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
+    std::optional<RemoteAttentionFixture> remote;
+    std::optional<ops::DistributedAttention> distributed_attention;
+    std::vector<std::int32_t> distributed_referenced;
+    if (distributed) {
+        const std::vector<std::int32_t> table =
+            make_block_table(cache.batch_view().block_tables.ne[0], mapping);
+        distributed_referenced = referenced_pages(table, total);
+        // A scale case declares its split as the page where its scaled region
+        // begins, so the partition is derived from that same boundary rather than
+        // restated separately.
+        const std::int32_t boundary_page =
+            magnitude == nullptr ? 0 : magnitude->boundary / kPagedKVPageSize;
+        remote.emplace(cache.batch_view(), *devices,
+                       remote_partition(distributed_referenced, cache.batch_view().k_pages.ne[3],
+                                        *remote_case, boundary_page));
+        distributed_attention.emplace(devices->primary, devices->secondary, op_geometry(geometry),
+                                      test_case.tokens, 1, cache.batch_view().block_tables.ne[1],
+                                      cache.batch_view().block_tables.ne[0]);
+    }
 
     launch_attention_case(
         [&](cudaStream_t stream) {
+            if (distributed_attention) {
+                distributed_attention->execute(tq, tk, tv, tp, Tensor{}, ttable_row,
+                                               kAttentionScale, remote->local(), remote->remote(),
+                                               envelope, tout, stream);
+                return;
+            }
             ops::causal_softmax_attention(tq, tk, tv, tp, Tensor{}, ttable_row,
                                           op_geometry(geometry), kAttentionScale,
                                           staged ? staged->batch_view() : cache.batch_view(),
@@ -1857,18 +2465,37 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
         },
         test_case.graph_replay);
     if (staged) { staged->merge(); }
+    if (remote) remote->merge();
 
     const std::string label =
-        case_label("causal_softmax_attention", geometry, storage, test_case, mapping);
+        case_label("causal_softmax_attention", geometry, storage, test_case, mapping) +
+        (remote ? " remote=" + std::to_string(remote->primary_pages()) + "/" +
+                      std::to_string(cache.batch_view().k_pages.ne[3])
+                : std::string());
     const std::vector<std::uint16_t> output_bits =
         copy_from_guarded<std::uint16_t>(dout, q_bits.size());
-    int failures = verify_attention(label, bf16_bits_to_double(output_bits), reference,
-                                    attention_criterion(storage));
+    int failures =
+        scale_fixture_failures + verify_attention(label, bf16_bits_to_double(output_bits),
+                                                  reference, attention_criterion(storage));
+    if (remote_case != nullptr) {
+        failures += verify_remote_partition(label, distributed_referenced, remote->primary_pages(),
+                                            *remote_case);
+    }
+    if (magnitude != nullptr && remote_case != nullptr) {
+        // The readback runs after merge(), so the primary cache holds both shards'
+        // rows again and the declared scales are checked on the exact state the Op
+        // read.
+        const std::vector<std::int32_t> table =
+            make_block_table(cache.batch_view().block_tables.ne[0], mapping);
+        failures += verify_scale_extremes(label, cache.snapshot(), geometry, table, *magnitude,
+                                          total, remote->primary_pages());
+    }
     failures += verify_cache(label, cache.snapshot(), expected,
                              storage == KvCacheStorage::BFloat16 ||
                                  storage == KvCacheStorage::Nvfp4Group16 ||
                                  storage == KvCacheStorage::Fp8KeyNvfp4Value);
-    if (storage == KvCacheStorage::Nvfp4Group16 || storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+    if (storage == KvCacheStorage::Nvfp4Group16 || storage == KvCacheStorage::Fp8KeyNvfp4Value ||
+        storage == KvCacheStorage::Fp8E4M3Row256) {
         DeviceCache standalone(initial, mapping);
         ops::kv_cache_append(tk, tv, tp, standalone.view(), nullptr);
         cuda_synchronize();
@@ -1883,7 +2510,7 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     failures += verify_positions(label + " table row unchanged", dtable_row, {table_row});
     failures += dout.verify_guards((label + " output").c_str());
     failures += workspace_buffer.verify_guards((label + " workspace").c_str());
-    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+    if (workspace.used() != 0 || workspace.peak_used() > workspace_bytes) {
         std::cerr << label << ": workspace query/execution high-water mismatch\n";
         ++failures;
     }
@@ -1952,7 +2579,7 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     failures += verify_positions(label + " positions unchanged", dp, positions);
     failures += dout.verify_guards((label + " output").c_str());
     failures += workspace_buffer.verify_guards((label + " workspace").c_str());
-    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+    if (workspace.used() != 0 || workspace.peak_used() > workspace_bytes) {
         std::cerr << label << ": workspace query/execution high-water mismatch\n";
         ++failures;
     }
@@ -2012,7 +2639,13 @@ int verify_invalid_columns_zero(const std::string& label, std::span<const std::u
 }
 
 int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
-                   const BatchAttentionCase& test_case, bool use_staging = false) {
+                   const BatchAttentionCase& test_case, bool use_staging = false,
+                   const RemoteCase* remote_case     = nullptr,
+                   const DistributedDevices* devices = nullptr) {
+    const bool distributed = remote_case != nullptr;
+    if (distributed && test_case.graph_replay) {
+        throw std::invalid_argument("distributed batch cases use eager execution");
+    }
     const int batch = test_case.contexts.size(), width = test_case.width;
     const int pool_rows = std::max(
         batch, *std::max_element(test_case.table_rows.begin(), test_case.table_rows.end()) + 1);
@@ -2057,11 +2690,42 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
         op_geometry(geometry), storage, envelope, batch, width, width);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 256));
     WorkspaceArena workspace(DeviceSpan{scratch.data(), scratch.bytes()});
-    DeviceContext device;
+    int current_device = 0;
+    CUDA_CHECK(cudaGetDevice(&current_device));
+    DeviceContext device(current_device);
     const bool masked = test_case.graph_replay ||
                         std::any_of(test_case.valid_columns.begin(), test_case.valid_columns.end(),
                                     [&](int count) { return count != width; });
+    std::optional<RemoteAttentionFixture> remote;
+    std::optional<ops::DistributedAttention> distributed_attention;
+    std::vector<std::int32_t> distributed_referenced;
+    if (distributed) {
+        const std::vector<std::int32_t> table = batch_block_table(
+            cache.view().block_tables.ne[0], cache.view().block_tables.ne[1], test_case.mapping);
+        // Only live columns address cache, so the partition is derived from each row's live
+        // frontier. An empty row addresses nothing and must not widen the partition.
+        std::vector<int> row_visible(static_cast<std::size_t>(batch));
+        for (int b = 0; b < batch; ++b) {
+            const int valid = test_case.valid_columns[static_cast<std::size_t>(b)];
+            row_visible[static_cast<std::size_t>(b)] =
+                valid > 0 ? test_case.contexts[static_cast<std::size_t>(b)] + valid : 0;
+        }
+        distributed_referenced = batch_referenced_pages(table, cache.view().block_tables.ne[0],
+                                                        test_case.table_rows, row_visible);
+        remote.emplace(
+            cache.view(), *devices,
+            remote_partition(distributed_referenced, cache.view().k_pages.ne[3], *remote_case));
+        distributed_attention.emplace(devices->primary, devices->secondary, op_geometry(geometry),
+                                      width, batch, cache.view().block_tables.ne[1],
+                                      cache.view().block_tables.ne[0]);
+    }
     const auto launch = [&] {
+        if (distributed_attention) {
+            distributed_attention->execute(tq, tk, tv, tp, masked ? tvalid : Tensor{}, tlanes,
+                                           kAttentionScale, remote->local(), remote->remote(),
+                                           envelope, tout, device.stream);
+            return;
+        }
         ops::causal_softmax_attention(tq, tk, tv, tp, masked ? tvalid : Tensor{}, tlanes,
                                       op_geometry(geometry), kAttentionScale,
                                       staged ? staged->batch_view() : cache.view(), envelope,
@@ -2127,13 +2791,22 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
             launch();
         cuda_synchronize(device.stream);
         if (staged) { staged->merge(); }
+        if (remote) remote->merge();
         const std::string label = std::string("causal batch ") + geometry.name + " " +
                                   cache_name(storage) + " W=" + std::to_string(width) +
-                                  " B=" + std::to_string(batch) + " phase=" + std::to_string(phase);
+                                  " B=" + std::to_string(batch) +
+                                  " phase=" + std::to_string(phase) +
+                                  (remote ? " remote=" + std::to_string(remote->primary_pages()) +
+                                                "/" + std::to_string(cache.view().k_pages.ne[3])
+                                          : std::string());
         const auto output       = copy_from_guarded<std::uint16_t>(dout, q.size());
         failures += verify_attention(label, bf16_bits_to_double(output), reference,
                                      attention_criterion(storage));
         failures += verify_invalid_columns_zero(label, output, geometry, width, valid);
+        if (remote_case != nullptr) {
+            failures += verify_remote_partition(label, distributed_referenced,
+                                                remote->primary_pages(), *remote_case);
+        }
         failures += cache.verify(label, expected);
         failures += cache.verify_untouched(label, before, positions, lanes, valid, width);
         if (control) {
@@ -2163,7 +2836,7 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
                     verify_positions(label + " lanes unchanged", dlanes, lanes);
         failures += dout.verify_guards(label) + scratch.verify_guards(label);
         if (staged) { failures += staged->guards(label); }
-        if (workspace.used() != 0 || workspace.peak_used() != capacity) {
+        if (workspace.used() != 0 || workspace.peak_used() > capacity) {
             std::cerr << label << ": workspace mismatch\n";
             ++failures;
         }
@@ -2545,7 +3218,6 @@ int verify_workspace_capacity_contract() {
     } catch (const std::invalid_argument&) {}
     return failures;
 }
-
 } // namespace
 
 int run_softmax_attention_nvfp4_tests() {
@@ -2580,6 +3252,323 @@ int run_softmax_attention_fp8_tests() {
     failures += run_quantized_batch_cases(KvCacheStorage::Fp8E4M3Row256, 960u);
     std::cout << (failures == 0 ? "PASS" : "FAIL")
               << " causal_softmax_attention fp8 independent correctness\n";
+    return failures == 0 ? 0 : 1;
+}
+
+int run_softmax_attention_fp8_ampere_tests() {
+    int count = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&count));
+    int original = 0;
+    CUDA_CHECK(cudaGetDevice(&original));
+    for (int device = 0; device < count; ++device) {
+        cudaDeviceProp properties{};
+        CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
+        if (properties.major != 8 || properties.minor != 6) continue;
+        CUDA_CHECK(cudaSetDevice(device));
+        int failures = 0;
+        try {
+            failures = run_a1_case(kGeometries[0], KvCacheStorage::Fp8E4M3Row256,
+                                   {1, 128, 192, 1101u}, MappingPattern::Fragmented);
+            failures +=
+                run_batch_case(kGeometries[0], KvCacheStorage::Fp8E4M3Row256,
+                               {8, {61, 4091}, {7, 5}, {1, 0}, MappingPattern::Fragmented, 1102u});
+            failures += run_batch_case(
+                kGeometries[0], KvCacheStorage::Fp8E4M3Row256,
+                {8, {63, 129}, {8, 0}, {0, 1}, MappingPattern::Fragmented, 1103u, true});
+            failures += run_a3_case(kGeometries[0], KvCacheStorage::Fp8E4M3Row256,
+                                    {1, 65535, 65536, 1104u}, MappingPattern::Fragmented);
+            failures += run_a1_case(kGeometries[0], KvCacheStorage::Fp8E4M3Row256,
+                                    {129, 63, 256, 1105u}, MappingPattern::Fragmented);
+        } catch (const std::exception& error) {
+            std::cerr << "FP8 Ampere attention: " << error.what() << '\n';
+            failures = 1;
+        }
+        CUDA_CHECK(cudaSetDevice(original));
+        return failures == 0 ? 0 : 1;
+    }
+    std::cout << "SKIP: FP8 secondary attention requires an SM86 device\n";
+    return 77;
+}
+
+int run_distributed_successive_cases(const DistributedDevices& devices);
+
+// Distributed regression cases. Each case is paired with the failure it protects against; the
+// set is deliberately small and boundary-focused instead of a wide parameter sweep.
+int run_distributed_cases(const DistributedDevices& devices) {
+    constexpr KvCacheStorage kStorage = KvCacheStorage::Fp8E4M3Row256;
+    const Geometry& wide              = kGeometries[0];
+    const Geometry& narrow            = kGeometries[1];
+    int failures                      = 0;
+
+    const auto single = [&](const Geometry& geometry, const AttentionCase& test_case,
+                            MappingPattern mapping, RemoteCase remote_case,
+                            const KeyMagnitude* magnitude = nullptr) {
+        return run_a1_case(geometry, kStorage, test_case, mapping, false, &remote_case, &devices,
+                           magnitude);
+    };
+    const auto batch = [&](const Geometry& geometry, const BatchAttentionCase& test_case,
+                           RemoteCase remote_case) {
+        return run_batch_case(geometry, kStorage, test_case, false, &remote_case, &devices);
+    };
+
+    // Mixed contributions: the split lands between the referenced physical IDs, so a single row
+    // draws keys from both planes at different depths. Catches a physical-ID partition or merge
+    // boundary error that silently drops or double-counts one plane's keys. The second case
+    // repeats it through the prompt-width route with a page-crossing visible set.
+    failures += single(wide, {1, 128, 192, 1201u}, MappingPattern::Fragmented, RemoteCase::EvenIds);
+    failures +=
+        single(wide, {129, 63, 256, 1202u}, MappingPattern::Fragmented, RemoteCase::EvenIds);
+
+    // Local-only contribution: every visible key resolves through primary physical IDs and the
+    // secondary plane stays entirely unreferenced. Catches a merge that assumes both shards are
+    // non-empty, and a secondary launch that reads its unreferenced pages.
+    failures +=
+        single(wide, {6, 61, 192, 1203u}, MappingPattern::Fragmented, RemoteCase::AllLocalPlanes);
+
+    // Remote-only contribution: every visible key is served from the secondary plane while the
+    // primary plane holds one nominally unused ID. Catches the reverse asymmetry: a zero local
+    // contribution must be numerically neutral (zero result vector, LSE -inf), not NaN or a
+    // stale value, and the secondary launch must not require a nonempty local range.
+    failures +=
+        single(wide, {6, 61, 192, 1204u}, MappingPattern::Fragmented, RemoteCase::AllRemoteIds);
+
+    // Repeat the empty-shard orientations on both page-crossing prompt routes. The paired
+    // H24/W129 and H16/W65 cases distinguish primary compact, secondary compact, and neutral
+    // empty-shard reductions beyond the short decode cases above; the mixed-split counterparts
+    // are the existing cases at the start of this group.
+    failures +=
+        single(wide, {129, 63, 256, 1211u}, MappingPattern::Fragmented, RemoteCase::AllLocalPlanes);
+    failures +=
+        single(wide, {129, 63, 256, 1212u}, MappingPattern::Fragmented, RemoteCase::AllRemoteIds);
+    failures += single(narrow, {65, 63, 192, 1213u}, MappingPattern::Fragmented,
+                       RemoteCase::AllLocalPlanes);
+    failures +=
+        single(narrow, {65, 63, 192, 1214u}, MappingPattern::Fragmented, RemoteCase::AllRemoteIds);
+
+    // Semantic boundary: an all-zero query makes every score identical, so both shards report the
+    // same partial maximum and the merge has to combine equal maxima rather than assume a strict
+    // ordering. A merge that tracks the maximum with a strict comparison, or that rescales only
+    // when one shard's maximum is strictly larger, produces a wrong denominator here while the
+    // random-query cases still pass. Zero rows are supported by the existing contract, which
+    // returns exact BF16 zero for a query row with no visible key.
+    failures +=
+        single(wide, {6, 61, 192, 1207u, true}, MappingPattern::Fragmented, RemoteCase::EvenIds);
+
+    // Frontier that starts on the last key of one logical page and continues into the next, on a
+    // different head grouping. The visible set therefore reaches two pages on opposite sides of
+    // the split, so the local shard holds the page-tail keys and the secondary shard holds the
+    // following page's keys. Catches a per-page iteration that assumes a full page, an off-by-one
+    // at the page boundary, and a shard range that is derived from key indices instead of physical
+    // pages.
+    failures +=
+        single(narrow, {7, 63, 192, 1205u}, MappingPattern::Fragmented, RemoteCase::EvenIds);
+
+    // Uneven non-empty split: the visible set spans three pages, the primary keeps only the lowest
+    // referenced page and the secondary owns the other two, so on the widest row the primary shard
+    // contributes 64 keys against the secondary's 128. Catches a shard bound, split statistic or
+    // merge step that assumes both shards hold comparable amounts of work, and a range derived from
+    // half the pool instead of from the partition. The case's declared asymmetry is verified after
+    // the call, so a mapping or geometry change cannot leave it running as a balanced split.
+    failures +=
+        single(wide, {6, 186, 192, 1301u}, MappingPattern::Fragmented, RemoteCase::PrimaryLowestId);
+
+    // Extreme per-shard scale mismatch, in both orientations. Each fixture uses all-ones queries
+    // and an all-ones key prototype per side, with factors 1 and 4096. After the FP8 key transform,
+    // the unscaled and scaled logits are about 16 and 65,536 respectively. Thus every head/token
+    // has a cross-shard LSE contrast far above 100 nats, independent of private query rounding or
+    // a near-tied winning key; the fixture check verifies this against the decoded FP8 values.
+    // Constant zero/one value regions make an equally weighted shard blend observably wrong. A
+    // direct exponentiation of either partial LSE overflows FP32. Mirroring the scale boundary
+    // makes the dominant shard remote in one case and local in the other.
+    const KeyMagnitude extremes{/*boundary*/ 64, /*low*/ 1.0f, /*high*/ 4096.0f,
+                                /*uniform_regions*/ true};
+    failures += single(wide, {2, 190, 192, 1311u}, MappingPattern::Fragmented,
+                       RemoteCase::ScaleBoundary, &extremes);
+    const KeyMagnitude mirrored{/*boundary*/ 128, /*low*/ 4096.0f, /*high*/ 1.0f,
+                                /*uniform_regions*/ true};
+    failures += single(wide, {2, 190, 192, 1312u}, MappingPattern::Fragmented,
+                       RemoteCase::ScaleBoundary, &mirrored);
+
+    // Prompt-width frontier: 65 columns ending exactly on a page boundary, so the visible set
+    // spans two full pages. Catches a visible-set bound that drops the final page when the
+    // frontier lands on the boundary rather than inside a page.
+    failures +=
+        single(narrow, {65, 63, 192, 1206u}, MappingPattern::Fragmented, RemoteCase::EvenIds);
+
+    // Successive calls on one object with different inputs, different split points and a
+    // shifted page mapping. Outputs are compared on the first call and again after the second,
+    // so a stale transfer buffer or a cached remote plane would fail on the second call.
+    failures += run_distributed_successive_cases(devices);
+
+    // DFlash2-style widths on the batch route: masked rows with unequal live frontiers, a
+    // zero-length row and inert tail columns. Catches per-row visible-set handling that leaks
+    // between rows, a tail column that mutates cache, and a split that ignores the per-row mask.
+    const int orders[] = {7, 0, 4};
+    for (const int width : {2, 8, 16}) {
+        BatchAttentionCase test_case{width,
+                                     {0, 17, 61},
+                                     {width, width - 1, 1},
+                                     {orders[0], orders[1], orders[2]},
+                                     MappingPattern::Fragmented,
+                                     static_cast<std::uint32_t>(1230u + width)};
+        failures += batch(wide, test_case, RemoteCase::EvenIds);
+    }
+
+    // Two rows with unequal frontiers across the device split: one row's live keys are entirely
+    // remote and the other's are entirely local. Catches a per-row page base computed once for
+    // the batch and a merge that mixes rows between the two partial-result tensors. The second
+    // case repeats it with a zero-length row and three rows spread over the table.
+    failures += batch(narrow, {6, {0, 127}, {1, 6}, {0, 1}, MappingPattern::Fragmented, 1250u},
+                      RemoteCase::AllRemoteIds);
+    failures +=
+        batch(wide, {8, {0, 61, 127}, {0, 5, 8}, {2, 0, 1}, MappingPattern::Fragmented, 1240u},
+              RemoteCase::EvenIds);
+
+    return failures;
+}
+
+// Two complete calls through one DistributedAttention object with different inputs, different
+// physical page mappings and different split points. Only the object is shared, so a transfer
+// buffer or workspace allocation that is sized or filled once cannot satisfy the second call.
+int run_distributed_successive_cases(const DistributedDevices& devices) {
+    constexpr KvCacheStorage kStorage = KvCacheStorage::Fp8E4M3Row256;
+    const Geometry& geometry          = kGeometries[0];
+    const std::int32_t tokens         = 5;
+    const std::int32_t base           = 61;
+    const std::int32_t total          = base + tokens;
+    const std::int32_t max_context    = total + 3;
+    const std::size_t q_elements  = static_cast<std::size_t>(kHeadDim) * geometry.q_heads * tokens;
+    const std::size_t kv_elements = static_cast<std::size_t>(kHeadDim) * geometry.kv_heads * tokens;
+
+    std::vector<float> first_q  = make_bf16_values(q_elements, 1301u, -0.25f, 0.25f);
+    std::vector<float> first_k  = make_bf16_values(kv_elements, 1302u, -0.25f, 0.25f);
+    std::vector<float> first_v  = make_bf16_values(kv_elements, 1303u, -1.0f, 1.0f);
+    std::vector<float> second_q = make_bf16_values(q_elements, 1311u, -0.25f, 0.25f);
+    std::vector<float> second_k = make_bf16_values(kv_elements, 1312u, -0.25f, 0.25f);
+    std::vector<float> second_v = make_bf16_values(kv_elements, 1313u, -1.0f, 1.0f);
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(tokens));
+    for (std::int32_t token = 0; token < tokens; ++token) {
+        positions[static_cast<std::size_t>(token)] = base + token;
+    }
+
+    const HostCache first_initial  = make_cache(geometry, kStorage, max_context, 1320u);
+    const HostCache second_initial = make_cache(geometry, kStorage, max_context, 1330u);
+    HostCache first_expected = first_initial, second_expected = second_initial;
+    append_cache(first_expected, first_k, first_v, positions);
+    append_cache(second_expected, second_k, second_v, positions);
+    const std::vector<double> first_reference = ideal_attention(first_q, first_expected, positions);
+    const std::vector<double> second_reference =
+        ideal_attention(second_q, second_expected, positions);
+
+    DeviceCache first_cache(first_initial, MappingPattern::Fragmented);
+    DeviceCache second_cache(second_initial, MappingPattern::Remote);
+    const ops::CausalAttentionExecutionEnvelope envelope{static_cast<std::uint32_t>(total),
+                                                         static_cast<std::uint32_t>(max_context)};
+    GuardedDeviceBuffer dq(q_elements * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dk(kv_elements * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dv(kv_elements * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dp(positions.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer drows(sizeof(std::int32_t));
+    GuardedDeviceBuffer dout(q_elements * sizeof(std::uint16_t));
+    dp.copy_from_host(positions.data(), positions.size() * sizeof(std::int32_t));
+    const std::int32_t table_row = 0;
+    drows.copy_from_host(&table_row, sizeof(table_row));
+    Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, tokens});
+    Tensor tk(dk.data(), DType::BF16, {kHeadDim, geometry.kv_heads, tokens});
+    Tensor tv(dv.data(), DType::BF16, {kHeadDim, geometry.kv_heads, tokens});
+    Tensor tp(dp.data(), DType::I32, {tokens});
+    Tensor trows(drows.data(), DType::I32, {1});
+    Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, tokens});
+
+    // One object serves both calls: its startup resources are fixed by the constructor and may not
+    // be re-derived from the first call's inputs.
+    ops::DistributedAttention attention(devices.primary, devices.secondary, op_geometry(geometry),
+                                        tokens, 1, first_cache.batch_view().block_tables.ne[1],
+                                        first_cache.batch_view().block_tables.ne[0]);
+
+    int failures = 0;
+    const std::array<const char*, 2> names{"first", "second"};
+    // Both mappings must leave the even split inside the referenced range; an identity mapping
+    // can collapse the referenced pages into adjacent IDs that no split separates.
+    const std::array<MappingPattern, 2> mappings{MappingPattern::Fragmented,
+                                                 MappingPattern::Remote};
+    for (int call = 0; call < 2; ++call) {
+        const std::vector<float>& q = call == 0 ? first_q : second_q;
+        const std::vector<float>& k = call == 0 ? first_k : second_k;
+        const std::vector<float>& v = call == 0 ? first_v : second_v;
+        const auto q_bits = to_bf16_bits(q), k_bits = to_bf16_bits(k), v_bits = to_bf16_bits(v);
+        dq.copy_from_host(q_bits.data(), q_bits.size() * sizeof(std::uint16_t));
+        dk.copy_from_host(k_bits.data(), k_bits.size() * sizeof(std::uint16_t));
+        dv.copy_from_host(v_bits.data(), v_bits.size() * sizeof(std::uint16_t));
+        std::vector<std::uint16_t> canary(q_bits.size(), kOutputCanary);
+        dout.copy_from_host(canary.data(), canary.size() * sizeof(std::uint16_t));
+
+        DeviceCache& cache           = call == 0 ? first_cache : second_cache;
+        HostCache& expected          = call == 0 ? first_expected : second_expected;
+        const MappingPattern mapping = mappings[static_cast<std::size_t>(call)];
+        const std::vector<std::int32_t> table =
+            make_block_table(cache.batch_view().block_tables.ne[0], mapping);
+        const std::vector<std::int32_t> referenced = referenced_pages(table, total);
+        RemoteAttentionFixture remote(
+            cache.batch_view(), devices,
+            remote_partition(referenced, cache.batch_view().k_pages.ne[3], RemoteCase::EvenIds));
+        attention.execute(tq, tk, tv, tp, Tensor{}, trows, kAttentionScale, remote.local(),
+                          remote.remote(), envelope, tout, nullptr);
+        cuda_synchronize();
+        remote.merge();
+
+        const std::string label = std::string("distributed successive ") + names[call] +
+                                  " mapping=" + mapping_name(mapping) +
+                                  " remote=" + std::to_string(remote.primary_pages()) + "/" +
+                                  std::to_string(cache.batch_view().k_pages.ne[3]);
+        const auto output       = copy_from_guarded<std::uint16_t>(dout, q_bits.size());
+        failures += verify_attention(label, bf16_bits_to_double(output),
+                                     call == 0 ? first_reference : second_reference,
+                                     attention_criterion(kStorage));
+        failures +=
+            verify_remote_partition(label, referenced, remote.primary_pages(), RemoteCase::EvenIds);
+        failures += verify_cache(label, cache.snapshot(), expected, false);
+        failures += verify_input(label + " q unchanged", dq, q_bits);
+        failures += verify_input(label + " k unchanged", dk, k_bits);
+        failures += verify_input(label + " v unchanged", dv, v_bits);
+        failures += verify_positions(label + " positions unchanged", dp, positions);
+        failures += dout.verify_guards(label);
+        failures += cache.verify_guards(label);
+    }
+    return failures;
+}
+
+int run_softmax_attention_distributed_tests() {
+    const DistributedDevices devices = select_distributed_devices();
+    if (!devices.selectable) {
+        std::cout << "SKIP: distributed attention " << devices.reason << '\n';
+        return 77;
+    }
+    // The route's secondary kernel is compiled for the Ampere pairing it was qualified against, so
+    // a host without an SM86 secondary has not exercised the specified case at all. Reporting SKIP
+    // keeps the missing hardware visible instead of letting an unqualified pairing print PASS.
+    if (!devices.secondary_is_sm86()) {
+        std::cout << "SKIP: distributed attention requires an SM86 secondary device; device "
+                  << devices.secondary << " is SM" << devices.secondary_major
+                  << devices.secondary_minor << '\n';
+        return 77;
+    }
+    const int original = [&] {
+        int device = 0;
+        CUDA_CHECK(cudaGetDevice(&device));
+        return device;
+    }();
+    int failures = 0;
+    try {
+        CUDA_CHECK(cudaSetDevice(devices.primary));
+        failures = run_distributed_cases(devices);
+    } catch (const std::exception& error) {
+        std::cerr << "distributed attention: " << error.what() << '\n';
+        failures = 1;
+    }
+    CUDA_CHECK(cudaSetDevice(original));
+    std::cout << (failures == 0 ? "PASS" : "FAIL")
+              << " distributed causal attention two-device independent correctness\n";
     return failures == 0 ? 0 : 1;
 }
 

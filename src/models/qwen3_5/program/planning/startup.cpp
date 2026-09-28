@@ -10,6 +10,8 @@
 #include "core/device.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/candidate_selector.h"
+#include "ninfer/ops/distributed_attention.h"
+
 #include "ninfer/ops/context_kv_materialize.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 #include "ninfer/ops/linear_topk.h"
@@ -47,6 +49,20 @@ enum class GdnWorkspacePath : std::uint8_t {
 std::size_t checked_add(std::size_t a, std::size_t b, const char* label) {
     if (b > std::numeric_limits<std::size_t>::max() - a) { throw std::overflow_error(label); }
     return a + b;
+}
+
+std::size_t free_device_bytes(int device) {
+    int previous_device = 0;
+    CUDA_CHECK(cudaGetDevice(&previous_device));
+    const bool switched = previous_device != device;
+    if (switched) { CUDA_CHECK(cudaSetDevice(device)); }
+    std::size_t free_bytes    = 0;
+    std::size_t total_bytes   = 0;
+    const cudaError_t query   = cudaMemGetInfo(&free_bytes, &total_bytes);
+    const cudaError_t restore = switched ? cudaSetDevice(previous_device) : cudaSuccess;
+    if (query != cudaSuccess) { CUDA_CHECK(query); }
+    CUDA_CHECK(restore);
+    return free_bytes;
 }
 
 std::size_t checked_mul(std::size_t a, std::size_t b, const char* label) {
@@ -140,12 +156,26 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 plan.active_kv.secondary_device
                     ? plan.active_kv.resident_tokens / static_cast<std::uint32_t>(kPagedKVPageSize)
                     : 0,
-            .text_overflow_device = plan.active_kv.secondary_device,
-            .active_step_capacity = static_cast<std::uint32_t>(checked_i32(
+            .text_overflow_device         = plan.active_kv.secondary_device,
+            .active_step_capacity         = static_cast<std::uint32_t>(checked_i32(
                 static_cast<std::uint64_t>(std::max(
                     effective_prefill_chunk, static_cast<std::int32_t>(plan.draft_window + 1))) *
                     plan.max_concurrency,
                 "active KV step metadata capacity exceeds int32")),
+            .remote_attention_device      = plan.remote_attention.secondary_device,
+            .remote_full_attention_layers = plan.remote_attention.secondary_device
+                                                ? plan.remote_attention.full_attention_layers
+                                                : 0,
+            .attention_query_heads        = plan.remote_attention.secondary_device
+                                                ? dimension(config.attention->num_attention_heads)
+                                                : 0,
+            .max_attention_width = plan.remote_attention.secondary_device
+                                       ? std::max(effective_prefill_chunk,
+                                                  static_cast<std::int32_t>(plan.draft_window + 1U))
+                                       : 0,
+            .max_attention_batch = plan.remote_attention.secondary_device
+                                       ? static_cast<std::int32_t>(plan.max_concurrency)
+                                       : 0,
         });
     qwen3_5::StateImageSpec state_image_spec{
         .linear =
@@ -786,6 +816,48 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     default:
         throw std::invalid_argument("unknown kv_capacity policy");
     }
+    const RemoteAttentionOptions& remote = options.remote_attention;
+    if (remote.secondary_device.has_value() != (remote.full_attention_layers != 0)) {
+        throw std::invalid_argument(
+            "remote attention requires both a secondary device and a positive layer count");
+    }
+    if (remote.secondary_device) {
+        if (options.use_cuda_graph) {
+            throw std::invalid_argument(
+                "host-mediated two-device attention cannot be captured by CUDA graphs; "
+                "disable CUDA graphs for remote attention");
+        }
+        const auto& config = parameters.model.config().text;
+        if (options.purpose != EnginePurpose::Generation || *remote.secondary_device < 0 ||
+            *remote.secondary_device == options.device ||
+            options.kv_cache != KvCacheStorage::Fp8E4M3Row256 ||
+            (options.speculative.backend != SpeculativeBackend::None &&
+             options.speculative.backend != SpeculativeBackend::DFlash2)) {
+            throw std::invalid_argument(
+                "remote attention requires FP8 generation, a distinct nonnegative GPU, "
+                "and none or DFlash2 speculation");
+        }
+        if (remote.full_attention_layers > config.full_attention_layers) {
+            throw std::invalid_argument(
+                "remote full-attention layer count exceeds the model's full-attention layers");
+        }
+        if (options.kv_capacity.mode != KvCapacityMode::Explicit ||
+            options.kv_capacity.explicit_tokens % static_cast<std::uint32_t>(kPagedKVPageSize) !=
+                0) {
+            throw std::invalid_argument(
+                "remote attention requires an explicit page-aligned total KV capacity");
+        }
+        if (options.active_kv.secondary_device || options.active_kv.resident_tokens != 0) {
+            throw std::invalid_argument(
+                "remote full-layer attention and active KV suffix overflow are mutually exclusive");
+        }
+        if (options.context_cache.secondary_cache_device &&
+            *options.context_cache.secondary_cache_device != *remote.secondary_device) {
+            throw std::invalid_argument(
+                "remote attention and inactive secondary cache must use the same GPU");
+        }
+    }
+
     switch (options.speculative.backend) {
     case SpeculativeBackend::None:
         if (options.speculative.draft_tokens != 0 ||
@@ -812,6 +884,7 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         }
         break;
     }
+
     if (device.compute_capability() != 120) {
         throw std::invalid_argument("Qwen3.5 family runtime requires compute capability 12.0");
     }
@@ -839,10 +912,26 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->causal_scoring      = inputs.causal_scoring;
     impl->device              = inputs.device;
     impl->context_cache       = inputs.context_cache;
+    impl->remote_attention    = inputs.remote_attention;
     impl->active_kv           = inputs.active_kv;
     impl->kv_storage          = inputs.kv_storage;
     impl->persistent          = persistent_layout(*impl);
-    impl->workspace           = build_workspace_plan(*impl);
+    if (impl->remote_attention.secondary_device) {
+        const auto& attention = *impl->parameters->model.config().text.attention;
+        const std::int32_t max_width =
+            std::max(static_cast<std::int32_t>(std::min(impl->prefill_chunk, impl->capacity)),
+                     static_cast<std::int32_t>(impl->draft_window + 1U));
+        impl->remote_attention_resources = ops::DistributedAttention::estimate_resources(
+            impl->device, *impl->remote_attention.secondary_device,
+            ops::AttentionHeadGeometry{.head_dim    = dimension(attention.head_dim),
+                                       .query_heads = dimension(attention.num_attention_heads),
+                                       .kv_heads    = dimension(attention.num_key_value_heads)},
+            max_width, checked_i32(impl->max_concurrency, "remote attention batch exceeds int32"),
+            checked_i32(impl->max_concurrency, "remote attention table rows exceed int32"),
+            checked_i32(page_count(impl->capacity),
+                        "remote attention logical page capacity exceeds int32"));
+    }
+    impl->workspace = build_workspace_plan(*impl);
     if (impl->use_cuda_graph) {
         // Definitions remain per execution profile, but only one executable is instantiated for
         // each reachable node-topology class. These bounds cover the largest profile installed in
@@ -886,8 +975,10 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     }
 
     impl->device_reservation_bytes = checked_add(
-        checked_add(impl->persistent.bytes, impl->workspace.capacity, "sequence memory plan"),
-        impl->graph_allowance_bytes, "sequence graph allowance");
+        checked_add(
+            checked_add(impl->persistent.bytes, impl->workspace.capacity, "sequence memory plan"),
+            impl->graph_allowance_bytes, "sequence graph allowance"),
+        impl->remote_attention_resources.primary_bytes, "remote attention primary resources");
     return impl;
 }
 
@@ -912,6 +1003,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .device              = options.device,
         .context_cache       = options.context_cache,
         .active_kv           = options.active_kv,
+        .remote_attention    = options.remote_attention,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
     std::uint32_t minimum_pages       = std::max(logical_pages, inputs.max_concurrency);
@@ -931,11 +1023,51 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         // local pages and double-buffer workspace are planned as one fixed budget.
         minimum_pages = maximum_pages = fixed_pages;
     }
+    if (options.remote_attention.secondary_device) {
+        const std::uint32_t fixed_pages = page_count(options.kv_capacity.explicit_tokens);
+        if (fixed_pages < minimum_pages || fixed_pages > maximum_pages) {
+            throw std::invalid_argument(
+                "remote attention total capacity is outside the supported request envelope");
+        }
+        // Static per-layer placement is sized against the complete fixed physical page namespace.
+        minimum_pages = maximum_pages = fixed_pages;
+    }
 
     auto planner     = std::make_unique<qwen3_5::detail::SequencePlannerImpl>();
     planner->inputs  = inputs;
     planner->minimum = build_sequence_candidate(inputs, minimum_pages);
-    planner->curve   = runtime::SequenceCapacityCurve{
+    if (planner->inputs.remote_attention.secondary_device) {
+        const SequencePlanImpl& plan = *planner->minimum;
+        std::size_t required_bytes =
+            checked_add(plan.persistent.decoder.text_kv.pages.static_secondary_bytes,
+                        plan.remote_attention_resources.secondary_bytes,
+                        "remote attention secondary resources");
+        if (plan.context_cache.secondary_cache_device) {
+            const std::size_t cold_state_bytes = checked_mul(
+                plan.persistent.state_images.host.image_bytes,
+                plan.context_cache.secondary_cache_state_slots, "secondary cold state cache bytes");
+            required_bytes = checked_add(
+                required_bytes,
+                checked_add(cold_state_bytes, plan.context_cache.secondary_cache_kv_capacity_bytes,
+                            "secondary inactive cache bytes"),
+                "remote attention aggregate secondary resources");
+        }
+        constexpr std::size_t kSecondaryHeadroom = 1024ULL * 1024ULL * 1024ULL;
+        const std::size_t available_bytes =
+            free_device_bytes(*planner->inputs.remote_attention.secondary_device);
+        const std::size_t required_with_headroom =
+            checked_add(required_bytes, kSecondaryHeadroom, "remote attention secondary headroom");
+        if (available_bytes < required_with_headroom) {
+            throw std::invalid_argument(
+                "remote attention on secondary GPU " +
+                std::to_string(*planner->inputs.remote_attention.secondary_device) + " requires " +
+                std::to_string(required_bytes) +
+                " bytes for static KV, attention workspaces, and inactive cache, plus 1 GiB "
+                "free headroom; only " +
+                std::to_string(available_bytes) + " bytes are currently free");
+        }
+    }
+    planner->curve = runtime::SequenceCapacityCurve{
         .main_page_tokens                     = static_cast<std::uint32_t>(kPagedKVPageSize),
         .minimum_main_page_groups             = minimum_pages,
         .maximum_main_page_groups             = maximum_pages,

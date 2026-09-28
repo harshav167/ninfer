@@ -903,23 +903,62 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         const auto cache_view =
             batch_text_kv_->prepare_layer(fidx, position_batch, valid, kv_table_rows, s);
-        ops::causal_softmax_attention(
-            q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
-            {dimension(config_.attention->head_dim),
-             dimension(config_.attention->num_attention_heads),
-             dimension(config_.attention->num_key_value_heads)},
-            static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            cache_view, *active_causal_attention_envelope_, work_, a_batch, s);
+        if (batch_text_kv_->uses_remote_attention(static_cast<std::uint32_t>(fidx))) {
+            auto* remote = batch_text_kv_->remote_attention();
+            if (remote == nullptr) {
+                throw std::logic_error("remote attention layer has no execution wrapper");
+            }
+            remote->execute(
+                q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
+                static_cast<float>(1.0 /
+                                   std::sqrt(static_cast<double>(config_.attention->head_dim))),
+                cache_view,
+                batch_text_kv_->secondary_layer_planes(static_cast<std::uint32_t>(fidx)),
+                *active_causal_attention_envelope_, a_batch, s);
+        } else {
+            ops::causal_softmax_attention(
+                q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
+                {dimension(config_.attention->head_dim),
+                 dimension(config_.attention->num_attention_heads),
+                 dimension(config_.attention->num_key_value_heads)},
+                static_cast<float>(1.0 /
+                                   std::sqrt(static_cast<double>(config_.attention->head_dim))),
+                cache_view, *active_causal_attention_envelope_, work_, a_batch, s);
+        }
     } else {
-        const auto cache_view = batch_text_kv_->prepare_layer(fidx, cache_positions.view({T, 1}),
-                                                              Tensor{}, kv_table_rows, s);
-        ops::causal_softmax_attention(
-            qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
-            {dimension(config_.attention->head_dim),
-             dimension(config_.attention->num_attention_heads),
-             dimension(config_.attention->num_key_value_heads)},
-            static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
-            cache_view, *active_causal_attention_envelope_, work_, a, s);
+        const Tensor position_batch = cache_positions.view({T, 1});
+        const auto cache_view =
+            batch_text_kv_->prepare_layer(fidx, position_batch, Tensor{}, kv_table_rows, s);
+        if (batch_text_kv_->uses_remote_attention(static_cast<std::uint32_t>(fidx))) {
+            auto* remote = batch_text_kv_->remote_attention();
+            if (remote == nullptr) {
+                throw std::logic_error("remote attention layer has no execution wrapper");
+            }
+            Tensor a_batch = a.view({dimension(config_.attention->head_dim),
+                                     dimension(config_.attention->num_attention_heads), T, 1});
+            remote->execute(
+                qn.view({dimension(config_.attention->head_dim),
+                         dimension(config_.attention->num_attention_heads), T, 1}),
+                kn.view({dimension(config_.attention->head_dim),
+                         dimension(config_.attention->num_key_value_heads), T, 1}),
+                v.view({dimension(config_.attention->head_dim),
+                        dimension(config_.attention->num_key_value_heads), T, 1}),
+                position_batch, Tensor{}, kv_table_rows,
+                static_cast<float>(1.0 /
+                                   std::sqrt(static_cast<double>(config_.attention->head_dim))),
+                cache_view,
+                batch_text_kv_->secondary_layer_planes(static_cast<std::uint32_t>(fidx)),
+                *active_causal_attention_envelope_, a_batch, s);
+        } else {
+            ops::causal_softmax_attention(
+                qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
+                {dimension(config_.attention->head_dim),
+                 dimension(config_.attention->num_attention_heads),
+                 dimension(config_.attention->num_key_value_heads)},
+                static_cast<float>(1.0 /
+                                   std::sqrt(static_cast<double>(config_.attention->head_dim))),
+                cache_view, *active_causal_attention_envelope_, work_, a, s);
+        }
     }
     batch_text_kv_->complete_layer(fidx, s);
     ops::sigmoid_mul(gate, a, s);

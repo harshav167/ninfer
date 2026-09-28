@@ -2,6 +2,7 @@
 #include "ninfer/ops/softmax_attention.h"
 
 #include "core/layout.h"
+#include "core/device.h"
 #include "core/paged_kv_storage.h"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
@@ -21,6 +22,14 @@ constexpr std::int32_t kMaximumVerifyTokens          = 16;
 constexpr std::int32_t kMaximumBatchSize             = 8;
 constexpr std::uint32_t kTwoChunkPromptVisibleKeys   = 512;
 constexpr std::uint32_t kThreeChunkPromptVisibleKeys = 1024;
+
+bool fp8_uses_small_tiles(KvCacheStorage storage) {
+    if (storage != KvCacheStorage::Fp8E4M3Row256) return false;
+    int device = 0, major = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    CUDA_CHECK(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device));
+    return major == 8;
+}
 
 std::int32_t causal_attention_chunk_tokens(std::int32_t q_heads, std::int32_t width,
                                            std::int32_t batch_size, KvCacheStorage storage,
@@ -346,6 +355,10 @@ namespace detail {
 CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::int32_t width,
                                                     std::int32_t batch_size, KvCacheStorage storage,
                                                     CausalAttentionExecutionEnvelope envelope) {
+    if (fp8_uses_small_tiles(storage)) {
+        return width <= (q_heads == 24 ? 8 : 6) ? CausalAttentionRoute::SmallT
+                                                : CausalAttentionRoute::ChunkedSmallT;
+    }
     if (q_heads == 24 && width <= kMaximumVerifyTokens) {
         if (batch_size == 1) {
             std::uint32_t prompt_limit = 0;
@@ -438,6 +451,9 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
     };
 
     std::size_t maximum = 0;
+    if (fp8_uses_small_tiles(cache_storage) && max_width > kMaximumVerifyTokens) {
+        maximum = chunk_capacity(q_heads == 24 ? 8 : 6);
+    }
     if (min_width <= kMaximumVerifyTokens) {
         const std::int32_t last = std::min(max_width, kMaximumVerifyTokens);
         for (std::int32_t width = min_width; width <= last; ++width) {

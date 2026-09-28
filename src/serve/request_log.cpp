@@ -495,6 +495,12 @@ std::string format_server_start_json(
                    {"max_shared_prefixes", cache.max_shared_prefixes.value()},
                    {"max_long_anchors_per_continuation",
                     cache.max_long_anchors_per_continuation.value()}}}};
+    if (engine_options.remote_attention.secondary_device) {
+        record["engine"]["remote_attention"] =
+            Json{{"secondary_device", *engine_options.remote_attention.secondary_device},
+                 {"full_attention_layers", engine_options.remote_attention.full_attention_layers}};
+    }
+
     record["sampling_defaults"] =
         Json{{"thinking", preset_json(sampling_defaults.thinking)},
              {"non_thinking", preset_json(sampling_defaults.non_thinking)},
@@ -519,17 +525,22 @@ std::string format_server_start_json(
              {"host_state_occupied_slots", memory.host_state_occupied_slots},
              {"host_kv_capacity_bytes", memory.host_kv_capacity_bytes},
              {"host_kv_occupied_bytes", memory.host_kv_occupied_bytes}};
-    record["memory"]["secondary_cache_device"]         = memory.secondary_cache_device;
-    record["memory"]["secondary_state_capacity_slots"] = memory.secondary_state_capacity_slots;
-    record["memory"]["secondary_state_occupied_slots"] = memory.secondary_state_occupied_slots;
-    record["memory"]["secondary_kv_capacity_bytes"]    = memory.secondary_kv_capacity_bytes;
-    record["memory"]["secondary_kv_occupied_bytes"]    = memory.secondary_kv_occupied_bytes;
-    record["memory"]["secondary_staging_bytes"]        = memory.secondary_staging_bytes;
-    record["memory"]["active_kv_secondary_device"]     = memory.active_kv_secondary_device;
-    record["memory"]["active_kv_resident_tokens"]      = memory.active_kv_resident_tokens;
-    record["memory"]["active_kv_secondary_bytes"]      = memory.active_kv_secondary_bytes;
-    record["memory"]["active_kv_device_staging_bytes"] = memory.active_kv_device_staging_bytes;
-    record["memory"]["active_kv_host_staging_bytes"]   = memory.active_kv_host_staging_bytes;
+    record["memory"]["secondary_cache_device"]           = memory.secondary_cache_device;
+    record["memory"]["secondary_state_capacity_slots"]   = memory.secondary_state_capacity_slots;
+    record["memory"]["secondary_state_occupied_slots"]   = memory.secondary_state_occupied_slots;
+    record["memory"]["secondary_kv_capacity_bytes"]      = memory.secondary_kv_capacity_bytes;
+    record["memory"]["secondary_kv_occupied_bytes"]      = memory.secondary_kv_occupied_bytes;
+    record["memory"]["secondary_staging_bytes"]          = memory.secondary_staging_bytes;
+    record["memory"]["active_kv_secondary_device"]       = memory.active_kv_secondary_device;
+    record["memory"]["active_kv_resident_tokens"]        = memory.active_kv_resident_tokens;
+    record["memory"]["active_kv_secondary_bytes"]        = memory.active_kv_secondary_bytes;
+    record["memory"]["active_kv_device_staging_bytes"]   = memory.active_kv_device_staging_bytes;
+    record["memory"]["remote_attention_primary_bytes"]   = memory.remote_attention_primary_bytes;
+    record["memory"]["remote_attention_secondary_bytes"] = memory.remote_attention_secondary_bytes;
+    record["memory"]["remote_attention_host_staging_bytes"] =
+        memory.remote_attention_host_staging_bytes;
+    record["memory"]["static_secondary_kv_bytes"]    = memory.static_secondary_kv_bytes;
+    record["memory"]["active_kv_host_staging_bytes"] = memory.active_kv_host_staging_bytes;
     record["environment"] =
         Json{{"device", environment.device},
              {"gpu_name", environment.gpu_name},

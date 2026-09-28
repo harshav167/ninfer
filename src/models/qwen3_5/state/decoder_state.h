@@ -3,6 +3,7 @@
 #include "core/layout.h"
 #include "core/active_kv_stager.h"
 #include "core/paged_kv_cache.h"
+#include "ninfer/ops/distributed_attention.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -29,6 +30,11 @@ struct DecoderStateSpec {
     std::uint32_t text_resident_page_groups = 0;
     std::optional<int> text_overflow_device;
     std::uint32_t active_step_capacity = 0;
+    std::optional<int> remote_attention_device;
+    std::uint32_t remote_full_attention_layers = 0;
+    std::int32_t attention_query_heads         = 0;
+    std::int32_t max_attention_width           = 0;
+    std::int32_t max_attention_batch           = 0;
 };
 
 struct PagedKVCacheLayout {
@@ -40,6 +46,9 @@ struct PagedKVCacheLayout {
     PagedKVStorageLayout layer_storage;
     ActiveKVStagingLayout active_staging;
     std::uint32_t active_step_capacity = 0;
+    std::int32_t attention_query_heads = 0;
+    std::int32_t max_attention_width   = 0;
+    std::int32_t max_attention_batch   = 0;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept { return pages.payload_bytes(); }
 };
@@ -94,6 +103,16 @@ public:
                                                       const Tensor& table_rows,
                                                       cudaStream_t stream) const;
     void complete_layer(std::uint32_t layer, cudaStream_t stream) const;
+    [[nodiscard]] bool uses_remote_attention(std::uint32_t layer) const noexcept;
+    [[nodiscard]] PagedKVStagedPlanes secondary_layer_planes(std::uint32_t layer) const;
+
+    [[nodiscard]] ops::DistributedAttention* remote_attention() noexcept {
+        return remote_attention_.get();
+    }
+
+    [[nodiscard]] ops::DistributedAttention* remote_attention() const noexcept {
+        return remote_attention_.get();
+    }
 
     [[nodiscard]] std::uint64_t active_read_bytes() const noexcept {
         return active_stager_ ? active_stager_->read_bytes() : 0;
@@ -114,6 +133,7 @@ private:
     // Residency may change without changing any logical KV contents or owner.
     mutable DeviceKVPagePool pages_;
     mutable KVExecutionTablePool execution_tables_;
+    std::unique_ptr<ops::DistributedAttention> remote_attention_;
     std::uint32_t layers_      = 0;
     std::uint32_t max_context_ = 0;
     std::int32_t kv_heads_     = 0;

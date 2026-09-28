@@ -99,6 +99,46 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     } else if (options.active_kv.resident_tokens != 0) {
         throw std::invalid_argument("active KV local token budget requires a secondary device");
     }
+    const auto& remote = options.remote_attention;
+    if (!remote.secondary_device && remote.full_attention_layers != 0) {
+        throw std::invalid_argument(
+            "remote full-attention layer count requires a secondary device");
+    }
+    if (remote.secondary_device) {
+        const int secondary = *remote.secondary_device;
+        if (remote.full_attention_layers == 0) {
+            throw std::invalid_argument(
+                "remote attention secondary device requires a positive full-attention layer count");
+        }
+        if (options.purpose != EnginePurpose::Generation || secondary < 0 ||
+            secondary == options.device || options.kv_cache != KvCacheStorage::Fp8E4M3Row256 ||
+            (options.speculative.backend != SpeculativeBackend::None &&
+             options.speculative.backend != SpeculativeBackend::DFlash2)) {
+            throw std::invalid_argument(
+                "remote attention requires FP8 generation, a distinct nonnegative GPU, "
+                "and none or DFlash2 speculation");
+        }
+        if (options.kv_capacity.mode != KvCapacityMode::Explicit ||
+            options.kv_capacity.explicit_tokens % 64 != 0) {
+            throw std::invalid_argument(
+                "remote attention requires an explicit page-aligned total KV capacity");
+        }
+        if (options.active_kv.secondary_device || options.active_kv.resident_tokens != 0) {
+            throw std::invalid_argument(
+                "remote full-layer attention and active KV suffix overflow are mutually exclusive");
+        }
+        if (options.context_cache.secondary_cache_device &&
+            *options.context_cache.secondary_cache_device != secondary) {
+            throw std::invalid_argument(
+                "remote attention and inactive secondary cache must use the same GPU");
+        }
+        if (options.use_cuda_graph) {
+            throw std::invalid_argument(
+                "host-mediated two-device attention cannot be captured by CUDA graphs; "
+                "disable CUDA graphs for remote attention");
+        }
+    }
+
     switch (options.purpose) {
     case EnginePurpose::Generation:
         break;

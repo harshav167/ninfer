@@ -77,6 +77,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--secondary-cache-device N] [--secondary-cache-state-slots N] "
            "[--secondary-cache-kv-mib N] "
            "[--active-kv-secondary-device N] [--active-kv-local-tokens N] "
+           "[--remote-attention-secondary-device N] [--remote-attention-full-layers N] "
            "[--max-private-continuations N] [--max-shared-prefixes N] "
            "[--max-long-anchors-per-continuation N] "
            "[--request-log-jsonl FILE] "
@@ -251,6 +252,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--active-kv-local-tokens") {
             options.active_kv.resident_tokens = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--active-kv-local-tokens"), "active-kv-local-tokens"));
+        } else if (arg == "--remote-attention-secondary-device") {
+            options.remote_attention.secondary_device =
+                parse_nonnegative_int(require_value("--remote-attention-secondary-device"),
+                                      "remote-attention-secondary-device");
+        } else if (arg == "--remote-attention-full-layers") {
+            options.remote_attention.full_attention_layers = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--remote-attention-full-layers"),
+                                      "remote-attention-full-layers"));
         } else if (arg == "--max-private-continuations") {
             options.context_cache.max_private_continuations =
                 static_cast<std::uint32_t>(parse_nonnegative_int(
@@ -350,6 +359,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else {
             throw std::invalid_argument("unknown argument: " + arg);
         }
+    }
+    if (options.remote_attention.secondary_device.has_value() !=
+        (options.remote_attention.full_attention_layers != 0)) {
+        throw std::invalid_argument(
+            "remote attention requires both a secondary device and a positive full-layer count");
+    }
+    if (options.remote_attention.secondary_device && !kv_capacity_explicit) {
+        throw std::invalid_argument("remote attention requires an explicit --kv-capacity");
     }
     if (!kv_capacity_explicit) {
         options.kv_capacity = KvCapacityPolicy::explicit_capacity(options.max_context);

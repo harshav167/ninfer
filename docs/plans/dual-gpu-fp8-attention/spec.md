@@ -1,8 +1,8 @@
 # Dual-stream FP8 inference with near-KV attention
 
-**Status:** proposed; documentation only. Implementation is not authorized by creation of these documents.
+**Status:** implementation authorized; production cutover remains separately gated.
 **Triage:** ready-for-agent, subject to the execution gates below.
-**Execution method:** `/skill:tdd`, working directly without subagents.
+**Execution method:** `/skill:tdd`; task-agent implementation with Main orchestration, review and verification, as subsequently requested by the owner.
 
 ## Problem Statement
 
@@ -53,9 +53,9 @@ This explicitly changes the previous storage-only role of the 3070. Approval is 
 
 ### Execution gates
 
-- Confirm the two test seams described below before writing tests.
-- Approve the narrowly scoped secondary-device attention role; the previous storage-only restriction remains binding until then.
-- Confirm ticket granularity and dependencies before implementation starts. Writing local tickets does not imply that review has occurred.
+- The owner approved implementation after the proposed attention/Engine seams, limited secondary-device attention role and ticket breakdown were presented.
+- The owner initially selected direct local implementation, then explicitly requested task-agent fan-out under the orchestration workflow. No commits or PR publication remain authorized.
+- The owner authorized temporary service downtime for GPU qualification with restoration of the existing deployment afterward; this does not authorize production cutover.
 - Retain the stronger interpretation of the throughput objective: 150 TPS per stream, at least 300 aggregate, during genuine overlapping decode. Any weaker target requires an explicit decision.
 
 ### Architecture and ownership
@@ -87,14 +87,14 @@ This explicitly changes the previous storage-only role of the 3070. Approval is 
 
 ### Operational constraints
 
-- Work directly; no subagents. Implementation work must invoke/read `/skill:tdd` before each new red–green cycle.
+- Use task agents with disjoint file ownership for implementation; Main owns review and verification. Implementation work follows `/skill:tdd`; agents skip builds/tests/formatters and Main runs red/green gates between editing waves.
 - Build with `cmake --build build -j 2`, selecting affected targets where appropriate. Do not change system resource limits, drivers or dependencies unless separately authorized and necessary.
 - Keep production running unchanged during planning. Coordinate any later exclusive GPU validation explicitly. No automatic production cutover, commits, PRs or issue publication.
 - Keep existing artifacts; no model replacement, conversion or download is authorized by this plan.
 
 ## Testing Decisions
 
-### Proposed seams — awaiting confirmation
+### Approved test seams
 
 1. **Primary behavioral seam: public Engine generation.** Submit real requests, consume GenerationHandle events/results, and inspect existing public runtime summaries where necessary. Exercise concurrency, cache reuse, state settlement, cancellation and recovery through this boundary. Do not introduce private allocator/stager test APIs for the feature.
 2. **Necessary numerical seam: complete causal Softmax Attention Op.** Engine text output cannot establish floating-point correctness. Invoke the real production route and independently decode packed K/V for the existing naive FP32/FP64 oracle. Cover the represented input domain and relevant real model shapes.
@@ -137,7 +137,7 @@ These are the only proposed new-test locations by semantic boundary. Existing HT
 - Implementing MTP-10 merely because Cinference supports it; it remains a separately scoped candidate.
 - New scheduling priorities, active-request preemption, broader concurrency than the requested two streams, or protocol redesign.
 - Changes to OMP source, unrelated system configuration, or the paused model-evaluation campaign.
-- Production deployment or runtime implementation during this documentation task.
+- Automatic production cutover without a separate acceptance decision.
 
 ## Further Notes
 

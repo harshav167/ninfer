@@ -18,6 +18,18 @@
 
 namespace ninfer::ops {
 
+// Compact cross-device attention hand-off. A shard publishes one normalized value vector plus one
+// extra FP32 component holding its logsumexp, so two devices can be combined without exchanging
+// unnormalized numerators, split statistics, or the KV bytes the shard was reduced from.
+inline constexpr int kCausalFp8Components   = kCausalHeadDim + 1;
+inline constexpr int kCausalFp8CompactBlock = 256;
+inline constexpr int kCausalFp8MergeBlock   = 256;
+inline constexpr float kCausalFp8Log2E      = 1.4426950408889634074F;
+
+// Physical-page filter bound meaning "every block-table entry belongs to this device". The ordinary
+// all-local route passes this bound so the tiled kernel's page filter is inert.
+inline constexpr int kCausalFp8AllLocalPages = 0x7fffffff;
+
 __device__ __forceinline__ int4 causal_small_t_fp8_dequant_f16x8(const std::uint8_t* codes,
                                                                  __half scale) {
     const int2 raw         = load_vec<int2>(codes);
@@ -42,16 +54,22 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t column_begin, std::int32_t logical_capacity, float attention_scale,
-        float* partial_acc, float* partial_m, float* partial_l) {
-    constexpr int Wc                   = WarpsPerCta;
-    constexpr int RowCount             = TokenTile * Geometry::GroupSize;
-    constexpr int RowTiles             = (RowCount + 15) / 16;
-    constexpr int Br                   = RowTiles * 16;
-    constexpr int Bc                   = KeyBlock;
-    constexpr int D                    = kCausalHeadDim;
+        float* partial_acc, float* partial_m, float* partial_l, int physical_begin = 0,
+        int physical_end = kCausalFp8AllLocalPages) {
+    constexpr int Wc       = WarpsPerCta;
+    constexpr int RowCount = TokenTile * Geometry::GroupSize;
+    constexpr int RowTiles = (RowCount + 15) / 16;
+    constexpr int Br       = RowTiles * 16;
+    constexpr int Bc       = KeyBlock;
+    constexpr int D        = kCausalHeadDim;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+    constexpr bool HalfQK = true;
+#else
+    constexpr bool HalfQK = false;
+#endif
     constexpr int DB16                 = D / 2;
     constexpr int Threads              = Wc * 32;
-    constexpr int QKKs                 = D / 32;
+    constexpr int QKKs                 = D / (HalfQK ? 16 : 32);
     constexpr int QKNt                 = Bc / 8;
     constexpr int PStride              = Bc == 32 ? 64 : Bc;
     constexpr int ConsumerWarpsPerTile = Wc / RowTiles;
@@ -68,15 +86,16 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     static_assert(RowTiles >= 1 && RowTiles <= 3);
     static_assert(Wc > RowTiles && Wc % RowTiles == 0);
     static_assert(PVNtPerWarp == 4 || PVNtPerWarp == 8 || PVNtPerWarp == 16);
-    static_assert(QKKs == 8);
-    __shared__ __align__(16) std::uint8_t q_s[Br * D];
-    __shared__ __align__(16) std::uint8_t static_arena[DynamicArena ? 16 : 4 * Bc * D];
+    __shared__ __align__(16) std::uint8_t q_s[Br * D * (HalfQK ? 2 : 1)];
+    __shared__ __align__(16)
+        std::uint8_t static_arena[DynamicArena ? 16 : (HalfQK ? 6 : 4) * Bc * D];
     extern __shared__ __align__(16) std::uint8_t dynamic_arena[];
     std::uint8_t* arena  = DynamicArena ? dynamic_arena : static_arena;
     float* q_scale_tmp   = reinterpret_cast<float*>(arena);
     std::uint8_t* k_fp8  = arena;
     std::uint8_t* v_fp8  = arena + Bc * D;
     __half* v_f16        = reinterpret_cast<__half*>(arena + 2 * Bc * D);
+    __half* k_half       = reinterpret_cast<__half*>(arena + 4 * Bc * D);
     __nv_bfloat16* q_b16 = reinterpret_cast<__nv_bfloat16*>(q_s);
     __nv_bfloat16* k_b16 = reinterpret_cast<__nv_bfloat16*>(k_fp8);
     __shared__ __align__(16) __half p_s[Br * PStride];
@@ -193,8 +212,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         for (int token = warp; token < valid_tokens; token += Wc) {
             const int position = positions[token];
             if (position < split_start || position >= split_end) continue;
-            const int physical_page =
-                physical_pages_s[(position >> kPagedKVPageShift) - first_page];
+            int physical_page = physical_pages_s[(position >> kPagedKVPageShift) - first_page];
+            if (physical_page < physical_begin || physical_page >= physical_end) continue;
+            physical_page -= physical_begin;
             const int page_offset = position & kPagedKVPageMask;
             float values[8];
             float local_absmax = 0.0F;
@@ -242,7 +262,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         __syncthreads();
     }
 
-    for (int index = tid; index < Br * D; index += Threads) q_s[index] = 0;
+    for (int index = tid; index < static_cast<int>(sizeof(q_s)); index += Threads) q_s[index] = 0;
     for (int row = tid; row < RowCount; row += Threads) q_scale_tmp[row] = 0.0F;
     __syncthreads();
 
@@ -266,8 +286,16 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 #pragma unroll
         for (int r = 0; r < 8; ++r) {
             const int d = lane + 32 * r;
-            causal_small_t_store_byte_swizzled(q_s, row, d, DB16,
-                                               kv_cache_fp8_quant_code(values[r], inv));
+            if constexpr (HalfQK) {
+                const auto code = kv_cache_fp8_quant_code(values[r], inv);
+                __nv_fp8_e4m3 represented;
+                represented.__x = code;
+                reinterpret_cast<__half*>(q_s)[row * D + causal_small_t_tc_swz(row, d)] =
+                    static_cast<__half>(represented);
+            } else {
+                causal_small_t_store_byte_swizzled(q_s, row, d, DB16,
+                                                   kv_cache_fp8_quant_code(values[r], inv));
+            }
         }
         if (lane == 0) q_scale_tmp[row] = qs;
     }
@@ -305,6 +333,18 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     float l1 = 0.0F;
 
     auto issue_kv_tile = [&](int tile_k0, int physical_page) {
+        if (physical_page < physical_begin || physical_page >= physical_end) {
+            for (int i = tid; i < Bc; i += Threads) {
+                k_scale_s[i] = v_scale_s[i] = __float2half_rn(0.0F);
+            }
+            for (int i = tid; i < Bc * D / 16; i += Threads) {
+                store_vec(k_fp8 + i * 16, make_int4(0, 0, 0, 0));
+                store_vec(v_fp8 + i * 16, make_int4(0, 0, 0, 0));
+            }
+            ninfer::ops::cp_commit();
+            return;
+        }
+        physical_page -= physical_begin;
         if constexpr (TokenTile == 1 && Bc == 32) {
             for (int chunk = tid; chunk < Bc / 8; chunk += Threads) {
                 const int key_l                 = chunk * 8;
@@ -357,7 +397,18 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     __syncthreads();
 
     for (int kb = 0; kb < key_blocks; ++kb) {
-        const int k0 = first_tile + kb * Bc;
+        const int k0            = first_tile + kb * Bc;
+        const bool visible_tile = physical_page >= physical_begin && physical_page < physical_end;
+        if constexpr (HalfQK) {
+            for (int index = tid; index < Bc * (D / 8); index += Threads) {
+                const int row      = index / (D / 8);
+                const int d        = (index % (D / 8)) * 8;
+                const auto* packed = &k_fp8[(row * DB16 + causal_small_t_tc_swz(row, d / 2)) * 2];
+                store_vec(&k_half[row * D + causal_small_t_tc_swz(row, d)],
+                          causal_small_t_fp8_dequant_f16x8(packed, __float2half_rn(1.0F)));
+            }
+            __syncthreads();
+        }
         if (warp < RowTiles) {
             const int row_base = warp * 16;
             __half* p_sw       = &p_s[row_base * PStride];
@@ -371,17 +422,26 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int acol = kk * 16 + a_coloff;
                 unsigned af[4];
                 ldmatrix_x4(af[0], af[1], af[2], af[3],
-                            smem_addr(&q_b16[(row_base + a_rowoff) * DB16 +
+                            smem_addr(&q_b16[(row_base + a_rowoff) * (HalfQK ? D : DB16) +
                                              causal_small_t_tc_swz(row_base + a_rowoff, acol)]));
 #pragma unroll
                 for (int nt = 0; nt < QKNt; ++nt) {
                     const int brow = nt * 8 + b_rin;
                     const int bcol = kk * 16 + b_koff;
                     unsigned bf[2];
-                    ldmatrix_x2(bf[0], bf[1],
-                                smem_addr(&k_b16[brow * DB16 + causal_small_t_tc_swz(brow, bcol)]));
-                    mma_fp8_e4m3(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af[0],
-                                 af[1], af[2], af[3], bf[0], bf[1]);
+                    if constexpr (HalfQK) {
+                        ldmatrix_x2(
+                            bf[0], bf[1],
+                            smem_addr(&k_half[brow * D + causal_small_t_tc_swz(brow, bcol)]));
+                        mma_f16(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af[0],
+                                af[1], af[2], af[3], bf[0], bf[1]);
+                    } else {
+                        ldmatrix_x2(
+                            bf[0], bf[1],
+                            smem_addr(&k_b16[brow * DB16 + causal_small_t_tc_swz(brow, bcol)]));
+                        mma_fp8_e4m3(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af[0],
+                                     af[1], af[2], af[3], bf[0], bf[1]);
+                    }
                 }
             }
 #pragma unroll
@@ -412,24 +472,24 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int col0 = nt * 8 + 2 * lid;
                 const int key0 = k0 + col0;
                 const int key1 = key0 + 1;
-                score[nt][0] =
-                    row0 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs0
-                        ? score[nt][0] * attention_scale
-                        : -CUDART_INF_F;
-                score[nt][1] =
-                    row0 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs0
-                        ? score[nt][1] * attention_scale
-                        : -CUDART_INF_F;
-                score[nt][2] =
-                    row1 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs1
-                        ? score[nt][2] * attention_scale
-                        : -CUDART_INF_F;
-                score[nt][3] =
-                    row1 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs1
-                        ? score[nt][3] * attention_scale
-                        : -CUDART_INF_F;
-                bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
-                bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
+                score[nt][0]   = visible_tile && row0 < RowCount && key0 >= split_start &&
+                                         key0 < split_end && key0 <= qabs0
+                                     ? score[nt][0] * attention_scale
+                                     : -CUDART_INF_F;
+                score[nt][1]   = visible_tile && row0 < RowCount && key1 >= split_start &&
+                                         key1 < split_end && key1 <= qabs0
+                                     ? score[nt][1] * attention_scale
+                                     : -CUDART_INF_F;
+                score[nt][2]   = visible_tile && row1 < RowCount && key0 >= split_start &&
+                                         key0 < split_end && key0 <= qabs1
+                                     ? score[nt][2] * attention_scale
+                                     : -CUDART_INF_F;
+                score[nt][3]   = visible_tile && row1 < RowCount && key1 >= split_start &&
+                                         key1 < split_end && key1 <= qabs1
+                                     ? score[nt][3] * attention_scale
+                                     : -CUDART_INF_F;
+                bm0            = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
+                bm1            = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
             }
             bm0                = warp_max<4>(bm0, FullMask);
             bm1                = warp_max<4>(bm1, FullMask);
@@ -644,6 +704,142 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_fp8_reduce_outpu
 
     const float value = head_l > 0.0F ? numerator / head_l : 0.0F;
     out[causal_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(value);
+}
+
+// Compact-shard reduction. One CTA owns one query column of one device shard and publishes the
+// complete normalized vector plus its logsumexp, so a merge never needs the unnormalized
+// numerators, the per-split statistics, or the KV bytes the vector was reduced from.
+//
+// The reduction order is the ordinary route's: merge the split statistics under their own maximum,
+// weight each split numerator by its normalized probability mass, and divide once. Splits that hold
+// no contribution carry m=-inf and l=0, so they contribute an exact zero instead of a NaN, and a
+// column with no visible key at all publishes zero components with a logsumexp of -inf.
+template <typename Geometry>
+__launch_bounds__(kCausalFp8CompactBlock) __global__
+    void causal_attention_small_t_fp8_compact_kernel(const float* partial_acc,
+                                                     const float* partial_m, const float* partial_l,
+                                                     const std::int32_t* positions,
+                                                     const std::int32_t* valid_columns,
+                                                     std::int32_t tokens, std::int32_t full_width,
+                                                     std::int32_t column_begin,
+                                                     std::int32_t split_count, float* result) {
+    // One block owns one (query head, column) pair. The grid is flat because a prompt-width column
+    // count exceeds the 65535-block limit of blockIdx.y. The column index is the global one, so a
+    // chunked shard writes exactly its own columns of the full result tensor.
+    const int flat_index  = static_cast<int>(blockIdx.x);
+    const int flat_column = flat_index / Geometry::QHeads;
+    const int q_head      = flat_index - flat_column * Geometry::QHeads;
+    const int batch       = flat_column / tokens;
+    const int token       = flat_column - batch * tokens;
+    const int column      = token + column_begin;
+    const int tid         = static_cast<int>(threadIdx.x);
+    if (split_count <= 0) { return; }
+
+    const std::int64_t head =
+        static_cast<std::int64_t>(q_head) +
+        static_cast<std::int64_t>(Geometry::QHeads) *
+            (static_cast<std::int64_t>(column) + static_cast<std::int64_t>(full_width) * batch);
+    const std::int64_t component = static_cast<std::int64_t>(kCausalFp8Components) * head;
+
+    // An inert masked column has no visible key, so its contribution is neutral in every component:
+    // the merge drops it exactly and the merged column stays the exact BF16 zero the ordinary route
+    // produces. The whole block takes this branch together, so no barrier is crossed divergently.
+    const int live_columns = valid_columns == nullptr ? full_width : valid_columns[batch];
+    if (column >= live_columns) {
+        if (tid < kCausalHeadDim) { result[component + tid] = 0.0F; }
+        if (tid == 0) { result[component + kCausalHeadDim] = -CUDART_INF_F; }
+        return;
+    }
+
+    // The split state is stored with the split index fastest and the batch index slowest, exactly
+    // as the tiled kernel writes it, so a multi-row call must step over the preceding rows' blocks.
+    const std::int64_t stat_row =
+        static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
+    partial_acc +=
+        static_cast<std::int64_t>(batch) * kCausalHeadDim * Geometry::QHeads * tokens * split_count;
+    partial_m += stat_row;
+    partial_l += stat_row;
+
+    __shared__ float weights[Geometry::SmallTMaximumSplits];
+    __shared__ float warp_sums[8];
+    __shared__ float scalars[2];
+    // The split geometry is the chunk's, and the visibility frontier is the chunk's last column,
+    // exactly as the tiled kernel that produced these statistics computed it.
+    const std::int32_t* chunk_positions =
+        positions + static_cast<std::int64_t>(batch) * full_width + column_begin;
+    const int window = chunk_positions[tokens - 1] + 1;
+    const int active_splits =
+        causal_small_t_quantized_active_splits<Geometry>(window, split_count, tokens);
+    const float total = causal_merge_split_statistics<Geometry>(
+        partial_m, partial_l, q_head, token, tokens, active_splits, weights, warp_sums, scalars);
+
+    // The merge combines two shards in the logsumexp domain, so a shard publishes the log of its
+    // own unnormalized mass: LSE = max_split(m) + log(sum_split(l * exp(m - max))). Publishing the
+    // bare maximum instead would silently reweight every non-dominant key of this shard.
+    if (tid == 0) {
+        // A row with no visible contribution normalizes to zero; its logsumexp stays -inf so the
+        // merge treats it as empty rather than as a zero-mass distribution. The merge rescales by
+        // exp2 of an LSE difference, so the log is taken at full precision rather than by the
+        // fast intrinsic; one thread per column pays for it once.
+        result[component + kCausalHeadDim] =
+            total > 0.0F ? scalars[0] + logf(total) : -CUDART_INF_F;
+    }
+    if (tid < kCausalHeadDim) {
+        float numerator = 0.0F;
+        for (int split = 0; split < active_splits; ++split) {
+            if (weights[split] != 0.0F) {
+                numerator += partial_acc[causal_partial_acc_index<Geometry>(q_head, tid, token,
+                                                                            split, tokens)] *
+                             weights[split];
+            }
+        }
+        result[component + tid] = total > 0.0F ? numerator / total : 0.0F;
+    }
+}
+
+// Merges the two device shards of one query column. Stable in the logsumexp domain: the larger
+// shard logsumexp is the reference and the other shard is rescaled by exp2 of the difference, which
+// is never positive, so the weights cannot overflow and the smaller contribution simply vanishes.
+// Both shards empty produce the exact BF16 zero of an empty row; one empty shard is exactly the
+// non-empty shard's own normalized vector because its weight is exp2(0)=1 and the other is zero.
+template <typename Geometry>
+__launch_bounds__(kCausalFp8MergeBlock) __global__
+    void causal_attention_small_t_fp8_merge_kernel(const float* first, const float* second,
+                                                   __nv_bfloat16* out, std::int32_t columns) {
+    const int flat_index  = static_cast<int>(blockIdx.x);
+    const int flat_column = flat_index / Geometry::QHeads;
+    const int q_head      = flat_index - flat_column * Geometry::QHeads;
+    if (flat_column >= columns) { return; }
+    const int tid = static_cast<int>(threadIdx.x);
+
+    const std::int64_t head      = static_cast<std::int64_t>(q_head) +
+                                   static_cast<std::int64_t>(Geometry::QHeads) * flat_column;
+    const std::int64_t component = static_cast<std::int64_t>(kCausalFp8Components) * head;
+    const float first_lse        = first[component + kCausalHeadDim];
+    const float second_lse       = second[component + kCausalHeadDim];
+    const float maximum          = fmaxf(first_lse, second_lse);
+    const bool first_empty       = !(first_lse > -CUDART_INF_F);
+    const bool second_empty      = !(second_lse > -CUDART_INF_F);
+    // A lone non-empty shard is reproduced exactly by giving it unit weight rather than by relying
+    // on the fast exponential being exact at zero, and both-empty keeps the exact BF16 zero of an
+    // empty row. With two non-empty shards the ratio is scale-free, so the fast exponential is
+    // safe.
+    const float first_weight =
+        first_empty ? 0.0F
+                    : (second_empty ? 1.0F : exp2_approx((first_lse - maximum) * kCausalFp8Log2E));
+    const float second_weight =
+        second_empty ? 0.0F
+                     : (first_empty ? 1.0F : exp2_approx((second_lse - maximum) * kCausalFp8Log2E));
+    const float total = first_weight + second_weight;
+    const int d       = tid;
+    if (d < kCausalHeadDim) {
+        const float value =
+            total > 0.0F
+                ? (first[component + d] * first_weight + second[component + d] * second_weight) /
+                      total
+                : 0.0F;
+        out[causal_q_index<Geometry>(q_head, d, flat_column)] = __float2bfloat16(value);
+    }
 }
 
 } // namespace ninfer::ops

@@ -84,6 +84,7 @@ struct SequencePlanningInputs {
     int device          = 0;
     ContextCacheOptions context_cache;
     ActiveKvOverflowOptions active_kv;
+    RemoteAttentionOptions remote_attention;
 };
 
 } // namespace ninfer::models::qwen3_5::detail
@@ -107,6 +108,8 @@ struct SequencePlanImpl {
     int device          = 0;
     ContextCacheOptions context_cache;
     ActiveKvOverflowOptions active_kv;
+    RemoteAttentionOptions remote_attention;
+    ops::DistributedAttentionResourceEstimate remote_attention_resources;
     PersistentLayout persistent;
     WorkspacePlan workspace;
     std::size_t graph_allowance_bytes    = 0;

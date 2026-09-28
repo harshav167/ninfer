@@ -557,6 +557,12 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
         out.active_kv_device_staging_bytes = decoder->text_kv.active_staging_bytes();
         out.active_kv_host_staging_bytes   = overflow->staging_bytes();
     }
+    out.static_secondary_kv_bytes = decoder->text_kv.page_pool().static_secondary_payload_bytes();
+    if (const auto* remote = decoder->text_kv.remote_attention()) {
+        out.remote_attention_primary_bytes      = remote->primary_bytes();
+        out.remote_attention_secondary_bytes    = remote->secondary_bytes();
+        out.remote_attention_host_staging_bytes = remote->host_staging_bytes();
+    }
     if (host_state_images) {
         out.host_state_capacity_slots = host_state_images->capacity();
         out.host_state_occupied_slots = host_state_images->occupied();

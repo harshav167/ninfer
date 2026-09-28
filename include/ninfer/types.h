@@ -162,6 +162,11 @@ struct ContextCostOptions {
     std::filesystem::path preset_path;
 };
 
+struct RemoteAttentionOptions {
+    std::optional<int> secondary_device;
+    std::uint32_t full_attention_layers = 0;
+};
+
 struct ActiveKvOverflowOptions {
     // Shared local active-KV budget, not a per-lane partition. Remaining pages of
     // the explicit kv_capacity live on this secondary device and are layer-staged.
@@ -191,6 +196,7 @@ struct EngineOptions {
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
     ActiveKvOverflowOptions active_kv;
+    RemoteAttentionOptions remote_attention;
     StartupObserver startup_observer;
 };
 
@@ -862,31 +868,35 @@ struct MemorySummary {
     ArenaMemorySummary sequence;
     ArenaMemorySummary workspace;
     std::optional<VisionWorkspaceMemorySummary> vision_workspace;
-    std::size_t minimum_runtime_reservation_bytes = 0;
-    std::size_t kv_capacity_increment_bytes       = 0;
-    std::size_t runtime_reservation_bytes         = 0;
-    std::size_t available_after_weights_bytes     = 0;
-    std::size_t available_after_startup_bytes     = 0;
-    std::size_t kv_capacity_headroom_bytes        = 0;
-    std::size_t planned_slack_bytes               = 0;
-    std::size_t workspace_logical_peak_bytes      = 0;
-    std::size_t cuda_graph_allowance_bytes        = 0;
-    std::size_t kv_payload_bytes                  = 0;
-    std::uint32_t host_state_capacity_slots       = 0;
-    std::uint32_t host_state_occupied_slots       = 0;
-    std::size_t host_kv_capacity_bytes            = 0;
-    std::size_t host_kv_occupied_bytes            = 0;
-    int secondary_cache_device                    = -1;
-    std::uint32_t secondary_state_capacity_slots  = 0;
-    std::uint32_t secondary_state_occupied_slots  = 0;
-    std::size_t secondary_kv_capacity_bytes       = 0;
-    std::size_t secondary_kv_occupied_bytes       = 0;
-    std::size_t secondary_staging_bytes           = 0;
-    int active_kv_secondary_device                = -1;
-    std::uint32_t active_kv_resident_tokens       = 0;
-    std::size_t active_kv_secondary_bytes         = 0;
-    std::size_t active_kv_device_staging_bytes    = 0;
-    std::size_t active_kv_host_staging_bytes      = 0;
+    std::size_t minimum_runtime_reservation_bytes   = 0;
+    std::size_t kv_capacity_increment_bytes         = 0;
+    std::size_t runtime_reservation_bytes           = 0;
+    std::size_t available_after_weights_bytes       = 0;
+    std::size_t available_after_startup_bytes       = 0;
+    std::size_t kv_capacity_headroom_bytes          = 0;
+    std::size_t planned_slack_bytes                 = 0;
+    std::size_t workspace_logical_peak_bytes        = 0;
+    std::size_t cuda_graph_allowance_bytes          = 0;
+    std::size_t kv_payload_bytes                    = 0;
+    std::uint32_t host_state_capacity_slots         = 0;
+    std::uint32_t host_state_occupied_slots         = 0;
+    std::size_t host_kv_capacity_bytes              = 0;
+    std::size_t host_kv_occupied_bytes              = 0;
+    int secondary_cache_device                      = -1;
+    std::uint32_t secondary_state_capacity_slots    = 0;
+    std::uint32_t secondary_state_occupied_slots    = 0;
+    std::size_t secondary_kv_capacity_bytes         = 0;
+    std::size_t secondary_kv_occupied_bytes         = 0;
+    std::size_t secondary_staging_bytes             = 0;
+    int active_kv_secondary_device                  = -1;
+    std::uint32_t active_kv_resident_tokens         = 0;
+    std::size_t active_kv_secondary_bytes           = 0;
+    std::size_t active_kv_device_staging_bytes      = 0;
+    std::size_t active_kv_host_staging_bytes        = 0;
+    std::size_t remote_attention_primary_bytes      = 0;
+    std::size_t remote_attention_secondary_bytes    = 0;
+    std::size_t remote_attention_host_staging_bytes = 0;
+    std::size_t static_secondary_kv_bytes           = 0;
 };
 
 // Worker-owned monotonic nanosecond counters. Top-level Host phases are mutually exclusive;

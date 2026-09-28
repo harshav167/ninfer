@@ -87,10 +87,13 @@ struct KVPageGeometry {
 struct DeviceKVPagePoolSpec {
     std::uint32_t page_group_count = 0;
     KVPageGeometry geometry;
-    // Execution-page IDs span the local prefix and optional secondary suffix.
-    // Zero resident_page_group_count means the ordinary all-local pool.
+    // Legacy suffix-overflow mode: execution-page IDs span local and secondary suffixes.
     std::uint32_t resident_page_group_count = 0;
     std::optional<int> overflow_device;
+    // Static per-plane mode: selected complete planes live on a second device while preserving
+    // the full physical page-group ID range. Mutually exclusive with suffix overflow.
+    std::optional<int> static_secondary_device;
+    std::vector<std::uint32_t> static_secondary_plane_indices;
 };
 
 struct KVExecutionTableSpec {
@@ -109,6 +112,8 @@ struct DeviceKVPagePoolLayout {
     std::vector<DeviceKVPlaneLayout> overflow_planes;
     TensorRegion residency_scratch;
     std::size_t overflow_bytes = 0;
+    std::vector<DeviceKVPlaneLayout> static_secondary_planes;
+    std::size_t static_secondary_bytes = 0;
 
     [[nodiscard]] std::size_t payload_bytes() const noexcept;
 };
@@ -227,7 +232,21 @@ public:
     [[nodiscard]] std::uint32_t reserved_pages() const noexcept;
     [[nodiscard]] std::uint32_t available_pages() const noexcept;
     [[nodiscard]] std::size_t plane_count() const noexcept;
+    // Returns an empty Tensor for a static-secondary plane; never exposes a peer pointer.
     [[nodiscard]] const Tensor& plane(std::size_t index) const;
+    [[nodiscard]] const Tensor& secondary_plane(std::size_t index) const;
+
+    [[nodiscard]] bool has_static_secondary_planes() const noexcept {
+        return static_secondary_.has_value();
+    }
+
+    [[nodiscard]] int static_secondary_device() const noexcept {
+        return spec_.static_secondary_device.value_or(-1);
+    }
+
+    [[nodiscard]] std::size_t static_secondary_payload_bytes() const noexcept {
+        return static_secondary_ ? static_secondary_->size() : 0;
+    }
 
     [[nodiscard]] std::uint32_t resident_capacity_pages() const noexcept {
         return spec_.resident_page_group_count ? spec_.resident_page_group_count : capacity_pages();
@@ -304,6 +323,8 @@ private:
     std::optional<OffloadBuffer> overflow_;
     std::vector<Tensor> overflow_planes_;
     Tensor residency_scratch_;
+    std::optional<OffloadBuffer> static_secondary_;
+    std::vector<Tensor> static_secondary_planes_;
     // Handle slots stay stable when their physical payloads change tiers.
     std::vector<std::int32_t> slot_to_physical_;
     std::vector<std::int32_t> physical_to_slot_;
@@ -332,8 +353,6 @@ public:
     KVExecutionRowHandle() noexcept = default;
 
     [[nodiscard]] bool valid() const noexcept { return owner_ != nullptr; }
-
-    [[nodiscard]] std::int32_t row_index() const noexcept { return row_; }
 
 private:
     friend class KVExecutionTablePool;

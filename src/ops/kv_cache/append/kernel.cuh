@@ -380,7 +380,7 @@ __global__ void kv_cache_append_prefix_cyclic_kernel(
                                             padded_capacity);
 }
 
-__global__ void kv_cache_append_prefix_paged_kernel(
+static __global__ void kv_cache_append_prefix_paged_kernel(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ counts,
     const std::int32_t* __restrict__ table_rows, __nv_bfloat16* __restrict__ cache_k,

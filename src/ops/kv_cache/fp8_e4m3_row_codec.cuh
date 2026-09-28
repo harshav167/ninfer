@@ -68,9 +68,30 @@ __device__ __forceinline__ std::uint16_t kv_cache_fp8_quant_code2(float x0, floa
 }
 
 __device__ __forceinline__ __half2 kv_cache_fp8_code2_to_half2(std::uint16_t storage) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
+    // E4M3FN's finite values are exactly representable in FP16. Widen the bit
+    // fields directly on Ampere instead of the general software float converter.
+    const auto widen = [](unsigned code) {
+        const unsigned magnitude = code & 0x7fU;
+        unsigned bits            = (magnitude << 7) + 0x2000U;
+        if (magnitude < 8U) {
+            if (magnitude == 0U) {
+                bits = 0U;
+            } else {
+                const unsigned shift = __clz(magnitude) - 29;
+                bits = ((8U - shift) << 10) | ((magnitude << (8U + shift)) & 0x3ffU);
+            }
+        } else if (magnitude == 0x7fU) {
+            bits = 0x7e00U;
+        }
+        return __ushort_as_half(static_cast<unsigned short>(bits | ((code & 0x80U) << 8)));
+    };
+    return __halves2half2(widen(storage & 0xffU), widen(storage >> 8));
+#else
     __nv_fp8x2_e4m3 value;
     value.__x = storage;
     return static_cast<__half2>(value);
+#endif
 }
 
 __device__ __forceinline__ __half2 kv_cache_fp8_dequant_code2_to_half2(std::uint16_t storage,

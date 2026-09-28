@@ -47,6 +47,8 @@ ninfer_add_op_bench(ninfer_nvfp4_linear_add_bench SOURCES "${CMAKE_CURRENT_LIST_
 ninfer_add_op_bench(ninfer_fp8_linear_add_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/fp8_linear_add_bench.cu")
 ninfer_add_op_bench(ninfer_causal_softmax_attention_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/causal_softmax_attention_bench.cu")
+set_target_properties(ninfer_causal_softmax_attention_bench
+  PROPERTIES CUDA_ARCHITECTURES "86;120a")
 ninfer_add_op_bench(ninfer_context_softmax_attention_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/context_softmax_attention_bench.cu")
 ninfer_add_op_bench(ninfer_sliding_window_attention_bench

@@ -55,6 +55,18 @@ add_test(NAME ninfer_softmax_attention_k8v4_test
 add_test(NAME ninfer_softmax_attention_fp8_test
   COMMAND ninfer_softmax_attention_test --fp8-only)
 
+add_test(NAME ninfer_softmax_attention_fp8_ampere_test
+  COMMAND ninfer_softmax_attention_test --fp8-ampere)
+set_tests_properties(ninfer_softmax_attention_fp8_ampere_test
+  PROPERTIES SKIP_RETURN_CODE 77)
+
+# The two-device route needs a second CUDA-capable device. Missing hardware is a skip, not a pass:
+# the distributed runner returns 77 and reports the reason.
+add_test(NAME ninfer_softmax_attention_distributed_test
+  COMMAND ninfer_softmax_attention_test --distributed)
+set_tests_properties(ninfer_softmax_attention_distributed_test
+  PROPERTIES SKIP_RETURN_CODE 77)
+
 set_tests_properties(
   ninfer_softmax_attention_nvfp4_test
   ninfer_softmax_attention_k8v4_test
