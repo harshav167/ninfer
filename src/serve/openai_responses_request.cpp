@@ -530,23 +530,29 @@ enum class AssistantInputPhase {
 [[noreturn]] void invalid_assistant_history(std::size_t index, std::string message) {
     bad_request("input Item " + std::to_string(index) + " " + std::move(message) +
                     "; supported assistant Item order is reasoning, message content, then "
-                    "function calls",
+                    "function calls, and reasoning after message content starts a new "
+                    "assistant turn",
                 "input", "invalid_assistant_history");
 }
 
 struct AssistantInputRun {
     AssistantInputRun() { reset(); }
 
-    void append_reasoning(std::string reasoning, std::size_t index) {
+    // Within one assistant turn the order is reasoning, message content, then
+    // function calls. Reasoning after completed content therefore opens the
+    // next assistant turn: clients may replay consecutive assistant turns when
+    // a transient user nudge between them is not persisted.
+    void append_reasoning(std::string reasoning, std::size_t index, std::vector<ChatTurn>& turns) {
         switch (phase) {
+        case AssistantInputPhase::Content:
+            flush(turns);
+            [[fallthrough]];
         case AssistantInputPhase::Empty:
             turn.reasoning_content = std::move(reasoning);
             phase                  = AssistantInputPhase::Reasoning;
             return;
         case AssistantInputPhase::Reasoning:
             invalid_assistant_history(index, "reasoning cannot follow another reasoning Item");
-        case AssistantInputPhase::Content:
-            invalid_assistant_history(index, "reasoning cannot follow assistant message content");
         case AssistantInputPhase::Calls:
             invalid_assistant_history(index, "reasoning cannot follow function_call Items");
         }
@@ -632,7 +638,8 @@ void parse_input(const Json& input, OpenAIResponsesPromptRequest& out,
                 out.input_turns.push_back(std::move(message.turn));
             }
         } else if (type == "reasoning") {
-            assistant.append_reasoning(parse_reasoning_item(item, canonical), index);
+            assistant.append_reasoning(parse_reasoning_item(item, canonical), index,
+                                       out.input_turns);
         } else if (type == "function_call") {
             assistant.append_call(parse_function_call_item(item, canonical, identities));
         } else if (type == "function_call_output") {
