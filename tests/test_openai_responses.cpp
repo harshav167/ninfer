@@ -568,15 +568,30 @@ int test_assistant_item_boundaries_and_errors() {
                 Json{{"model", "m"}, {"input", std::move(input)}}, limits());
         });
     };
-    const ApiError reasoning_after_content = rejected(Json::array({first, reasoning}));
-    failures +=
-        check(reasoning_after_content.status == 400 &&
-                  reasoning_after_content.type == "invalid_request_error" &&
-                  reasoning_after_content.code == "invalid_assistant_history" &&
-                  reasoning_after_content.param == "input" &&
-                  reasoning_after_content.message.find(
-                      "reasoning cannot follow assistant message content") != std::string::npos,
-              "reasoning after assistant content did not fail precisely");
+    const OpenAIResponsesCreateRequest consecutive = parse_openai_responses_create_request(
+        Json{{"model", "m"},
+             {"input",
+              Json::array({Json{{"type", "message"}, {"role", "user"}, {"content", "start"}},
+                           reasoning, first, reasoning, second})}},
+        limits());
+    failures += check(consecutive.prompt.input_turns.size() == 3 &&
+                          consecutive.prompt.input_turns[1].role == ninfer::ChatRole::Assistant &&
+                          consecutive.prompt.input_turns[1].reasoning_content == "thought" &&
+                          consecutive.prompt.input_turns[1].content.size() == 1 &&
+                          consecutive.prompt.input_turns[1].content[0].text == "first " &&
+                          consecutive.prompt.input_turns[2].role == ninfer::ChatRole::Assistant &&
+                          consecutive.prompt.input_turns[2].reasoning_content == "thought" &&
+                          consecutive.prompt.input_turns[2].content.size() == 1 &&
+                          consecutive.prompt.input_turns[2].content[0].text == "second",
+                      "reasoning after assistant content did not open the next assistant turn");
+    const ApiError reasoning_after_call = rejected(Json::array({call, reasoning}));
+    failures += check(reasoning_after_call.status == 400 &&
+                          reasoning_after_call.type == "invalid_request_error" &&
+                          reasoning_after_call.code == "invalid_assistant_history" &&
+                          reasoning_after_call.param == "input" &&
+                          reasoning_after_call.message.find(
+                              "reasoning cannot follow function_call Items") != std::string::npos,
+                      "reasoning after unanswered calls did not fail precisely");
     const ApiError content_after_call = rejected(Json::array({call, first}));
     failures += check(content_after_call.code == "invalid_assistant_history" &&
                           content_after_call.message.find(
