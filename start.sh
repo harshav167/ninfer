@@ -11,7 +11,9 @@ REQUEST_LOG="${REQUEST_LOG:-$ROOT/../models/swift15-orcarouter-ninfer/serve-fp8-
 [[ -f "$MODEL" ]] || { printf 'Missing model artifact: %s\n' "$MODEL" >&2; exit 1; }
 export CUDA_VISIBLE_DEVICES=0
 
-# No secondary GPU cache, active overflow, or host checkpoint storage.
+# Host checkpoints: with only one lane, OMP's side requests (titles, summaries,
+# compaction) would otherwise replace the agent's only cached state and force a
+# full ~200K re-prefill on the next turn. Pinned host slots keep it resumable.
 # CUDA graphs are enabled; the KV pool must leave room for graph resources.
 # Thinking remains enabled by the chat template.
 # NInfer's maintained Qwen3.8 template, not the artifact's embedded one: some
@@ -25,7 +27,7 @@ exec "$SERVER" "$MODEL" \
   --chat-template "$CHAT_TEMPLATE" \
   --pending-timeout-ms 1200000 \
   --kv-dtype fp8 \
-  --device-state-slots 0 --host-state-slots 0 --host-kv-mib 0 \
+  --device-state-slots 0 --host-state-slots "${HOST_STATE_SLOTS:-8}" --host-kv-mib "${HOST_KV_MIB:-16384}" \
   --max-private-continuations 8 --max-shared-prefixes 8 \
   --spec dflash2 --draft-tokens 7 --lm-head-draft \
   --vision --preserve-thinking --default-max-tokens 65536 \
