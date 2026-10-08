@@ -10,10 +10,13 @@ REQUEST_LOG="${REQUEST_LOG:-$ROOT/../models/swift15-orcarouter-ninfer/serve-fp8-
 [[ -x "$SERVER" ]] || { printf 'Missing server binary: %s\n' "$SERVER" >&2; exit 1; }
 [[ -f "$MODEL" ]] || { printf 'Missing model artifact: %s\n' "$MODEL" >&2; exit 1; }
 export CUDA_VISIBLE_DEVICES=0
+# Blocking CUDA waits instead of spinning a CPU core on every device sync.
+export NINFER_CUDA_SYNC="${NINFER_CUDA_SYNC:-blocking}"
 
 # Host checkpoints: with only one lane, OMP's side requests (titles, summaries,
 # compaction) would otherwise replace the agent's only cached state and force a
-# full ~200K re-prefill on the next turn. Pinned host slots keep it resumable.
+# full ~200K re-prefill on the next turn. Pinned host context keeps it resumable.
+# 17920 MiB = the previous 16 GiB host KV + 8 StateImages (~1.46 GiB).
 # CUDA graphs are enabled; the KV pool must leave room for graph resources.
 # Thinking remains enabled by the chat template.
 # NInfer's maintained Qwen3.8 template, not the artifact's embedded one: some
@@ -27,8 +30,7 @@ exec "$SERVER" "$MODEL" \
   --chat-template "$CHAT_TEMPLATE" \
   --pending-timeout-ms 1200000 \
   --kv-dtype fp8 \
-  --device-state-slots 0 --host-state-slots "${HOST_STATE_SLOTS:-8}" --host-kv-mib "${HOST_KV_MIB:-16384}" \
-  --max-private-continuations 8 --max-shared-prefixes 8 \
+  --device-state-slots 0 --host-context-mib "${HOST_CONTEXT_MIB:-17920}" \
   --spec dflash2 --draft-tokens 7 --lm-head-draft \
   --vision --preserve-thinking --default-max-tokens 65536 \
   --request-log-jsonl "$REQUEST_LOG" --log-level info \
