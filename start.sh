@@ -1,17 +1,15 @@
 #!/usr/bin/env bash
-# Swift 1.5 OrcaRouter (kvnxiao NInfer v3, uncensored): one shared FP8 KV pool, entirely on the RTX 5090.
+# Swift1.5 OrcaRouter NVFP4: one shared FP8 KV pool on the RTX 5090.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-MODEL="${MODEL:-$ROOT/../models/swift15-orcarouter-ninfer/swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4.ninfer}"
+MODEL="${MODEL:-/home/wade/local-ai/models/swift15-orcarouter-ninfer/swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4.ninfer}"
 SERVER="$ROOT/build/apps/ninfer-serve"
-# One shared KV pool for both lanes, not one window per lane. Each extra lane
-# costs ~1 GB of runtime memory; 232,640 is the largest page-aligned pool that
-# fits with 2 lanes (262,144 fits only with 1).
+# Both execution lanes share one 232,640-token KV pool; it is not duplicated per lane.
 CONTEXT="${CONTEXT:-232640}"
 # Two lanes let OMP's side requests (titles, summaries) run beside the main
 # turn instead of queueing behind it.
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-2}"
-REQUEST_LOG="${REQUEST_LOG:-$ROOT/../models/swift15-orcarouter-ninfer/serve-fp8-c1-graphs-requests.jsonl}"
+REQUEST_LOG="${REQUEST_LOG:-/home/wade/local-ai/models/swift15-orcarouter-ninfer/serve-fp8-c1-graphs-requests.jsonl}"
 
 [[ -x "$SERVER" ]] || { printf 'Missing server binary: %s\n' "$SERVER" >&2; exit 1; }
 [[ -f "$MODEL" ]] || { printf 'Missing model artifact: %s\n' "$MODEL" >&2; exit 1; }
