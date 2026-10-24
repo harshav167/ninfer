@@ -163,6 +163,9 @@ resources, calibrated graphs, Host reservations, and final footprint checks rema
 enabling tests explicitly when qualifying. Keep `apps/` and the matching `lib/`
 together because this local build uses relative RPATHs to shared libraries.
 
+Updating or building this checkout does not switch the production service.
+Deployment through the existing service is a separate, explicitly authorized action.
+
 ## Speculative decoding
 
 | TOML field | CLI flag | Values / default | Meaning |

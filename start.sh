@@ -34,7 +34,7 @@ export NINFER_CUDA_SYNC="${NINFER_CUDA_SYNC:-blocking}"
 # developer role and `instructions` that OMP sends.
 CHAT_TEMPLATE="${CHAT_TEMPLATE:-$ROOT/tools/chat_templates/qwen3_8.jinja}"
 exec "$SERVER" "$MODEL" \
-  --device 0 --host 0.0.0.0 --port "${PORT:-30002}" \
+  --device 0 --host 0.0.0.0 --port "${PORT:-30000}" \
   --model-id qwen38-ninfer \
   --max-context "$CONTEXT" --context-capacity "$CONTEXT_CAPACITY" --max-concurrency "$MAX_CONCURRENCY" \
   --memory-headroom 0B \
