@@ -136,6 +136,29 @@ Vision is selected at startup. Its bounded execution window processes media befo
 text segment consumes the features. The media budgets cover CPU preprocessing/cache storage and
 are separate from the GPU Vision budget. Processor-specific media limits still apply.
 
+## Local Swift development launcher
+
+The repository-local `start.sh` uses `build/rtx5090-release/apps/ninfer-serve`.
+It preserves the local Swift 1.5 OrcaRouter configuration: FP8 KV, two active lanes,
+a shared 232,640-token maximum context, 1,024-token prefill chunks, Vision, DFlash2 K7
+with the optimized proposal head, preserved thinking, and blocking CUDA waits.
+Its default endpoint is `0.0.0.0:30000`; running it does not modify systemd or OMP.
+
+`CONTEXT_CAPACITY=8619483136` is an explicit byte budget for the shared Device State/KV
+arena, not a token count or a separate allocation per lane. For this artifact, the
+previously qualified native layout uses a 195,897,344-byte StateImage/block and a
+2,113,536-byte FP8 KV page: four StateImages plus 3,637 pages require 44 blocks.
+Changing the model, context or concurrency requires requalifying this budget.
+The launcher passes `--memory-headroom 0B` to preserve its explicit-budget behavior
+using upstream's configurable allowance; physical allocation, required execution
+resources, calibrated graphs, Host reservations, and final footprint checks remain.
+
+`HOST_CACHE_CAPACITY` defaults to `17920MiB`; `PORT`, `PREFILL_CHUNK`, `MODEL`,
+`CHAT_TEMPLATE`, and `REQUEST_LOG` remain overridable. Request logs default to
+`.agent-tmp/dev-serve/requests.jsonl`. Build with the `rtx5090-release` preset,
+enabling tests explicitly when qualifying. Keep `apps/` and the matching `lib/`
+together because this local build uses relative RPATHs to shared libraries.
+
 ## Speculative decoding
 
 | TOML field | CLI flag | Values / default | Meaning |
