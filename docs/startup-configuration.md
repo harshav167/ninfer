@@ -147,7 +147,7 @@ footprint. Automatic capacity keeps its minimum 1 GiB planning headroom.
 
 The repository-local `start.sh` launches the Swift 1.5 OrcaRouter candidate from
 `build/rtx5090-release/apps/ninfer-serve`, independently of the production checkout.
-Its default endpoint is `0.0.0.0:30002`; it does not change systemd or OMP settings.
+Its default endpoint is `0.0.0.0:30000`, retaining the existing OMP endpoint.
 It retains FP8 KV, two active lanes, a 232,640-token maximum context, 1,024-token
 prefill chunks, Vision, DFlash2 K7 with the optimized proposal head, preserved
 thinking, and blocking CUDA waits.
@@ -167,6 +167,13 @@ default to `.agent-tmp/dev-serve/requests.jsonl`. Build with the `rtx5090-releas
 preset, enabling tests explicitly when qualifying; benchmarks need not be built.
 Keep `apps/` and the matching `lib/` together because the candidate uses relative
 RPATHs to shared Core/Ops libraries.
+
+The local `ninfer.service` selects this checkout through
+`/etc/systemd/system/ninfer.service.d/dev-worktree.conf`, which replaces
+`WorkingDirectory` and `ExecStart` with `/home/wade/local-ai/ninfer-dev` and its
+`start.sh`. The original unit still names the production checkout. To roll back,
+stop the service, remove only `dev-worktree.conf`, run `systemctl daemon-reload`,
+then start the service. Keep both build trees and their matching libraries intact.
 
 
 ### 2.2 上下文与其他内存
