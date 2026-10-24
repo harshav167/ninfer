@@ -1,5 +1,6 @@
 #include "models/qwen4_exp/parallel/wire.h"
 #include "runtime/executor/protocol.h"
+#include "runtime/engine/startup_memory.h"
 
 namespace ninfer::models::qwen4_exp {
 namespace {
@@ -75,7 +76,7 @@ void encode_rank_load(Encoder& out, const RankLoadRequest& request) {
     out.boolean(o.context_cache.enabled);
     out.u32(o.context_cache.checkpoint_interval);
     out.u64(o.context_cache.host_capacity_bytes.value_or(0));
-    out.u64(std::max(kDefaultContextHeadroomBytes, o.context_capacity.automatic_headroom_bytes));
+    out.u64(runtime::startup_headroom_bytes(o.context_capacity));
     out.u64(request.host_reservation_bytes);
     out.boolean(request.control_owner);
 }

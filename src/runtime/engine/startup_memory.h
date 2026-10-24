@@ -1,10 +1,20 @@
 #pragma once
 
 #include "core/device.h"
+#include "ninfer/types.h"
+
+#include <algorithm>
 
 namespace ninfer::runtime {
 
 [[nodiscard]] std::size_t device_budget(std::size_t available);
+
+[[nodiscard]] inline std::size_t startup_headroom_bytes(const ContextCapacityPolicy& policy) {
+    // An explicit arena fixes the requested allocation; it still has to pass
+    // physical-memory, graph preparation and final footprint checks.
+    if (policy.mode == ContextCapacityMode::Explicit) return 0;
+    return std::max(kDefaultContextHeadroomBytes, policy.automatic_headroom_bytes);
+}
 
 // Startup has one Device owner. Snapshots are taken with its transfers and work settled.
 // Re-read after destroying a candidate: retained driver storage is already charged.

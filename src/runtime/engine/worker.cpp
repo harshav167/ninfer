@@ -38,10 +38,8 @@ void run_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifac
         preparing = std::make_unique<Preparation>(*reader, payload, connection.bootstrap().identity,
                                                   device, topology, connection.communication());
         const auto requirement = preparing->memory();
-        StartupMemoryBudget budget(
-            initial, device_budget(initial.available_bytes()),
-            std::max(kDefaultContextHeadroomBytes, requirement.headroom_bytes),
-            requirement.host_reservation_bytes);
+        StartupMemoryBudget budget(initial, device_budget(initial.available_bytes()),
+                                   requirement.headroom_bytes, requirement.host_reservation_bytes);
         const auto before_weights    = device_memory_snapshot(device.device());
         const auto available_weights = budget.available(before_weights);
         if (requirement.weight_bytes > available_weights ||
@@ -81,22 +79,22 @@ void run_rank(distributed::WorkerConnection& connection, std::unique_ptr<artifac
         std::size_t opaque_growth             = 0;
         std::size_t control_reservation_bytes = 0;
         const auto describe                   = [&] {
-            auto result                                 = preparing->describe();
-            const auto after                            = device_memory_snapshot(device.device());
-            auto& observation                           = result.observation;
-            const auto& identity                        = connection.bootstrap().identity;
-            observation.rank                            = identity.rank;
-            observation.node                            = identity.node;
-            observation.hardware                        = device.properties().name;
-            observation.communication                   = connection.communication().statistics();
-            observation.stamp                           = {0, observation_time_ns()};
-            observation.physical_memory                 = PhysicalMemorySample{after.total_bytes,
+            auto result                 = preparing->describe();
+            const auto after            = device_memory_snapshot(device.device());
+            auto& observation           = result.observation;
+            const auto& identity        = connection.bootstrap().identity;
+            observation.rank            = identity.rank;
+            observation.node            = identity.node;
+            observation.hardware        = device.properties().name;
+            observation.communication   = connection.communication().statistics();
+            observation.stamp           = {0, observation_time_ns()};
+            observation.physical_memory = PhysicalMemorySample{after.total_bytes,
                                                                after.cuda_free_bytes,
                                                                after.system_total_bytes,
                                                                after.system_available_bytes,
                                                                after.shared_physical_memory,
                                                                observation.stamp.sampled_ns};
-            result.budget.limit_bytes                   = budget.limit();
+            result.budget.limit_bytes   = budget.limit();
             result.budget.context_control_budget_bytes  = control_reservation_bytes;
             result.budget.headroom_bytes                = budget.headroom();
             result.budget.available_after_weights_bytes = after_weights.available_bytes();

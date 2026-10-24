@@ -138,6 +138,37 @@ HTTP(S)、data URI、绝对路径保持原含义；显式 `--media-root` 的工�
 自动 KV 的具体策略由 Engine/planner 提供，配置层保留该请求。
 Vision、speculative 及具体格式的可用性不在 parser 建立模型能力表。
 
+Explicit `--context-capacity SIZE` does not subtract the automatic 1 GiB startup
+headroom. The requested arena must still fit available Device memory alongside
+weights, execution resources, calibrated graphs, and the final observed startup
+footprint. Automatic capacity keeps its minimum 1 GiB planning headroom.
+
+### Local Swift development launcher
+
+The repository-local `start.sh` launches the Swift 1.5 OrcaRouter candidate from
+`build/rtx5090-release/apps/ninfer-serve`, independently of the production checkout.
+Its default endpoint is `0.0.0.0:30002`; it does not change systemd or OMP settings.
+It retains FP8 KV, two active lanes, a 232,640-token maximum context, 1,024-token
+prefill chunks, Vision, DFlash2 K7 with the optimized proposal head, preserved
+thinking, and blocking CUDA waits.
+
+`CONTEXT_CAPACITY=8619483136` is an explicit **byte** budget for the shared
+Device State/KV arena, not a token count and not a per-lane allocation. For the
+selected artifact, the native layout gives a 195,897,344-byte StateImage/block
+and a 2,113,536-byte FP8 KV page. Checkpoint handover requires four StateImages
+and 3,637 KV pages: `4 + ceil(3637 / 92) = 44` blocks. The native startup
+working-set checks reject a smaller incompatible budget instead of shrinking
+the requested context. Changing the model, context or concurrency requires
+requalifying this budget; setting `CONTEXT` alone does not resize the arena.
+
+`HOST_CACHE_CAPACITY` defaults to `17920MiB`; `PORT`, `PREFILL_CHUNK`, `MODEL`,
+`CHAT_TEMPLATE`, and `REQUEST_LOG` remain overridable. Candidate request logs
+default to `.agent-tmp/dev-serve/requests.jsonl`. Build with the `rtx5090-release`
+preset, enabling tests explicitly when qualifying; benchmarks need not be built.
+Keep `apps/` and the matching `lib/` together because the candidate uses relative
+RPATHs to shared Core/Ops libraries.
+
+
 ### 2.2 上下文与其他内存
 
 | TOML 字段 | 命令行 | 类型 / 默认 | 含义与行为 |

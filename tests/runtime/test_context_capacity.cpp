@@ -121,6 +121,27 @@ int main() {
                           !ninfer::runtime::intermediate_capture(0, 4096, 0, {}, {}, 8192),
                       "capture density ignored a nearby required point or a short interval");
 
+    // Explicit capacity opts out of automatic planning headroom, not physical limits.
+    constexpr std::size_t gib = 1ULL << 30;
+    const DeviceMemorySnapshot before{4 * gib, 4 * gib};
+    const auto explicit_policy = ContextCapacityPolicy::explicit_capacity(3 * gib);
+    const StartupMemoryBudget explicit_budget(before, 4 * gib,
+                                              startup_headroom_bytes(explicit_policy), 0);
+    const DeviceMemorySnapshot loaded{3 * gib, 4 * gib};
+    failures += check(explicit_budget.available(loaded) == 3 * gib,
+                      "explicit Context capacity still reserves automatic startup headroom");
+    const StartupMemoryBudget capped(before, 3 * gib, startup_headroom_bytes(explicit_policy), 0);
+    failures += check(capped.fits({gib, 4 * gib}) && !capped.fits({gib - 1, 4 * gib}),
+                      "explicit Context capacity stopped enforcing actual startup budget");
+    const StartupMemoryBudget auto_budget(
+        before, 4 * gib, startup_headroom_bytes(ContextCapacityPolicy::automatic(0)), 0);
+    failures += check(auto_budget.available(loaded) == 2 * gib,
+                      "automatic startup lost its minimum headroom");
+    const StartupMemoryBudget extra_headroom(
+        before, 4 * gib, startup_headroom_bytes(ContextCapacityPolicy::automatic(2 * gib)), 0);
+    failures += check(extra_headroom.available(loaded) == gib,
+                      "automatic startup ignored requested extra headroom");
+
     // The probe left 200 bytes in the driver; the new free snapshot already includes it.
     const ninfer::runtime::StartupMemoryBudget budget({10000, 12000}, 8000, 500, 0);
     failures += check(budget.available({7800, 12000}) == 5300,

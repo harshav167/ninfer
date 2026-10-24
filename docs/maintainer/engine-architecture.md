@@ -420,8 +420,9 @@ MemorySummary.cuda_graph 分别报告校准增长、保留量、重建估计和�
 驱动缓存，不能当作纯 Graph allocation 精确归因。runtime_reservation_bytes 表示 rank 的显式资源预留；
 共享物理内存目标还计入 pinned staging、PLE Host 准备区等共享容量，独显目标仅计入 Device backing。
 
-显式与自动 KV 容量都至少保留 1 GiB 基础 headroom；自动策略要求更大值时取其值。
-基础 headroom 容纳未精确计入的开销，不要求初始化后仍完整空闲，也不按拓扑重复预留。
+自动 Context 容量至少保留 1 GiB 规划 headroom；自动策略要求更大值时取其值。
+显式字节容量不再额外扣除自动 headroom，但仍验证物理可用显存、Graph 准备和最终实例占用。
+规划 headroom 容纳未精确计入的开销，不要求初始化后仍完整空闲，也不按拓扑重复预留。
 Spark Vision live media 另行保留。正式准备以整个实例的实际占用判断预算，不要求正式增长小于估计。
 最多一次容量纠偏重建，只缩减自动 KV 或可选 expert cache；显式容量与功能不变，Host 分配失败和执行错误
 不作为缩减 GPU 容量的理由。

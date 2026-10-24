@@ -216,8 +216,7 @@ BuiltModel<typename Setup::Types> build_local_model(const artifact::Reader& read
     auto& device       = *device_owner;
     const auto initial = device_memory_snapshot(device.device());
     const auto limit   = device_budget(initial.available_bytes());
-    const auto headroom =
-        std::max(kDefaultContextHeadroomBytes, options.context_capacity.automatic_headroom_bytes);
+    const auto headroom = startup_headroom_bytes(options.context_capacity);
     const auto host_reservation = options.enable_vision ? options.media_live_bytes : 0;
     StartupMemoryBudget budget(initial, limit, headroom, host_reservation);
     const auto choices   = setup.placements();
