@@ -3,6 +3,7 @@
 #include "core/gdn_replay_records.h"
 #include "core/linear_attention_state.h"
 #include "models/common/moe/schedule.h"
+#include "models/qwen3_5/execution/intervention.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/state/decoder_state.h"
 #include "ninfer/ops/softmax_attention.h"
@@ -14,13 +15,24 @@
 
 namespace ninfer::models::qwen3_5::execution {
 
+// Offline calibration observation of one sequence. For each listed layer, column `column` of
+// that layer's output residual (after the FFN residual add, before any intervention and before
+// DFlash feature capture) is copied to target[:, slot]. target is BF16 [H,layers.size()]; layers
+// is strictly ascending; the traversal has one sequence.
+struct ResidualProbe {
+    std::span<const std::uint32_t> layers;
+    std::int32_t column = 0;
+    Tensor target;
+};
+
 struct TextExecutionView {
     const Parameters& parameters;
     MemoryArena& workspace;
     CudaExecutionView execution;
     const PagedKVCache& cache;
     LinearAttentionStateView& states;
-    moe::Schedule* moe = nullptr;
+    moe::Schedule* moe                       = nullptr;
+    const ResidualIntervention* intervention = nullptr;
 };
 
 // Contiguous ids/cache_positions I32 [W,B], RoPE positions I32 [W*B] or [W*B,3],
@@ -74,7 +86,7 @@ class TextRun {
 public:
     TextRun(TextExecutionView execution, TextInputs inputs, TextStateUpdate update,
             ops::CausalAttentionExecutionEnvelope envelope, Tensor hidden,
-            const DFlashFeatureSink* features = nullptr);
+            const DFlashFeatureSink* features = nullptr, const ResidualProbe* probe = nullptr);
     ~TextRun();
     TextRun(const TextRun&)            = delete;
     TextRun& operator=(const TextRun&) = delete;
@@ -89,7 +101,9 @@ public:
     void prefix();
     void mixer(std::uint32_t layer);
     void post_mixer(std::uint32_t layer, const moe::GpuCall* call = nullptr);
-    void capture_features(std::uint32_t layer);
+    // Layer epilogue: observes the raw layer output for a probe, applies the residual
+    // intervention, then captures DFlash features from the resulting residual.
+    void finish_layer(std::uint32_t layer);
     void finish();
     void set_attention_envelope(ops::CausalAttentionExecutionEnvelope envelope) noexcept;
 
@@ -102,6 +116,9 @@ private:
     void gdn(const BlockParameters&, std::uint32_t compact_layer);
     [[nodiscard]] ops::MoeExecutionHints next_projection_hints(std::uint32_t layer) const;
     void complete_layer();
+    void observe_residual(std::uint32_t layer);
+    void intervene(std::uint32_t layer);
+    void capture_features(std::uint32_t layer);
 
     TextExecutionView view_;
     TextInputs inputs_;
@@ -109,6 +126,7 @@ private:
     ops::CausalAttentionExecutionEnvelope envelope_;
     Tensor hidden_;
     std::optional<DFlashFeatureSink> features_;
+    std::optional<ResidualProbe> probe_;
     MemoryArena::Scope traversal_scope_;
     Tensor residual_;
     std::optional<moe::Schedule::Activity> activity_;

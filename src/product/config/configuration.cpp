@@ -114,6 +114,9 @@ StartupConfigurationView view(const LaunchOptions& launch, EntryPoint entry, con
         case Field::ChatTemplate:
             value = e.chat_template_path.string();
             break;
+        case Field::ResidualProfile:
+            value = e.residual_profile_path.string();
+            break;
         case Field::Vision:
             value = e.enable_vision;
             break;

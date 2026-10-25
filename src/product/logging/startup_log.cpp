@@ -201,9 +201,9 @@ struct StartupLogRenderer::Impl {
         case StartupStatus::Begin: {
             const Clock::time_point now = Clock::now();
             phases[index]               = PhaseProgress{
-                              .last_persistent  = now,
-                              .last_interactive = now - kInteractiveRefresh,
-                              .sample_time      = now,
+                .last_persistent  = now,
+                .last_interactive = now - kInteractiveRefresh,
+                .sample_time      = now,
             };
             if (event.phase == StartupPhase::EngineStartup) {
                 logger->info("starting engine");
@@ -290,6 +290,16 @@ void StartupLogRenderer::engine_ready(const LoadSummary& load) {
     impl_->logger->info("engine ready | {} | total {} | weights {} | CUDA sync {}",
                         format_pretty_text(load.model_name), format_pretty_duration(total_seconds),
                         format_pretty_bytes(load.host_to_device_bytes), load.cuda_sync_mode);
+    const ResidualInterventionSummary& residual = load.residual_intervention;
+    if (residual.enabled) {
+        impl_->logger->info("artifact {} | residual intervention ON | profile {} | layers {} ({})",
+                            format_pretty_text(load.artifact_id),
+                            format_pretty_text(residual.profile_path.string()),
+                            format_pretty_index_runs(residual.layers), residual.layers.size());
+    } else {
+        impl_->logger->info("artifact {} | residual intervention OFF",
+                            format_pretty_text(load.artifact_id));
+    }
     impl_->logger->debug(
         "load detail | architecture {} | artifact read {} | H2D {} | staging peak {} | device "
         "objects {} | host objects {}",

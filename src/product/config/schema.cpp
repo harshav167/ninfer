@@ -13,6 +13,8 @@ constexpr FieldSpec kFields[] = {
     {Field::ModelPath, "model.path", "", "", "FILE", "Model artifact (.ninfer)."},
     {Field::ChatTemplate, "model.chat_template", "--chat-template", "", "FILE",
      "Chat template override; empty uses the artifact."},
+    {Field::ResidualProfile, "model.residual_profile", "--residual-profile", "", "FILE",
+     "Residual-intervention profile (JSON v1); empty disables it."},
     {Field::Vision, "model.vision", "--vision", "--no-vision", "", "Load Vision resources."},
     {Field::Device, "engine.device", "--device", "", "N", "Local CUDA device ordinal."},
     {Field::MaxContext, "engine.max_context", "--max-context", "", "N",
@@ -382,6 +384,7 @@ FieldValue parse_field_value(Field field, const RawValue& value, bool command_li
     case Field::JsonSchemaFile:
         return text(value, true);
     case Field::ChatTemplate:
+    case Field::ResidualProfile:
     case Field::CostPresets:
     case Field::ApiKey:
     case Field::ModelId:

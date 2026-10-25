@@ -43,3 +43,8 @@ add_test(NAME ninfer_json_schema_oracle_test
   COMMAND ${CMAKE_COMMAND} -E env
     "NINFER_SCHEMA_PROBE=$<TARGET_FILE:ninfer_json_schema_test>"
     ${Python3_EXECUTABLE} -B ${PROJECT_SOURCE_DIR}/tests/text/test_json_schema.py)
+
+add_test(NAME ninfer_residual_profile_fit_test
+  COMMAND ${Python3_EXECUTABLE} -B -m unittest tests.test_fit_residual_profile)
+set_tests_properties(ninfer_residual_profile_fit_test PROPERTIES
+  WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}")

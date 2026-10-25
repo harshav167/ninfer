@@ -147,6 +147,10 @@ struct EngineOptions {
     std::optional<DeploymentOptions> deployment;
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
+    // Optional immutable residual-intervention profile (JSON v1). Empty leaves the model
+    // unchanged. The profile is bound to this Engine at startup, must name the exact loaded
+    // artifact and geometry, and cannot change for the Engine's lifetime.
+    std::filesystem::path residual_profile_path;
     std::size_t grammar_cache_bytes = 256ULL * 1024 * 1024;
     EnginePurpose purpose           = EnginePurpose::Generation;
     int device                      = 0;
@@ -777,6 +781,16 @@ struct GenerationResult {
     FinishReason finish_reason     = FinishReason::None;
     std::optional<std::string> matched_stop_string;
     RequestStats stats;
+};
+
+// Offline calibration observation of the unmodified model. values[l * hidden_size + d] is the
+// Main residual state of requested layer layers[l], after that layer's FFN residual add, at the
+// last prompt token; BF16 words are widened exactly to FP32.
+struct ResidualCapture {
+    std::vector<TokenId> prompt_token_ids;
+    std::vector<std::uint32_t> layers;
+    std::uint32_t hidden_size = 0;
+    std::vector<float> values;
 };
 
 } // namespace ninfer

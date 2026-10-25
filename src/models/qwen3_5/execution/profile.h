@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/common/qwen/vision/parameters.h"
+#include "models/common/residual/profile.h"
 
 #include "models/qwen3_5/config.h"
 #include "models/load_options.h"
@@ -82,7 +83,9 @@ struct ProposalProfile {
     std::uint32_t rows;
 };
 
-// Immutable execution geometry. Contains no allocation or execution addresses.
+// Immutable execution geometry. Contains no device allocation or execution addresses.
+// `intervention` is the validated startup residual profile (null when none was selected); its
+// host values are uploaded once by the rank that owns the execution resources.
 struct ModelProfile {
     Config config;
     models::LoadOptions options;
@@ -92,9 +95,11 @@ struct ModelProfile {
     std::optional<qwen::VisionProfile> vision;
     std::optional<DraftProfile> draft;
     std::optional<ProposalProfile> proposal;
+    std::shared_ptr<const residual::Profile> intervention;
 };
 
-[[nodiscard]] std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition&);
+[[nodiscard]] std::shared_ptr<const ModelProfile>
+describe_model(const ModelDefinition&, std::shared_ptr<const residual::Profile> intervention = {});
 
 } // namespace execution
 } // namespace ninfer::models::qwen3_5

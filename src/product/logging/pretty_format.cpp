@@ -100,4 +100,20 @@ std::string format_pretty_text(std::string_view value) {
     return out;
 }
 
+std::string format_pretty_index_runs(std::span<const std::uint32_t> indices) {
+    std::string out;
+    for (std::size_t first = 0; first < indices.size();) {
+        std::size_t last = first;
+        while (last + 1 < indices.size() && indices[last] != UINT32_MAX &&
+               indices[last + 1] == indices[last] + 1) {
+            ++last;
+        }
+        if (!out.empty()) { out.push_back(','); }
+        out += std::to_string(indices[first]);
+        if (last != first) { out += ".." + std::to_string(indices[last]); }
+        first = last + 1;
+    }
+    return out;
+}
+
 } // namespace ninfer::product

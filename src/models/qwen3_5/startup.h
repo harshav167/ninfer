@@ -43,12 +43,23 @@ public:
         return definition_;
     }
 
+    // The startup-fixed profile selection. Disabled when no profile was requested.
+    [[nodiscard]] const ResidualInterventionSummary& residual_intervention() const noexcept {
+        return residual_;
+    }
+
+    [[nodiscard]] TextGeometry geometry() const {
+        const auto& text = definition_->config().text;
+        return {text.hidden_size, text.num_hidden_layers};
+    }
+
     std::shared_ptr<const execution::ModelProfile> profile;
 
 private:
     std::vector<WeightCandidate> placements_;
     std::shared_ptr<const moe::Plan> offload_;
     const artifact::Reader& reader_;
+    ResidualInterventionSummary residual_;
     std::shared_ptr<const ModelDefinition> definition_;
     Architecture architecture_;
 };

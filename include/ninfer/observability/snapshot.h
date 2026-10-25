@@ -120,9 +120,23 @@ struct ContextCostSummary {
     std::filesystem::path preset_path;
 };
 
+// Startup-fixed residual intervention. Empty when no profile was selected.
+struct ResidualInterventionSummary {
+    bool enabled = false;
+    std::filesystem::path profile_path;
+    // Edited Main layers, strictly ascending.
+    std::vector<std::uint32_t> layers;
+};
+
 struct LoadSummary {
     std::string architecture;
     std::string model_name;
+    // Artifact container identifier: 32 lowercase hexadecimal characters.
+    std::string artifact_id;
+    // Main text geometry: hidden width and number of decoder layers.
+    std::uint32_t hidden_size       = 0;
+    std::uint32_t num_hidden_layers = 0;
+    ResidualInterventionSummary residual_intervention;
     std::string cuda_sync_mode;
     std::vector<std::string> weight_formats;
     std::string prefill_signature;
@@ -145,6 +159,11 @@ struct RankDescriptor {
 
 struct EngineDescription {
     std::string architecture, model_name;
+    // Same identifier as LoadSummary::artifact_id.
+    std::string artifact_id;
+    std::uint32_t hidden_size       = 0;
+    std::uint32_t num_hidden_layers = 0;
+    ResidualInterventionSummary residual_intervention;
     std::vector<RankDescriptor> ranks;
     std::uint32_t max_context = 0, max_concurrency = 0, prefill_chunk = 0;
     std::vector<ContextPoolCapacity> context_pools;

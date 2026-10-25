@@ -20,7 +20,9 @@ struct FrameSpec {
     std::uint32_t draft_window   = 0;
     SpeculativeBackend backend   = SpeculativeBackend::None;
     bool causal_scoring          = false;
-    bool vision                  = false;
+    // Main layer count observable by residual capture; nonzero only for causal scoring.
+    std::uint32_t residual_layers = 0;
+    bool vision                   = false;
 };
 
 // Arrays are compact-row indexed. Tensor views bind only the current exact-B prefix.
@@ -95,6 +97,7 @@ struct FrameHostLayout {
     std::optional<TensorRegion> step_rope_positions;
     std::optional<TensorRegion> step_valid_columns;
     std::optional<TensorRegion> score_logprobs;
+    std::optional<TensorRegion> residual_probe;
     std::size_t bytes = 0;
 };
 
@@ -115,6 +118,7 @@ struct FrameLayout {
     std::optional<TensorRegion> masks;
     std::optional<TensorRegion> score_targets;
     std::optional<TensorRegion> score_logprobs;
+    std::optional<TensorRegion> residual_probe;
     std::optional<MtpFrameLayout> mtp;
     std::optional<DFlashFrameLayout> dflash;
     FrameHostLayout host;
@@ -166,7 +170,7 @@ public:
     Tensor host_input_ids, host_cache_positions, host_rope_positions;
     Tensor host_visual_indices;
     Tensor host_control_tokens;
-    Tensor host_masks, host_drafts, host_score_logprobs;
+    Tensor host_masks, host_drafts, host_score_logprobs, host_residual_probe;
     Tensor host_step_positions, host_step_rope_positions, host_step_valid_columns;
     MemorySpan ingress, commit, egress;
     Tensor anchors, frontiers, backend_frontiers, extents, valid_columns;
@@ -179,7 +183,7 @@ public:
     Tensor input_ids, cache_positions, rope_positions, hidden;
     Tensor input_embeddings;
     Tensor visual_indices;
-    Tensor logits, target_argmax, masks, score_targets, score_logprobs;
+    Tensor logits, target_argmax, masks, score_targets, score_logprobs, residual_probe;
     std::optional<MtpFrame> mtp;
     std::optional<DFlashFrame> dflash;
 

@@ -7,6 +7,8 @@
 [model]
 path = "out/qwen3_8_flash_next.ninfer"
 chat_template = "" # Empty uses the artifact's template.
+residual_profile = "" # Optional residual-intervention profile (JSON v1, Qwen3.5-family text models); empty disables it.
+# Example: residual_profile = "profiles/arm-a.json" # Bound to the exact artifact id and geometry; checked at startup.
 vision = false
 
 [engine]

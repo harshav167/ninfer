@@ -23,3 +23,10 @@ add_executable(ninfer-perplexity
 ninfer_internal_includes(ninfer-perplexity)
 target_link_libraries(ninfer-perplexity PRIVATE
   ninfer_engine ninfer_product_logging ninfer::json)
+
+add_executable(ninfer-residual-capture
+  residual_capture/main.cpp
+  residual_capture/capture.cpp)
+ninfer_internal_includes(ninfer-residual-capture)
+target_link_libraries(ninfer-residual-capture PRIVATE
+  ninfer_engine ninfer_model_control ninfer::json)

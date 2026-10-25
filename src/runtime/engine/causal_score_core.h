@@ -11,13 +11,14 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <span>
 #include <thread>
 #include <utility>
 #include <vector>
 
 namespace ninfer::runtime {
 
-// One scoring job owns the execution slot until its result is delivered.
+// One scoring or residual-capture job owns the execution slot until its result is delivered.
 template <class Instance>
 class CausalScoreCore {
 public:
@@ -25,6 +26,14 @@ public:
 
     using ModelContract  = typename Instance::ModelContract;
     using PreparedPrompt = typename ModelContract::PreparedPrompt;
+
+    // Whether the model's Session observes residuals; architectures without that capability
+    // reject capture requests instead of providing a placeholder.
+    static constexpr bool supports_residual_capture =
+        requires(Instance& instance, PreparedPrompt prompt, std::span<const TokenId> suffix,
+                 std::span<const std::uint32_t> layers) {
+            instance.session->start_residual_capture(std::move(prompt), suffix, layers);
+        };
 
     explicit CausalScoreCore(Instance& instance) : instance_(instance) {
         published_snapshot_.ranks.assign(instance_.executor->observations().begin(),
@@ -62,24 +71,27 @@ public:
     CausalScoreCore& operator=(const CausalScoreCore&) = delete;
 
     [[nodiscard]] std::vector<float> score(PreparedPrompt prompt, std::uint32_t first_target) {
-        // One synchronous public call owns the sole job slot until its result is delivered.
-        std::scoped_lock call_lock(call_mutex_);
-        auto job                               = std::make_unique<Job>();
-        job->prompt                            = std::move(prompt);
-        job->first_target                      = first_target;
-        std::future<std::vector<float>> result = job->promise.get_future();
-        {
-            std::lock_guard queue_lock(queue_mutex_);
-            if (stopping_ || failed_) {
-                throw std::runtime_error("causal scoring engine is unavailable");
-            }
-            if (job_ != nullptr) {
-                throw std::logic_error("causal scoring core already has an in-flight job");
-            }
-            job_ = std::move(job);
+        auto job          = std::make_unique<Job>();
+        job->prompt       = std::move(prompt);
+        job->first_target = first_target;
+        return run(std::move(job)).logprobs;
+    }
+
+    // Prefills prompt + forced_suffix and returns the residual of the last token at each layer.
+    [[nodiscard]] ResidualCapture
+    capture_residuals([[maybe_unused]] PreparedPrompt prompt,
+                      [[maybe_unused]] std::span<const TokenId> forced_suffix,
+                      [[maybe_unused]] std::span<const std::uint32_t> layers) {
+        if constexpr (supports_residual_capture) {
+            auto job     = std::make_unique<Job>();
+            job->prompt  = std::move(prompt);
+            job->capture = true;
+            job->forced_suffix.assign(forced_suffix.begin(), forced_suffix.end());
+            job->layers.assign(layers.begin(), layers.end());
+            return run(std::move(job)).capture;
+        } else {
+            throw std::invalid_argument("residual capture is not supported by this architecture");
         }
-        queue_cv_.notify_one();
-        return result.get();
     }
 
     [[nodiscard]] EngineSnapshot snapshot() const {
@@ -112,11 +124,50 @@ private:
         published_snapshot_.ranks.assign(ranks.begin(), ranks.end());
     }
 
+    struct Completion {
+        std::vector<float> logprobs;
+        ResidualCapture capture;
+    };
+
     struct Job {
         PreparedPrompt prompt;
+        // Scoring: first_target. Capture: forced_suffix and layers.
         std::uint32_t first_target = 0;
-        std::promise<std::vector<float>> promise;
+        std::vector<TokenId> forced_suffix;
+        std::vector<std::uint32_t> layers;
+        bool capture = false;
+        std::promise<Completion> promise;
     };
+
+    [[nodiscard]] Completion run(std::unique_ptr<Job> job) {
+        // One synchronous public call owns the sole job slot until its result is delivered.
+        std::scoped_lock call_lock(call_mutex_);
+        std::future<Completion> result = job->promise.get_future();
+        {
+            std::lock_guard queue_lock(queue_mutex_);
+            if (stopping_ || failed_) {
+                throw std::runtime_error("causal scoring engine is unavailable");
+            }
+            if (job_ != nullptr) {
+                throw std::logic_error("causal scoring core already has an in-flight job");
+            }
+            job_ = std::move(job);
+        }
+        queue_cv_.notify_one();
+        return result.get();
+    }
+
+    [[nodiscard]] auto start(Job& job) {
+        if (job.capture) {
+            if constexpr (supports_residual_capture) {
+                return instance_.session->start_residual_capture(std::move(job.prompt),
+                                                                 job.forced_suffix, job.layers);
+            } else {
+                throw std::logic_error("residual capture reached an architecture without support");
+            }
+        }
+        return instance_.session->start_score(std::move(job.prompt), job.first_target);
+    }
 
     void worker_loop() noexcept {
         for (;;) {
@@ -135,11 +186,10 @@ private:
             scoring_.active_jobs   = 1;
             publish();
             try {
-                std::vector<float> result;
+                Completion result;
                 {
                     std::scoped_lock lock(execution_mutex_);
-                    const auto ticket =
-                        instance_.session->start_score(std::move(job->prompt), job->first_target);
+                    const auto ticket = start(*job);
                     if (!ticket) {
                         instance_.executor->fail("scoring execution slot is occupied");
                         throw std::logic_error("scoring execution slot is occupied");
@@ -155,9 +205,22 @@ private:
                                 throw std::logic_error(
                                     "scoring received an unrelated execution result");
                             }
-                            result = std::move(
-                                std::get<typename ModelContract::ScoreComplete>(event->result)
-                                    .logprobs);
+                            auto& complete =
+                                std::get<typename ModelContract::ScoreComplete>(event->result);
+                            result.logprobs = std::move(complete.logprobs);
+                            if constexpr (supports_residual_capture) {
+                                if (job->capture != complete.residuals.has_value()) {
+                                    throw std::logic_error(
+                                        "execution result does not match its scoring job kind");
+                                }
+                                if (complete.residuals) {
+                                    auto& observed                  = *complete.residuals;
+                                    result.capture.prompt_token_ids = std::move(observed.token_ids);
+                                    result.capture.layers           = std::move(job->layers);
+                                    result.capture.hidden_size      = observed.hidden_size;
+                                    result.capture.values           = std::move(observed.values);
+                                }
+                            }
                             break;
                         }
                         instance_.executor->flush();
@@ -165,7 +228,7 @@ private:
                     }
                 }
                 ++scoring_.completed_jobs;
-                scoring_.scored_tokens += result.size();
+                scoring_.scored_tokens += result.logprobs.size();
                 scoring_.active_jobs = 0;
                 scoring_.wall.observe(observation_time_ns() - started);
                 publish();

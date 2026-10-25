@@ -19,7 +19,24 @@ Startup::Startup(const artifact::Reader& definition_source, const artifact::Read
             throw std::invalid_argument(
                 "Qwen3_5 model preparation supports one rank with TP=EP=DP=PP=ADP=1");
     }
-    profile       = execution::describe_model(*definition_);
+    std::shared_ptr<const residual::Profile> intervention;
+    if (!options.residual_profile_path.empty()) {
+        const auto& text = definition_->config().text;
+        auto loaded      = residual::read_profile(options.residual_profile_path);
+        try {
+            residual::require_binding(loaded,
+                                      artifact::artifact_id_string(definition_->artifact_id()),
+                                      text.hidden_size, text.num_hidden_layers);
+        } catch (const std::invalid_argument& error) {
+            throw std::invalid_argument(
+                "residual profile " + options.residual_profile_path.string() + ": " + error.what());
+        }
+        residual_.enabled      = true;
+        residual_.profile_path = options.residual_profile_path;
+        for (const auto& edit : loaded.layers) residual_.layers.push_back(edit.layer);
+        intervention = std::make_shared<const residual::Profile>(std::move(loaded));
+    }
+    profile       = execution::describe_model(*definition_, std::move(intervention));
     auto resident = resolve_load(reader_, definition_, device);
     placements_.push_back({WeightPlacement::Resident,
                            resident.materialization().device_capacity_bytes,
@@ -55,7 +72,7 @@ Startup::plan(DeviceContext& device, const EngineOptions& options, WeightPlaceme
     const auto required_context     = policy.mode == ContextCapacityMode::Explicit
                                           ? runtime::ContextCapacity{policy.explicit_bytes}
                                           : capacity_plan.minimum_capacity();
-    const auto required_bytes       = capacity_plan.reservation_bytes(required_context) +
+    const auto required_bytes = capacity_plan.reservation_bytes(required_context) +
                                 (shared_memory ? capacity_plan.control_bytes(required_context) : 0);
     if (required_bytes > available) return std::nullopt;
     if (!host_experts) {

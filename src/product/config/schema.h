@@ -10,6 +10,7 @@ namespace ninfer::product::config_detail {
 enum class Field {
     ModelPath,
     ChatTemplate,
+    ResidualProfile,
     Vision,
     Device,
     MaxContext,

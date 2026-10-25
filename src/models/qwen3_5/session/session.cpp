@@ -343,6 +343,13 @@ std::optional<runtime::ExecutionTicket> Session::start_score(qwen::PreparedPromp
     return impl_->start_score(qwen::PreparedPromptAccess::take(std::move(prompt)), first);
 }
 
+std::optional<runtime::ExecutionTicket>
+Session::start_residual_capture(qwen::PreparedPrompt&& prompt, std::span<const TokenId> suffix,
+                                std::span<const std::uint32_t> layers) {
+    return impl_->start_residual_capture(qwen::PreparedPromptAccess::take(std::move(prompt)),
+                                         suffix, layers);
+}
+
 std::optional<SessionEvent> Session::poll() { return impl_->poll(); }
 
 void Session::supply(runtime::ExecutionTicket ticket, runtime::DecisionInput&& input) {

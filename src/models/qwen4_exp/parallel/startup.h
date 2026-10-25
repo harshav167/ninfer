@@ -30,6 +30,11 @@ public:
 
     [[nodiscard]] Architecture architecture() const { return Architecture::Qwen4Exp; }
 
+    [[nodiscard]] TextGeometry geometry() const {
+        const auto& text = definition_->config().text;
+        return {text.hidden, static_cast<std::uint32_t>(text.layers.size())};
+    }
+
 private:
     std::shared_ptr<const ModelDefinition> definition_;
     ParallelPlan parallel_;

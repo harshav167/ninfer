@@ -7,6 +7,7 @@
 #include "models/qwen3_5/execution/gdn.h"
 #include "models/qwen3_5/execution/workspace.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
+#include "ninfer/ops/clipped_direction_removal.h"
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/indexing.h"
@@ -17,6 +18,7 @@
 #include <algorithm>
 #include <cmath>
 #include <exception>
+#include <functional>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -43,7 +45,7 @@ bool is_sequence(const TextStateUpdate& update) {
 
 TextRun::TextRun(TextExecutionView execution, TextInputs inputs, TextStateUpdate update,
                  ops::CausalAttentionExecutionEnvelope envelope, Tensor hidden,
-                 const DFlashFeatureSink* features)
+                 const DFlashFeatureSink* features, const ResidualProbe* probe)
     : view_(execution), inputs_(std::move(inputs)), update_(update), envelope_(envelope),
       hidden_(hidden), traversal_scope_(view_.workspace.scope()) {
     const auto& config = view_.parameters.profile->config.text;
@@ -108,6 +110,29 @@ TextRun::TextRun(TextExecutionView execution, TextInputs inputs, TextStateUpdate
             if (layer >= view_.parameters.text.layers.size())
                 throw std::invalid_argument("Main feature layer is outside the model");
         features_ = *features;
+    }
+    const auto strictly_ascending_layers = [&](std::span<const std::uint32_t> layers) {
+        return !layers.empty() &&
+               std::adjacent_find(layers.begin(), layers.end(), std::greater_equal<>{}) ==
+                   layers.end() &&
+               layers.back() < view_.parameters.text.layers.size();
+    };
+    if (const auto* tables = view_.intervention) {
+        if (!strictly_ascending_layers(tables->layers))
+            throw std::invalid_argument("Main residual intervention layers are invalid");
+        const auto count = static_cast<std::int32_t>(tables->layers.size());
+        require_shape(tables->directions, DType::FP32, {channels, 2, count},
+                      "Main intervention directions");
+        require_shape(tables->references, DType::FP32, {2, count}, "Main intervention references");
+    }
+    if (probe) {
+        if (batch != 1 || !strictly_ascending_layers(probe->layers) || probe->column < 0 ||
+            probe->column >= width)
+            throw std::invalid_argument("Main residual probe selection is invalid");
+        require_shape(probe->target, DType::BF16,
+                      {channels, static_cast<std::int32_t>(probe->layers.size())},
+                      "Main residual probe target");
+        probe_ = *probe;
     }
     residual_ = view_.workspace.alloc(DType::BF16, {channels, columns});
 }
@@ -340,6 +365,36 @@ void TextRun::capture_features(std::uint32_t layer) {
     }
 }
 
+void TextRun::observe_residual(std::uint32_t layer) {
+    if (!probe_) return;
+    const auto found = std::find(probe_->layers.begin(), probe_->layers.end(), layer);
+    if (found == probe_->layers.end()) return;
+    const auto slot     = static_cast<std::int32_t>(found - probe_->layers.begin());
+    const auto bytes    = std::size_t(residual_.ne[0]) * dtype_size(DType::BF16);
+    const Tensor source = residual_.slice(1, probe_->column, 1);
+    const Tensor target = probe_->target.slice(1, slot, 1);
+    copy_bytes_async({target.data, bytes, target.device}, {source.data, bytes, source.device},
+                     view_.execution);
+}
+
+void TextRun::intervene(std::uint32_t layer) {
+    const auto* tables = view_.intervention;
+    if (!tables) return;
+    const auto found = std::lower_bound(tables->layers.begin(), tables->layers.end(), layer);
+    if (found == tables->layers.end() || *found != layer) return;
+    const auto slot         = static_cast<std::int32_t>(found - tables->layers.begin());
+    const auto channels     = residual_.ne[0];
+    const Tensor directions = tables->directions.slice(2, slot, 1).view({channels, 2});
+    const Tensor references = tables->references.slice(1, slot, 1).view({2});
+    ops::clipped_direction_removal(directions, references, residual_, view_.execution);
+}
+
+void TextRun::finish_layer(std::uint32_t layer) {
+    observe_residual(layer);
+    intervene(layer);
+    capture_features(layer);
+}
+
 void TextRun::finish() {
     if (features_ && !features_->residency_slots.data && features_->positions.data) {
         const auto bytes = std::size_t(residual_.ne[1]) * sizeof(std::int32_t);
@@ -365,7 +420,7 @@ bool TextRun::start() {
 }
 
 void TextRun::complete_layer() {
-    capture_features(layer_);
+    finish_layer(layer_);
     post_mixer_scope_.reset();
     ++layer_;
     stage_ = Stage::Layer;

@@ -649,6 +649,7 @@ double registered_tensor_peak_tflops(const BenchPoint& point, const char*& profi
          (point.n == 1664 && point.k == 2560 && point.t >= 2) ||
          (point.n == 2560 && point.k == 4608 && point.t >= 3) ||
          (point.n == 4608 && point.k == 4608 && point.t >= 3) ||
+         (point.n == 5120 && point.k == 4608 && point.t >= 3) ||
          (point.n == 4304 && point.k == 1152 && point.t >= 4) ||
          (point.n == 1152 && point.k == 4304 && point.t >= 4) ||
          (point.n == 1152 && point.k == 1152 && point.t >= 8) ||
@@ -683,7 +684,7 @@ Result make_result(const BenchPoint& point, const LinearBenchWeight& weight,
         checked_add(weight.model_weight_bytes(), x_bytes, "model bytes"), out_bytes, "model bytes");
     const double useful_flops = 2.0 * static_cast<double>(point.n) * static_cast<double>(point.k) *
                                 static_cast<double>(point.t);
-    const double seconds = timing.median_us * 1.0e-6;
+    const double seconds      = timing.median_us * 1.0e-6;
     const double memory_floor_us =
         static_cast<double>(model_bytes) / (bench::kRoofline.memory_gbs * 1.0e9) * 1.0e6;
 

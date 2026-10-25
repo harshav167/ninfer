@@ -129,9 +129,9 @@ void RankProgramImpl::begin_target(ComputeOperation& operation) {
     auto& frame        = resources.frame;
     const bool forward = std::holds_alternative<ForwardWork>(operation.request.work.operation) ||
                          std::holds_alternative<ScoreWork>(operation.request.work.operation);
-    const int batch = forward ? 1 : static_cast<int>(operation.batch);
-    const int width = static_cast<int>(operation.width);
-    auto input      = frame.input_view(width, batch);
+    const int batch    = forward ? 1 : static_cast<int>(operation.batch);
+    const int width    = static_cast<int>(operation.width);
+    auto input         = frame.input_view(width, batch);
     if (!forward && graphs) {
         operation.fused_decision =
             !operation.speculative &&
@@ -183,14 +183,24 @@ void RankProgramImpl::begin_target(ComputeOperation& operation) {
             features->residency_slots = frame.residency_slots.slice(0, 0, batch);
         }
     }
+    std::optional<execution::ResidualProbe> probe;
+    if (const auto* score = std::get_if<ScoreWork>(&operation.request.work.operation);
+        score && score->capture) {
+        probe.emplace();
+        probe->layers = score->capture->layers;
+        probe->column = static_cast<std::int32_t>(score->capture->column);
+        probe->target =
+            frame.residual_probe.slice(1, 0, static_cast<int>(score->capture->layers.size()));
+    }
     resources.work.reset();
     if (forward) prefill_timer.start();
     operation.text = std::make_unique<execution::TextRun>(
         execution::TextExecutionView{parameters, resources.work, device.execution_view(),
                                      resources.decoder.text_kv, resources.state_images.linear(),
-                                     resources.moe.get()},
+                                     resources.moe.get(),
+                                     resources.intervention ? &*resources.intervention : nullptr},
         std::move(inputs), update, ops::CausalAttentionExecutionEnvelope{minimum, maximum},
-        input.hidden, features ? &*features : nullptr);
+        input.hidden, features ? &*features : nullptr, probe ? &*probe : nullptr);
     operation.row_finished = operation.text->start();
 }
 

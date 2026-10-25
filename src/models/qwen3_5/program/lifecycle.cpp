@@ -16,7 +16,8 @@ RankProgramImpl::RankProgramImpl(const execution::Parameters& values, const Sequ
       draft_window(plan.draft_window), backend(plan.speculative_backend),
       proposal_head(plan.proposal_head), use_cuda_graph(plan.use_cuda_graph),
       kv_storage(plan.kv_storage), workspace_plan(plan.workspace),
-      resources(context, plan.persistent, plan.workspace, observer),
+      resources(context, plan.persistent, plan.workspace, values.profile->intervention.get(),
+                observer),
       context_counts(plan.causal_scoring ? 0
                                          : std::size_t(values.profile->public_tokens) *
                                                plan.max_concurrency * sizeof(std::int32_t)),

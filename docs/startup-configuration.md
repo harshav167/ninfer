@@ -124,6 +124,7 @@ HTTP(S)、data URI、绝对路径保持原含义；显式 `--media-root` 的工�
 |---|---|---|---|
 | `model.path` | 模型位置参数 | 路径；必填 | v3 `.ninfer` artifact |
 | `model.chat_template` | `--chat-template` | 路径 / `""` | 非空覆盖 artifact 模板；空值恢复 artifact 模板 |
+| `model.residual_profile` | `--residual-profile` | 路径 / `""` | 非空选择启动固定的 residual intervention profile（JSON v1，仅 Qwen3.5 系列文本模型）；空值恢复默认，即不启用，保持原有数学、启动资源与 Graph。一个 Engine 只有一个 profile，不可更换，所有 lane、缓存和 checkpoint 共享；它绑定精确的 artifact id 与模型几何，不一致时启动报错，不回退、不静默关闭。格式与生成见原生 capture/拟合工具（[CLI](cli.md)） |
 | `model.vision` | `--vision` / `--no-vision` | bool / false | 启动固定 Vision 权重和执行资源；HTTP 请求不能补开 |
 | `engine.device` | `--device` | 非负 int / 0 | 当前单 rank 的本地 CUDA ordinal |
 | `engine.max_context` | `--max-context` | 正 uint32 / 8192 | 单请求逻辑 context 上限，包含已处理输入和后续生成 |
@@ -137,6 +138,10 @@ HTTP(S)、data URI、绝对路径保持原含义；显式 `--media-root` 的工�
 
 自动 KV 的具体策略由 Engine/planner 提供，配置层保留该请求。
 Vision、speculative 及具体格式的可用性不在 parser 建立模型能力表。
+
+`model.residual_profile` 的产品层检查只覆盖类型、来源和路径形式：TOML 相对路径相对配置文件目录，
+argv 相对启动时的工作目录，空字符串恢复默认。文件是否存在、JSON 内容、artifact id 与几何绑定以及架构是否支持，
+都由 Engine 在读取权重前检查，任何不符都是启动错误。CLI 与 serve 默认都不设置该项。
 
 Explicit `--context-capacity SIZE` does not subtract the automatic 1 GiB startup
 headroom. The requested arena must still fit available Device memory alongside
@@ -346,6 +351,12 @@ server         listen             127.0.0.1:8080
 Host default 和 Graph/权重容量等未决事实保持标记。Engine 准备完成后消费实际
 EngineOptions、LoadSummary、MemorySummary 输出 resolved 摘要，展示实际 chunk、
 各 rank 的 Context backing、逻辑对象统计及资源规划结果。
+
+加载完成后，`LoadSummary` 的实际启动事实在 `engine ready` 日志之后另以一条 INFO 日志展示：
+`artifact_id`（32 位十六进制）与 `residual_intervention`（是否启用、profile 路径、被修改的 Main 层），
+例如 `artifact <id> | residual intervention ON | profile … | layers 27..42 (16)`，未启用时为 `OFF`。
+serve 的 `server_start` 记录同样保存 `artifact.artifact_id` 与 `engine.residual_intervention`
+（`enabled`、`profile_path`、`layers`）；请求值仍在 `model.residual_profile` 配置项中，两者分开记录。
 
 ### 3.3 结构化日志
 

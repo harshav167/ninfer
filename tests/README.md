@@ -235,6 +235,31 @@ NINFER_QWEN4_EXP_TEST_ARTIFACT=out/qwen3_8_flash_next.ninfer \
   ./build/dgx-spark-dev/tests/ninfer_qwen4_exp_score_state_real_test
 ```
 
+Residual intervention and capture are qualified at separate boundaries. `ninfer_normalization_test --suite
+clipped_direction_removal` checks the Op against a scalar FP64 evaluation of the complete formula
+(both clips, one clip, none, zero disclaimer direction, massive activations, H from 8 to 16384, T=0
+through 1024, byte-exact guards and untouched table slots, bit-exact pass-through when no clip is
+active, cases that fail if the second dot uses the unmodified column or if the intermediate is rounded to
+BF16, and Graph replay with changed residual, directions and references).
+`ninfer_residual_profile_test` covers the JSON v1 parser and binding checks without a model.
+`ninfer_residual_capture_test` covers the capture app's layer lists, dataset parser, manifest and
+little-endian residual file writer with an independent reader. The two opt-in real tests use
+`NINFER_TEST_ARTIFACT`: `ninfer_qwen3_5_residual_capture_real_test` checks shape, BF16 widening,
+determinism, layer-subset equality, forced-suffix equality with the same prompt tokens,
+multi-window capture determinism, rejected requests and unchanged scoring afterwards;
+`ninfer_qwen3_5_residual_profile_real_test` starts CausalScoring Engines with generated profiles and
+checks startup rejection of every binding/schema mismatch, unchanged scores for a clip that cannot
+activate, changed scores for an active edit, and refused capture under a profile.
+`ninfer_residual_profile_fit_test` checks fitting against independently constructed directions
+and references, disabled disclaimer edits, malformed payloads and degenerate calibration.
+
+```bash
+NINFER_TEST_ARTIFACT=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
+  ctest --test-dir build/rtx5090-dev \
+  -R 'ninfer_(residual_(profile|capture)_test|qwen3_5_residual_(capture|profile)_real_test)' \
+  --output-on-failure
+```
+
 `ninfer_moe_test` qualifies the integer routing, complete MoE and routed SwiGLU profiles.
 `ninfer_moe_block_scaled_test` qualifies NVFP4 A4 and block-FP8 A8/G128 experts with BF16
 control/shared and small-token A16 routes. It uses independent FP64 formulas and encoded-weight

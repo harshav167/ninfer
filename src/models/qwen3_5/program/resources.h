@@ -7,14 +7,18 @@
 #include "core/gdn_replay_records.h"
 #include "models/common/moe/schedule.h"
 #include "models/common/qwen/vision/vision.h"
+#include "models/common/residual/profile.h"
+#include "models/qwen3_5/execution/intervention.h"
 #include "models/qwen3_5/program/frames.h"
 #include "models/qwen3_5/state/decoder_state.h"
 #include "models/qwen3_5/state/state_image.h"
 #include "ninfer/ops/gdn_replay.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace ninfer::models::qwen3_5 {
 
@@ -25,11 +29,17 @@ struct DFlashPersistentSpec {
     std::int32_t feature_rows = 0;
 };
 
+struct ResidualInterventionSpec {
+    std::int32_t hidden = 0;
+    std::int32_t layers = 0;
+};
+
 struct ResourceSpec {
     DecoderStateSpec decoder;
     StateImageSpec state_images;
     std::optional<GdnReplayRecordSpec> replay_records;
     std::optional<DFlashPersistentSpec> dflash;
+    std::optional<ResidualInterventionSpec> intervention;
     FrameSpec frame;
     std::size_t context_bytes      = 0;
     std::size_t host_context_bytes = 0;
@@ -42,11 +52,17 @@ struct DFlashPersistentLayout {
     TensorRegion pending_features;
 };
 
+struct ResidualInterventionLayout {
+    TensorRegion directions;
+    TensorRegion references;
+};
+
 struct ResourceLayout {
     DecoderStateLayout decoder;
     StateImageDeviceLayout state_images;
     std::optional<GdnReplayRecordLayout> replay_records;
     std::optional<DFlashPersistentLayout> dflash;
+    std::optional<ResidualInterventionLayout> intervention;
     FrameLayout frame;
     std::optional<TensorRegion> token_counts;
     std::size_t context_bytes      = 0;
@@ -88,8 +104,10 @@ struct DFlashPersistentState {
 // Rank-owned arenas and execution storage; the Directory assigns each Context record.
 class Resources {
 public:
+    // `intervention` is the startup profile; it is present exactly when the layout plans
+    // intervention tables. Its values are uploaded once here and stay immutable afterwards.
     Resources(DeviceContext& device, const ResourceLayout& layout, const WorkspaceSpec& workspace,
-              const StartupObserver& observer = {});
+              const residual::Profile* intervention, const StartupObserver& observer = {});
     Resources(const Resources&)            = delete;
     Resources& operator=(const Resources&) = delete;
 
@@ -107,6 +125,8 @@ public:
     std::optional<GdnReplayRecords> replay_records;
     std::optional<ops::GdnReplayFoldPlan> replay_fold;
     std::optional<DFlashPersistentState> dflash;
+    std::vector<std::uint32_t> intervention_layers;
+    std::optional<execution::ResidualIntervention> intervention;
     Tensor token_counts;
     ExecutionFrame frame;
     std::unique_ptr<moe::Schedule> moe;

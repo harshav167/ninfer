@@ -60,6 +60,11 @@ int main() {
     options.launch.generation.preserve_thinking     = true;
     options.launch.generation.thinking_budget       = 512;
     options.launch.generation.sampling.temperature  = 0.6F;
+    options.launch.engine.residual_profile_path     = "/profiles/arm-a.json";
+    options.launch.provenance.fields.emplace(
+        "model.residual_profile",
+        ninfer::product::ConfigSource{.kind     = ninfer::product::ConfigSourceKind::CommandLine,
+                                      .argument = 3});
     options.launch.provenance.argv = {"ninfer-serve", options.launch.engine.artifact_path.string(),
                                       "--api-key", "<redacted>"};
 
@@ -71,6 +76,11 @@ int main() {
                           startup.at("configuration").at("server.api_key") == "configured" &&
                           startup.dump().find("must-not-appear") == std::string::npos,
                       "startup configuration log lost exact values or exposed the API key");
+    failures +=
+        check(startup.at("configuration").at("model.residual_profile") == "/profiles/arm-a.json" &&
+                  startup.at("sources").at("model.residual_profile") ==
+                      Json{{"kind", "argv"}, {"argument", 3}},
+              "startup configuration log lost the residual profile request or its source");
 
     ninfer::EngineOptions engine_options;
     engine_options.artifact_path                     = options.launch.engine.artifact_path;
@@ -103,12 +113,15 @@ int main() {
     load.max_rank_staging_bytes = 128;
     load.device_object_count    = 42;
     load.host_object_count      = 6;
-    load.context_cost           = {
-                  .transfer_source   = ninfer::ContextCostPresetSource::External,
-                  .prefill_source    = ninfer::ContextCostPresetSource::CompiledDefault,
-                  .hardware_class    = "nvidia-geforce-rtx-5090-sm120",
-                  .prefill_signature = "example-prefill-signature",
-                  .preset_path       = "local-costs.json",
+    load.artifact_id            = "0123456789abcdef0123456789abcdef";
+    load.residual_intervention  = {
+        .enabled = true, .profile_path = "/profiles/arm-a.json", .layers = {27, 28, 29, 41, 42}};
+    load.context_cost = {
+        .transfer_source   = ninfer::ContextCostPresetSource::External,
+        .prefill_source    = ninfer::ContextCostPresetSource::CompiledDefault,
+        .hardware_class    = "nvidia-geforce-rtx-5090-sm120",
+        .prefill_signature = "example-prefill-signature",
+        .preset_path       = "local-costs.json",
     };
 
     ninfer::EngineDescription description;
@@ -129,14 +142,14 @@ int main() {
     memory.allocations.persistent_device_bytes = 200;
     memory.allocations.workspace_device_bytes  = 500;
     memory.vision                              = ninfer::VisionWorkspaceMemorySummary{
-                                     .aggregate_prompt_tokens = 32768,
-                                     .max_item_tokens         = 16384,
-                                     .general_capacity_bytes  = 300,
-                                     .encode_required_bytes   = 400,
-                                     .handoff_offset_bytes    = 300,
-                                     .handoff_capacity_bytes  = 200,
-                                     .handoff_active_bytes    = 0,
-                                     .handoff_peak_bytes      = 150,
+        .aggregate_prompt_tokens = 32768,
+        .max_item_tokens         = 16384,
+        .general_capacity_bytes  = 300,
+        .encode_required_bytes   = 400,
+        .handoff_offset_bytes    = 300,
+        .handoff_capacity_bytes  = 200,
+        .handoff_active_bytes    = 0,
+        .handoff_peak_bytes      = 150,
     };
     budget.minimum_runtime_reservation_bytes = 1300;
     budget.context_capacity_bytes            = 8ULL << 30;
@@ -179,6 +192,13 @@ int main() {
         check(server.at("artifact").at("formats") == Json::array({"q4_g64_fp16", "q8_g32_fp16"}),
               "server weights id missing");
     failures += check(server.at("artifact").at("size_bytes") == 123456, "artifact size missing");
+    failures += check(server.at("artifact").at("artifact_id") == "0123456789abcdef0123456789abcdef",
+                      "artifact id missing from the server record");
+    failures += check(server.at("engine").at("residual_intervention") ==
+                          Json{{"enabled", true},
+                               {"profile_path", "/profiles/arm-a.json"},
+                               {"layers", Json::array({27, 28, 29, 41, 42})}},
+                      "residual intervention state missing from the server record");
     failures += check(server.at("engine").at("max_context") == 262144, "max context missing");
     failures += check(server.at("engine").at("context_capacity_mode") == "explicit" &&
                           server.at("engine").at("context_pools").at(0).at("capacity_bytes") ==
@@ -208,6 +228,16 @@ int main() {
         description, startup_report, snapshot, environment, std::uint64_t{123456}));
     failures +=
         check(k8v4_server.at("engine").at("kv_cache") == "k8v4", "K8V4 KV report name missing");
+    auto disabled_report                       = startup_report;
+    disabled_report.load.residual_intervention = {};
+    const Json disabled_server                 = Json::parse(format_server_start_json(
+        "serve-test", 1000, options, engine_options, sampling_defaults, "deployment-alias",
+        description, disabled_report, snapshot, environment, std::uint64_t{123456}));
+    failures += check(
+        disabled_server.at("engine").at("residual_intervention") ==
+                Json{{"enabled", false}, {"profile_path", ""}, {"layers", Json::array()}} &&
+            disabled_server.at("artifact").at("artifact_id") == "0123456789abcdef0123456789abcdef",
+        "disabled residual intervention was not recorded explicitly");
     failures += check(server.at("engine").at("vision") == false, "Vision state missing");
     failures += check(server.at("engine").at("speculative_backend") == "mtp",
                       "speculative backend missing");
@@ -453,18 +483,18 @@ int main() {
     outcome.stats.computed_prefill_tokens         = 300;
     outcome.stats.prefix_reuse_path               = ninfer::PrefixReusePath::Checkpoint;
     outcome.stats.engine_timing                   = {
-                          .queue_wait_seconds                     = 0.001,
-                          .engine_boundary_exposed_seconds        = 0.001,
-                          .session_call_exposed_seconds           = 0.002,
-                          .executor_poll_exposed_seconds          = 0.003,
-                          .engine_commit_output_exposed_seconds   = 0.004,
-                          .engine_maintenance_exposed_seconds     = 0.005,
-                          .scheduler_yield_exposed_seconds        = 0.3,
-                          .decode_host_exposed_seconds            = 0.01,
-                          .decode_scheduler_yield_exposed_seconds = 0.2,
-                          .prefill_units                          = 4,
-                          .decode_rounds                          = 2,
-                          .control_units                          = 1,
+        .queue_wait_seconds                     = 0.001,
+        .engine_boundary_exposed_seconds        = 0.001,
+        .session_call_exposed_seconds           = 0.002,
+        .executor_poll_exposed_seconds          = 0.003,
+        .engine_commit_output_exposed_seconds   = 0.004,
+        .engine_maintenance_exposed_seconds     = 0.005,
+        .scheduler_yield_exposed_seconds        = 0.3,
+        .decode_host_exposed_seconds            = 0.01,
+        .decode_scheduler_yield_exposed_seconds = 0.2,
+        .prefill_units                          = 4,
+        .decode_rounds                          = 2,
+        .control_units                          = 1,
     };
     outcome.stats.speculative.backend               = ninfer::SpeculativeBackend::Mtp;
     outcome.stats.speculative.draft_window          = 3;
@@ -475,13 +505,13 @@ int main() {
     outcome.stats.speculative.accepted_per_position = {290, 240, 190};
     outcome.stats.engine_request_id                 = 991;
     outcome.stats.scheduling                        = {
-                               .preemptions          = 3,
-                               .snapshot_restores    = 1,
-                               .replay_restores      = 2,
-                               .replayed_tokens      = 640,
-                               .paused_ns            = 123456789012345ULL,
-                               .device_to_host_bytes = 3145728,
-                               .host_to_device_bytes = 2097152,
+        .preemptions          = 3,
+        .snapshot_restores    = 1,
+        .replay_restores      = 2,
+        .replayed_tokens      = 640,
+        .paused_ns            = 123456789012345ULL,
+        .device_to_host_bytes = 3145728,
+        .host_to_device_bytes = 2097152,
     };
     outcome.stats.thinking = ninfer::ThinkingBudgetStats{.configured_budget     = 256,
                                                          .model_thinking_tokens = 256,
@@ -743,10 +773,10 @@ int main() {
 
     GenerationOutcome fallback_outcome = outcome;
     fallback_outcome.tool_call_parse   = {
-          .marker_seen               = true,
-          .structured_call_count     = 0,
-          .schema_mismatch_arguments = 0,
-          .fallback_reason           = ninfer::ToolCallParseFallbackReason::UndeclaredTool,
+        .marker_seen               = true,
+        .structured_call_count     = 0,
+        .schema_mismatch_arguments = 0,
+        .fallback_reason           = ninfer::ToolCallParseFallbackReason::UndeclaredTool,
     };
     const Json fallback_done =
         Json::parse(format_request_done_json("serve-test", 3003, context, fallback_outcome));
@@ -813,31 +843,31 @@ int main() {
     throughput.current.context_transfers.state[1].bytes   = 132;
     throughput.current.context_transfers.state[1].seconds = 0.25;
     throughput.current.state_objects                      = 3;
-    throughput.current.context_pools                      = {{.rank                = 0,
-                                                              .domain              = ninfer::ContextMemoryDomain::Host,
-                                                              .capacity_bytes      = 64ULL << 20,
-                                                              .live_bytes          = 12ULL << 20,
-                                                              .reserved_bytes      = 4ULL << 20,
-                                                              .peak_occupied_bytes = 20ULL << 20}};
-    throughput.current.last_selected_frontier_tokens      = 64;
-    throughput.current.pressure_spill_pages               = 4;
-    throughput.current.host_work                          = {
-                                 .engine_boundary_ns            = 1000000,
-                                 .session_call_ns               = 2000000,
-                                 .executor_poll_ns              = 3000000,
-                                 .engine_commit_output_ns       = 4000000,
-                                 .engine_maintenance_ns         = 5000000,
-                                 .scheduler_yield_ns            = 300000000,
-                                 .decode_host_ns                = 10000000,
-                                 .decode_scheduler_yield_ns     = 200000000,
-                                 .prefill_host_ns               = 3000000,
-                                 .prefill_scheduler_yield_ns    = 50000000,
-                                 .control_host_ns               = 2000000,
-                                 .control_scheduler_yield_ns    = 50000000,
-                                 .prefill_units                 = 4,
-                                 .control_units                 = 1,
-                                 .stats_publication_ns          = 250000,
-                                 .stats_publication_invocations = 5,
+    throughput.current.context_pools = {{.rank                = 0,
+                                         .domain              = ninfer::ContextMemoryDomain::Host,
+                                         .capacity_bytes      = 64ULL << 20,
+                                         .live_bytes          = 12ULL << 20,
+                                         .reserved_bytes      = 4ULL << 20,
+                                         .peak_occupied_bytes = 20ULL << 20}};
+    throughput.current.last_selected_frontier_tokens = 64;
+    throughput.current.pressure_spill_pages          = 4;
+    throughput.current.host_work                     = {
+        .engine_boundary_ns            = 1000000,
+        .session_call_ns               = 2000000,
+        .executor_poll_ns              = 3000000,
+        .engine_commit_output_ns       = 4000000,
+        .engine_maintenance_ns         = 5000000,
+        .scheduler_yield_ns            = 300000000,
+        .decode_host_ns                = 10000000,
+        .decode_scheduler_yield_ns     = 200000000,
+        .prefill_host_ns               = 3000000,
+        .prefill_scheduler_yield_ns    = 50000000,
+        .control_host_ns               = 2000000,
+        .control_scheduler_yield_ns    = 50000000,
+        .prefill_units                 = 4,
+        .control_units                 = 1,
+        .stats_publication_ns          = 250000,
+        .stats_publication_invocations = 5,
     };
     const std::string pretty_throughput = render_throughput(throughput).message;
     failures +=

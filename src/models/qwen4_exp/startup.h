@@ -43,6 +43,14 @@ public:
         return definition_;
     }
 
+    // Residual intervention is a Qwen3.5-family feature; the constructor rejects a profile.
+    [[nodiscard]] ResidualInterventionSummary residual_intervention() const { return {}; }
+
+    [[nodiscard]] TextGeometry geometry() const {
+        const auto& text = definition_->config().text;
+        return {text.hidden, static_cast<std::uint32_t>(text.layers.size())};
+    }
+
     std::shared_ptr<const execution::ModelProfile> profile;
 private:
     std::vector<WeightCandidate> placements_;

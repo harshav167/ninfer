@@ -10,6 +10,8 @@
 #include "runtime/engine/startup.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -211,12 +213,16 @@ public:
 
 private:
     void initialize_description() {
-        description.architecture    = startup.load.architecture;
-        description.model_name      = startup.load.model_name;
-        description.max_context     = options.max_context;
-        description.max_concurrency = options.max_concurrency;
-        description.prefill_chunk   = options.prefill_chunk;
-        description.kv_cache        = options.kv_cache;
+        description.architecture          = startup.load.architecture;
+        description.artifact_id           = startup.load.artifact_id;
+        description.hidden_size           = startup.load.hidden_size;
+        description.num_hidden_layers     = startup.load.num_hidden_layers;
+        description.residual_intervention = startup.load.residual_intervention;
+        description.model_name            = startup.load.model_name;
+        description.max_context           = options.max_context;
+        description.max_concurrency       = options.max_concurrency;
+        description.prefill_chunk         = options.prefill_chunk;
+        description.kv_cache              = options.kv_cache;
         std::visit(
             [&](const auto& instance) {
                 const auto usage = instance->session->physical_usage();
@@ -323,6 +329,59 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
         impl_->core);
     if (result.size() != expected) {
         throw std::logic_error("target Program returned an invalid causal score count");
+    }
+    return result;
+}
+
+ResidualCapture Engine::capture_residuals(PreparedPrompt prompt,
+                                          std::span<const TokenId> forced_suffix,
+                                          std::span<const std::uint32_t> layers) {
+    nvtx::ScopedRange capture_range(nvtx::Name::Score, nvtx::Category::Scoring,
+                                    static_cast<std::uint64_t>(forced_suffix.size()));
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->options.purpose != EnginePurpose::CausalScoring) {
+        throw std::logic_error("capture_residuals requires a CausalScoring Engine");
+    }
+    if (!impl_->options.residual_profile_path.empty()) {
+        throw std::logic_error(
+            "capture_residuals observes the unmodified model and cannot run with a residual "
+            "profile");
+    }
+    if (prompt.impl_ == nullptr) { throw std::invalid_argument("PreparedPrompt is empty"); }
+    if (prompt.impl_->domain != impl_->frontend_domain) {
+        throw std::invalid_argument("PreparedPrompt belongs to a different Frontend");
+    }
+    if (prompt.impl_->summary.has_media) {
+        throw std::invalid_argument("capture_residuals accepts text-only prompts");
+    }
+    if (layers.empty() ||
+        std::adjacent_find(layers.begin(), layers.end(), std::greater_equal<>{}) != layers.end()) {
+        throw std::invalid_argument(
+            "capture_residuals layers must be non-empty and strictly ascending");
+    }
+    const std::size_t tokens =
+        std::size_t(prompt.impl_->summary.prompt_tokens) + forced_suffix.size();
+    if (tokens == 0 || tokens > impl_->options.max_context) {
+        throw std::invalid_argument("capture_residuals token count must be in [1,max_context]");
+    }
+    ResidualCapture result = std::visit(
+        [&](auto& core) -> ResidualCapture {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                throw std::logic_error("Engine core is unavailable");
+            } else if constexpr (CoreState::element_type::purpose == EnginePurpose::CausalScoring) {
+                return core->capture_residuals(
+                    prompt.impl_->take<typename CoreState::element_type::PreparedPrompt>(),
+                    forced_suffix, layers);
+            } else {
+                throw std::logic_error("Engine scoring core is unavailable");
+            }
+        },
+        impl_->core);
+    if (result.prompt_token_ids.size() != tokens || result.hidden_size == 0 ||
+        !std::equal(result.layers.begin(), result.layers.end(), layers.begin(), layers.end()) ||
+        result.values.size() != layers.size() * std::size_t(result.hidden_size)) {
+        throw std::logic_error("target Program returned an invalid residual capture");
     }
     return result;
 }

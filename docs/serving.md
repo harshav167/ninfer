@@ -56,6 +56,16 @@ and prefill remain outside speculative acceleration. A later request cannot enab
 omitted at startup. The artifact need only contain the Text backbone and the optional components
 selected for this process.
 
+`--residual-profile FILE` (TOML `model.residual_profile`) optionally selects one startup-fixed
+residual-intervention profile for a Qwen3.5-family text model. It is off by default and cannot change
+while the process runs: every execution lane, cache and checkpoint shares the one profile, and
+switching profiles means restarting the server. The Engine validates the file before weights are read
+and requires it to name the exact loaded artifact id and model geometry; any mismatch is a startup
+error with no fallback. The startup log and the JSONL `server_start` record report the artifact id and
+whether the intervention is enabled, with its profile path and edited layers. See
+[startup configuration](startup-configuration.md) for the option contract and the [CLI guide](cli.md)
+for the profile format and its capture/fitting tools.
+
 ## Endpoints
 
 | Method and path | Behavior |
@@ -1014,7 +1024,7 @@ they do not infer request behavior from process-global counter deltas.
 | Event | Contents |
 |---|---|
 | `startup_config` | before model loading: active entry, configuration path, merged values, per-field default/file/argv sources, environment controls and redacted argv |
-| `server_start` | artifact path, architecture, public name, actual formats and prefill signature; resolved Engine and context-cache capacities, thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, unified Host context capacity and occupancy, KV sizing ledger, measured CUDA Graph rebuilding estimate and signed calibration/preparation deltas, CUDA/GPU environment, and redacted argv |
+| `server_start` | artifact path, architecture, public name, artifact container id (`artifact.artifact_id`), actual formats and prefill signature; the startup-fixed residual intervention (`engine.residual_intervention`: `enabled`, `profile_path`, edited `layers`); resolved Engine and context-cache capacities, thinking/non-thinking sampler defaults plus process overrides, thinking-history and thinking-budget defaults, Device arenas, the optional non-additive Vision layout inside the unified workspace, unified Host context capacity and occupancy, KV sizing ledger, measured CUDA Graph rebuilding estimate and signed calibration/preparation deltas, CUDA/GPU environment, and redacted argv |
 | `request_start` | protocol, resolved sampler and seed, requested reasoning effort, actual initial thinking mode and optional budget, Responses semantic-change flag, output budget, stream/message/tool shape |
 | `request_rejected` | parsed request shape, requested reasoning effort, media-item count, `phase: "prepare"`, and the exact HTTP status/type/code/parameter/message for a synchronous preparation rejection |
 | `request_done` | finish reason, prompt/completion/cache/computed-prefill tokens, prefix reuse path, tool-call parse diagnostics, preemption/recovery counters, thinking-budget application counters, unrounded request-stage seconds, per-request Engine Host exposure, and complete speculative-decoding counters |

@@ -7,7 +7,10 @@ namespace ninfer::models::qwen4_exp {
 
 ParallelStartup::ParallelStartup(const artifact::Reader& reader, const EngineOptions& options)
     : definition_(read_definition(reader, load_options(options))),
-      parallel_(plan_parallel(*definition_, *options.deployment)) {}
+      parallel_(plan_parallel(*definition_, *options.deployment)) {
+    if (!options.residual_profile_path.empty())
+        throw std::invalid_argument("Qwen4Exp does not support residual intervention profiles");
+}
 
 qwen::Frontend ParallelStartup::frontend(const EngineOptions& options) const {
     return create_frontend(*definition_, options);

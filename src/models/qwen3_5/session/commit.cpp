@@ -152,11 +152,18 @@ void SessionImpl::receive_result(runtime::ResultReady<ExecutionTypes>&& event) {
             current.bases[0].metadata, score->processed_tokens, SpeculativeBackend::None, false));
         if (score->logprobs.size() > scoring->logprobs.capacity() - scoring->logprobs.size())
             throw std::logic_error("score result exceeds its prepared target capacity");
+        // Only the window that ends a capture carries its observation.
+        const bool observed =
+            scoring->capture_layers && scoring->cursor + score->processed_tokens == scoring->limit;
+        const std::size_t observed_values =
+            observed ? scoring->capture_layers->size() * plan.profile->config.text.hidden_size : 0;
+        if (score->residuals.size() != observed_values)
+            throw std::logic_error("score result has the wrong residual capture extent");
         commit_completed_unit();
         scoring->cursor += score->processed_tokens;
         scoring->logprobs.insert(scoring->logprobs.end(), score->logprobs.begin(),
                                  score->logprobs.end());
-
+        if (observed) scoring->residuals = std::move(score->residuals);
         return;
     }
     throw std::logic_error("unknown native result");

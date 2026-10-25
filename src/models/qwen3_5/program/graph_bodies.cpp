@@ -43,9 +43,10 @@ void RankProgramImpl::initialize_graphs() {
             feature->layers          = parameters.profile->config.draft->target_layer_ids;
         }
         return std::make_unique<execution::TextRun>(
-            execution::TextExecutionView{parameters, resources.work, device.execution_view(),
-                                         resources.decoder.text_kv, resources.state_images.linear(),
-                                         resources.moe.get()},
+            execution::TextExecutionView{
+                parameters, resources.work, device.execution_view(), resources.decoder.text_kv,
+                resources.state_images.linear(), resources.moe.get(),
+                resources.intervention ? &*resources.intervention : nullptr},
             std::move(inputs), update, call.envelope, input.hidden, feature ? &*feature : nullptr);
     };
     bodies.project = [this](const GraphInvocation& call) {

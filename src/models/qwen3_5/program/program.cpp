@@ -3,6 +3,7 @@
 #include "core/startup.h"
 
 #include <algorithm>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <type_traits>
@@ -221,6 +222,17 @@ void RankProgramImpl::validate_work(const Work& work, runtime::FrameKind kind) c
                     op.first_column > op.input.tokens.size() ||
                     op.targets.size() > op.input.tokens.size() - op.first_column)
                     throw std::invalid_argument("Qwen3.5 scoring span is invalid");
+                if (op.capture) {
+                    const auto& layers = op.capture->layers;
+                    if (!op.targets.empty() || layers.empty() ||
+                        layers.size() > resources.frame.spec.residual_layers ||
+                        std::adjacent_find(layers.begin(), layers.end(), std::greater_equal<>{}) !=
+                            layers.end() ||
+                        layers.back() >= parameters.text.layers.size() ||
+                        op.capture->column >= op.input.tokens.size())
+                        throw std::invalid_argument(
+                            "Qwen3.5 residual capture selection is invalid");
+                }
             }
         },
         work.operation);

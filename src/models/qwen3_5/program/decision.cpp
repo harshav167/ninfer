@@ -246,7 +246,8 @@ void RankProgramImpl::publish_result(ComputeOperation& operation) {
         } else
             result.output = std::move(value);
     } else if (std::holds_alternative<ScoreWork>(operation.request.work.operation)) {
-        result.output = ScoreResult{operation.width, std::move(operation.scores)};
+        result.output = ScoreResult{operation.width, std::move(operation.scores),
+                                    std::move(operation.residuals)};
     } else if (std::holds_alternative<NormalizeWork>(operation.request.work.operation)) {
         result.output = NormalizeResult{};
     } else

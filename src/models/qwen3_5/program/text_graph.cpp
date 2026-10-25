@@ -167,7 +167,7 @@ void TextGraph::prepare(TextRun& run, const Parameters& parameters, moe::Schedul
                     run.mixer(layer);
                 }
                 run.post_mixer(layer);
-                run.capture_features(layer);
+                run.finish_layer(layer);
             }
             run.finish();
             epilogue();
@@ -211,12 +211,12 @@ void TextGraph::prepare(TextRun& run, const Parameters& parameters, moe::Schedul
                     definition.offloaded = schedule->capture_layer(
                         routed->bank, cuda, run.residual().ne[1], [&] { run.mixer(layer); },
                         [&](const moe::GpuCall& call) { run.post_mixer(layer, &call); },
-                        [&] { run.capture_features(layer); }, prior);
+                        [&] { run.finish_layer(layer); }, prior);
                 } else {
                     definition.resident.capture(cuda.stream(), [&] {
                         run.mixer(layer);
                         run.post_mixer(layer);
-                        run.capture_features(layer);
+                        run.finish_layer(layer);
                     });
                 }
             }

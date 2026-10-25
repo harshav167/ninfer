@@ -113,11 +113,14 @@ private:
     const ModelDefinition& plan_;
 };
 
-std::shared_ptr<const ModelProfile> describe_model_impl(const ModelDefinition& plan) {
+std::shared_ptr<const ModelProfile>
+describe_model_impl(const ModelDefinition& plan,
+                    std::shared_ptr<const residual::Profile> intervention) {
     auto out           = std::make_shared<ModelProfile>();
     out->config        = plan.config();
     out->options       = plan.options();
     out->public_tokens = plan.resources().text.public_token_count;
+    out->intervention  = std::move(intervention);
     const Describe describe(plan);
     const auto& w         = plan.weights();
     out->text.output_head = describe.linear(w.text.output_head_use);
@@ -132,8 +135,10 @@ std::shared_ptr<const ModelProfile> describe_model_impl(const ModelDefinition& p
 
 } // namespace
 
-std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition& source) {
-    return describe_model_impl(source);
+std::shared_ptr<const ModelProfile>
+describe_model(const ModelDefinition& source,
+               std::shared_ptr<const residual::Profile> intervention) {
+    return describe_model_impl(source, std::move(intervention));
 }
 
 

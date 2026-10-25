@@ -7,6 +7,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -245,6 +246,129 @@ void test_file_errors_and_example(const Files& files) {
         cli.launch.generation.max_tokens == 128 && server.launch.generation.max_tokens == 8192 &&
             !cli.launch.engine.context_cache.enabled && server.launch.engine.context_cache.enabled,
         "shared example did not select entry-specific defaults");
+    require(cli.launch.engine.residual_profile_path.empty() &&
+                server.launch.engine.residual_profile_path.empty(),
+            "the example selects a residual profile");
+}
+
+std::string line_with(const std::string& text, std::string_view needle) {
+    const auto at = text.find(needle);
+    if (at == text.npos) return {};
+    const auto begin = text.rfind('\n', at);
+    const auto first = begin == text.npos ? 0 : begin + 1;
+    return text.substr(first, text.find('\n', at) - first);
+}
+
+void test_residual_profile(const Files& files) {
+    const auto render = [](const auto& options) {
+        return ninfer::product::format_configuration(ninfer::product::configuration_view(options));
+    };
+    const auto selected = [&](std::string_view value) {
+        return files
+            .write("model.path = 'model.ninfer'\ncli.prompt = 'x'\nmodel.residual_profile = " +
+                   std::string(value) + "\n")
+            .string();
+    };
+
+    const auto absent = parse({"ninfer", "model.ninfer", "--prompt", "x"});
+    require(absent.launch.engine.residual_profile_path.empty() &&
+                serve({"ninfer-serve", "model.ninfer"}).launch.engine.residual_profile_path.empty(),
+            "an entry selected a residual profile without being asked");
+    const auto absent_row = line_with(render(absent), "residual_profile");
+    require(absent_row.find("\"\"") != std::string::npos &&
+                absent_row.find("[default]") != std::string::npos,
+            "absent residual profile is not displayed as an empty default");
+
+    const fs::path expected = files.root / "arm/a.json";
+    auto config             = selected("'profiles/../arm/a.json'");
+    const auto from_file    = parse({"ninfer", "--config", config});
+    require(from_file.launch.engine.residual_profile_path == expected &&
+                serve({"ninfer-serve", "--config", config}).launch.engine.residual_profile_path ==
+                    expected,
+            "file residual profile was not resolved against the configuration directory");
+    const auto file_row = line_with(render(from_file), "residual_profile");
+    require(file_row.find(expected.string()) != std::string::npos &&
+                file_row.find("[file:3]") != std::string::npos,
+            "file residual profile lost its value or source in the configuration display");
+
+    const auto overridden =
+        parse({"ninfer", "--config", config, "--residual-profile", "override.json"});
+    require(overridden.launch.engine.residual_profile_path == fs::absolute("override.json") &&
+                overridden.launch.engine.residual_profile_path.parent_path() != files.root,
+            "command-line residual profile did not resolve from the working directory");
+    require(line_with(render(overridden), "residual_profile").find("[argv:3]") != std::string::npos,
+            "command-line residual profile lost its source");
+    require(serve({"ninfer-serve", "--residual-profile=/profiles/serve.json", "--config", config})
+                    .launch.engine.residual_profile_path == fs::path("/profiles/serve.json"),
+            "serve did not accept the residual profile option");
+
+    for (const auto& clear : std::vector<std::vector<std::string>>{{"--residual-profile", ""},
+                                                                   {"--residual-profile="}}) {
+        for (const auto* program : {"ninfer", "ninfer-serve"}) {
+            std::vector<std::string> arguments{program, "--config", config};
+            arguments.insert(arguments.end(), clear.begin(), clear.end());
+            const bool is_cli = std::string_view(program) == "ninfer";
+            const auto path   = is_cli ? parse(arguments).launch.engine.residual_profile_path
+                                       : serve(arguments).launch.engine.residual_profile_path;
+            require(path.empty(),
+                    "empty command-line value did not clear the file residual profile");
+        }
+        std::vector<std::string> arguments{"ninfer", "--config", config};
+        arguments.insert(arguments.end(), clear.begin(), clear.end());
+        require(line_with(render(parse(arguments)), "residual_profile").find("[argv:") !=
+                    std::string::npos,
+                "cleared residual profile lost its command-line source");
+    }
+
+    config              = selected("''");
+    const auto restored = parse({"ninfer", "--config", config});
+    require(restored.launch.engine.residual_profile_path.empty() &&
+                serve({"ninfer-serve", "--config", config})
+                    .launch.engine.residual_profile_path.empty() &&
+                line_with(render(restored), "residual_profile").find("[file:3]") !=
+                    std::string::npos,
+            "empty file value did not restore the no-profile default");
+
+    config = selected("'/profiles/abs.json'");
+    require(parse({"ninfer", "--config", config}).launch.engine.residual_profile_path ==
+                fs::path("/profiles/abs.json"),
+            "absolute file residual profile changed");
+
+    for (const auto* value : {"1", "true", "1.5", "['a.json']"}) {
+        config             = selected(value);
+        const auto message = rejection([&] { parse({"ninfer", "--config", config}); });
+        require(message.find(config + ":3:") != std::string::npos &&
+                    message.find("model.residual_profile") != std::string::npos,
+                "residual profile type diagnostic lost its field or source location");
+        rejection([&] { serve({"ninfer-serve", "--config", config}); });
+    }
+    for (const auto* key : {"model.residual-profile", "model.residual_profil",
+                            "engine.residual_profile", "residual_profile"}) {
+        config = files
+                     .write(std::string("model.path = 'model.ninfer'\ncli.prompt = 'x'\n") + key +
+                            " = 'p.json'\n")
+                     .string();
+        const auto message = rejection([&] { parse({"ninfer", "--config", config}); });
+        require(message.find(config + ":3:") != std::string::npos &&
+                    message.find(key) != std::string::npos,
+                "unknown residual profile spelling was accepted or lost its location");
+    }
+    require(rejection([&] {
+                parse({"ninfer", "model.ninfer", "--prompt", "x", "--residual-profile"});
+            }).find("--residual-profile needs a value") != std::string::npos &&
+                rejection([&] {
+                    serve({"ninfer-serve", "model.ninfer", "--residual-profile"});
+                }).find("--residual-profile needs a value") != std::string::npos,
+            "residual profile option accepted a missing value");
+
+    for (const auto entry :
+         {ninfer::product::EntryPoint::Cli, ninfer::product::EntryPoint::Serve}) {
+        const auto help = ninfer::product::startup_usage_text("ninfer", entry);
+        const auto flag = help.find("--residual-profile FILE");
+        require(flag != std::string::npos && flag > help.find("model:\n") &&
+                    flag < help.find("\nengine:\n"),
+                "help does not list the residual profile option in the model group");
+    }
 }
 
 void test_deployment(const Files& files) {
@@ -335,6 +459,7 @@ int main() {
         test_arguments();
         test_file_merge(files);
         test_file_errors_and_example(files);
+        test_residual_profile(files);
         test_deployment(files);
         std::cout << "ok\n";
         return 0;

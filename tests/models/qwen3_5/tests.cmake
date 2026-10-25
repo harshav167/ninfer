@@ -46,6 +46,14 @@ ninfer_add_test(ninfer_qwen3_5_score_real_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_score_real.cpp"
   LIBRARIES ninfer_engine)
 
+ninfer_add_test(ninfer_qwen3_5_residual_profile_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_residual_profile_real.cpp"
+  LIBRARIES ninfer_engine ninfer::json)
+
+ninfer_add_test(ninfer_qwen3_5_residual_capture_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_engine_residual_capture_real.cpp"
+  LIBRARIES ninfer_engine)
+
 ninfer_add_test(ninfer_qwen3_5_vision_workspace_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_vision_workspace.cpp"
   LIBRARIES ninfer_model_execution ninfer_engine)
@@ -87,6 +95,8 @@ set(ninfer_qwen3_5_real_tests
   ninfer_qwen3_5_grammar_real_test
   ninfer_qwen3_5_tools_real_test
   ninfer_qwen3_5_score_real_test
+  ninfer_qwen3_5_residual_profile_real_test
+  ninfer_qwen3_5_residual_capture_real_test
   ninfer_qwen3_5_vision_workspace_test
   ninfer_qwen3_5_dflash2_real_test
   ninfer_qwen3_5_dflash_prefill_real_test

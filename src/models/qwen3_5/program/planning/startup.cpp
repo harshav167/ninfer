@@ -107,16 +107,23 @@ ResourceLayout persistent_layout(const SequencePlanImpl& plan) {
                                       static_cast<std::uint64_t>(draft.target_layer_ids.size())),
         };
     }
+    if (profile.intervention) {
+        spec.intervention = ResidualInterventionSpec{
+            .hidden = dimension(config.hidden_size),
+            .layers = dimension(profile.intervention->layers.size()),
+        };
+    }
     spec.frame = {
-        .hidden         = dimension(config.hidden_size),
-        .output_rows    = dimension(config.vocab_size),
-        .public_tokens  = dimension(profile.public_tokens),
-        .prefill_chunk  = std::min(plan.prefill_chunk, plan.capacity),
-        .batch_capacity = plan.max_concurrency,
-        .draft_window   = plan.draft_window,
-        .backend        = plan.speculative_backend,
-        .causal_scoring = plan.causal_scoring,
-        .vision         = plan.features.vision,
+        .hidden          = dimension(config.hidden_size),
+        .output_rows     = dimension(config.vocab_size),
+        .public_tokens   = dimension(profile.public_tokens),
+        .prefill_chunk   = std::min(plan.prefill_chunk, plan.capacity),
+        .batch_capacity  = plan.max_concurrency,
+        .draft_window    = plan.draft_window,
+        .backend         = plan.speculative_backend,
+        .causal_scoring  = plan.causal_scoring,
+        .residual_layers = plan.causal_scoring ? config.num_hidden_layers : 0U,
+        .vision          = plan.features.vision,
     };
     spec.context_bytes      = plan.context_bytes;
     spec.host_context_bytes = plan.context_cache.host_capacity_bytes.value_or(0);
@@ -139,7 +146,7 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
     const ops::CausalAttentionExecutionEnvelope text_envelope{1, plan.capacity};
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
-                           std::int32_t tokens) { (void)layout.alloc(dtype, {rows, tokens}); };
+                            std::int32_t tokens) { (void)layout.alloc(dtype, {rows, tokens}); };
     const auto scratch = [](WorkspaceLayoutBuilder& layout, std::size_t bytes) {
         if (bytes == 0) { return; }
         auto scope = layout.scope();
@@ -704,9 +711,9 @@ finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl
         throw std::invalid_argument("Qwen3.5 sequence planner is empty");
     }
     (void)planner->capacity_plan.reservation_bytes(capacity);
-    auto plan                    = capacity.device_bytes == planner->minimum->context_bytes
-                                       ? std::move(planner->minimum)
-                                       : build_sequence_candidate(planner->inputs, capacity.device_bytes);
+    auto plan = capacity.device_bytes == planner->minimum->context_bytes
+                    ? std::move(planner->minimum)
+                    : build_sequence_candidate(planner->inputs, capacity.device_bytes);
     plan->context_metadata_bytes = planner->capacity_plan.control_bytes(capacity);
     return plan;
 }

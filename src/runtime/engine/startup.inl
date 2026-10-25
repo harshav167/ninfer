@@ -300,6 +300,10 @@ BuiltModel<typename Setup::Types> build_local_model(const artifact::Reader& read
     const auto& stats         = instance->model->storage_stats();
     summary.architecture      = models::architecture_name(setup.architecture());
     summary.model_name        = setup.definition()->info().name;
+    summary.artifact_id       = artifact::artifact_id_string(setup.definition()->artifact_id());
+    summary.residual_intervention = setup.residual_intervention();
+    summary.hidden_size           = setup.geometry().hidden_size;
+    summary.num_hidden_layers     = setup.geometry().num_hidden_layers;
     summary.prefill_signature = signature;
     std::set<std::string> formats;
     for (const auto& weight : setup.definition()->weight_data()) {

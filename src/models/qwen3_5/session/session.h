@@ -296,8 +296,18 @@ using PhysicalUsageSnapshot = context::ContextUsage;
 
 struct ControlComplete {};
 
+// Exact observation of the last token of a residual capture: layer-major [layers][hidden] FP32
+// widening of the BF16 Main residual, plus the complete observed token sequence.
+struct ResidualObservation {
+    std::vector<TokenId> token_ids;
+    std::uint32_t hidden_size = 0;
+    std::vector<float> values;
+};
+
 struct ScoreComplete {
     std::vector<float> logprobs;
+    // Present exactly when the job was a residual capture.
+    std::optional<ResidualObservation> residuals;
 };
 
 struct SessionEvent {
@@ -424,6 +434,11 @@ public:
                   std::span<const std::optional<std::uint32_t>> splits);
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_score(qwen::PreparedPrompt&&,
                                                                       std::uint32_t first_target);
+    // Prefills prompt + forced_suffix through the scoring path and observes the Main residual of
+    // the last token at each listed layer (strictly ascending, below the model layer count).
+    [[nodiscard]] std::optional<runtime::ExecutionTicket>
+    start_residual_capture(qwen::PreparedPrompt&&, std::span<const TokenId> forced_suffix,
+                           std::span<const std::uint32_t> layers);
     [[nodiscard]] std::optional<SessionEvent> poll();
     void supply(runtime::ExecutionTicket, runtime::DecisionInput&&);
     [[nodiscard]] CommitResult commit(PendingBatch&& pending,

@@ -386,6 +386,9 @@ public:
                   std::span<const std::optional<std::uint32_t>> splits);
     [[nodiscard]] std::optional<runtime::ExecutionTicket> start_score(qwen::PreparedPromptData&&,
                                                                       std::uint32_t first_target);
+    [[nodiscard]] std::optional<runtime::ExecutionTicket>
+    start_residual_capture(qwen::PreparedPromptData&&, std::span<const TokenId> forced_suffix,
+                           std::span<const std::uint32_t> layers);
     [[nodiscard]] std::optional<SessionEvent> poll();
     void supply(runtime::ExecutionTicket, runtime::DecisionInput&&);
     [[nodiscard]] CommitResult commit(PendingBatch&& pending,
@@ -475,16 +478,27 @@ public:
 
     std::optional<Execution> execution;
 
+    // One synchronous job that drives its prompt through scoring windows: either causal scoring
+    // (inputs [0, N-1), targets from first_target) or residual capture (inputs [0, N), no
+    // targets, the last input column observed at capture_layers).
     struct Scoring {
         runtime::ExecutionTicket public_ticket;
         RequestBasePlan base;
         SequenceHandle sequence;
         std::uint32_t first_target = 0;
-        std::uint32_t cursor       = 0;
+        // Number of prompt tokens fed through the model.
+        std::uint32_t limit  = 0;
+        std::uint32_t cursor = 0;
         std::vector<float> logprobs;
+        std::optional<std::vector<std::uint32_t>> capture_layers;
+        std::vector<float> residuals;
     };
 
     std::optional<Scoring> scoring;
+
+    [[nodiscard]] std::optional<runtime::ExecutionTicket>
+    begin_scoring(qwen::PreparedPromptData&&, std::uint32_t first_target,
+                  std::optional<std::vector<std::uint32_t>> capture_layers);
 
     [[nodiscard]] std::uint32_t lane(SequenceHandle) const;
     [[nodiscard]] bool valid_sequence(SequenceHandle) const noexcept;

@@ -332,6 +332,65 @@ generated token IDs in diagnostics.
 
 Run `./build/rtx5090-release/apps/ninfer --help` for the exact option contract.
 
+## Residual intervention and calibration
+
+`--residual-profile PATH` (TOML `model.residual_profile`, accepted by `ninfer` and `ninfer-serve`)
+starts the Engine with one immutable residual-intervention profile for a Qwen3.5-family text model.
+The profile must name the exact loaded artifact (its 32-hex container id) and the model's hidden
+width and layer count; any mismatch, malformed value or unsupported architecture fails startup.
+Without the option the model runs unchanged. The profile cannot change while the Engine runs, so all
+lanes and caches share it; benchmark an off/on pair by restarting with and without the option. The
+mathematics, JSON v1 schema and ownership are in the
+[Qwen3.5 reference](maintainer/qwen3_5-model.md#optional-residual-intervention).
+
+`build/rtx5090-release/apps/ninfer-residual-capture` is the native calibration observer. It loads
+one artifact, renders each dataset prompt with the Engine's own chat template (thinking enabled), appends the
+optional forced assistant opening as tokens after the generation prefix, prefills once per sample and
+writes the raw post-FFN residual of the last token at the requested layers. It performs no
+generation and no Python model inference. Stop a resident server before capture when both
+model instances would exceed the GPU's memory budget.
+
+```bash
+./build/rtx5090-release/apps/ninfer-residual-capture models/qwen3_8_27b_nvfp4.ninfer \
+  --dataset calibration.jsonl --output out-capture/ --layers all \
+  --chat-template tools/chat_templates/qwen3_8.jinja
+```
+
+Each dataset line is `{"id": "...", "label": "...", "messages": [{"role": "user", "content": "..."}],
+"assistant_opening": "optional"}`; `id` is unique, `label` is opaque and echoed. Use the same
+`--chat-template` as the serving launcher so calibration sees the production prompt. `--layers` takes
+`all` or ascending indices and inclusive ranges such as `21-42,50`; `--device`, `--max-context`
+(default 8192), `--prefill-chunk` (default 1024) and `--kv-dtype bf16|fp8` (default `fp8`, the
+production launcher's value) select the Engine. The output directory must be
+empty or absent. `residuals.f32` is little-endian FP32 `[sample][layer][hidden]` in input order, written
+first; `manifest.json` is written last and carries `artifact_id`, `hidden_size`, `num_hidden_layers`,
+`layers`, the dataset SHA-256 and per-sample token counts and token-id SHA-256. An offline fitter
+(`tools/fit_residual_profile.py`) turns the manifest and activations into the profile.
+
+The fitter uses balanced forced-opening groups labeled `comply:N`, `refuse:N`, `clean:N`,
+and `disclaimer:N`, where `N` identifies an opening. Each group must have the same number of
+calibration samples; use the same topic corpus for every opening. It averages each opening
+across that corpus, removes compliance-opening spread from the refusal mean difference, and
+fits two sequential clipped directions. It selects layers `floor(3L/7)` through `floor(2L/3)`
+inclusive (27–42 for a 64-layer model). Capture at least that range.
+
+```bash
+python -m tools.fit_residual_profile out-capture/ --output residual-profile.json
+./start.sh --residual-profile residual-profile.json
+```
+
+The fitter requires NumPy, does not load model weights, and refuses to overwrite an existing
+profile. Defaults are `--edit-strength 2.0` and `--disclaimer-strength 0.4`; a negative
+disclaimer strength emits a zero second direction. Keep template, KV precision and prefill
+chunk fixed between calibration and comparison. The profile records capture/dataset hashes
+and fitting settings as provenance.
+
+This is a fixed-corpus adaptation of AbliteratedOutTheBox's calibration recipe, **not** its
+per-request calibration and gate. Every prompt is affected, including reasoning, tools and
+vision. Forced-opening calibration alone proves neither general refusal removal nor preserved
+quality; evaluate separate held-out behavior and matched off/on capability tests before use.
+It does not establish equivalence to a natively abliterated model.
+
 ## CUDA synchronization
 
 `NINFER_CUDA_SYNC` selects the CUDA device synchronization schedule at startup for both the CLI

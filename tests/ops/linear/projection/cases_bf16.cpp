@@ -178,6 +178,10 @@ const std::array kNewGeometries{
              4608,
              {1, 2, 8, 24, 64, 96, 128, 192, 256, 384, 512, 1984, 2048, 2111, 2112, 4096},
              ColumnDomain::Merger},
+    Geometry{5120,
+             4608,
+             {1, 2, 3, 4, 8, 16, 24, 32, 48, 64, 80, 96, 128, 192, 256, 384, 512, 2112, 4096},
+             ColumnDomain::Merger},
 };
 
 ninfer::test::quantized_weight::PackedWeight cancellation_weight(int n, int k, std::uint32_t seed) {
@@ -203,7 +207,7 @@ void run_new_bf16_geometry(Suite& suite, const Geometry& shape) {
     const int step         = raw ? 4 : 1;
     const int maximum      = raw ? 131072 : text ? std::numeric_limits<int>::max() : 32768;
     const bool wide        = (shape.n == 2560 && (shape.k == 2560 || shape.k == 3072)) ||
-                      shape.n == 124160 || shape.n == 77440 || shape.n == 48;
+                             shape.n == 124160 || shape.n == 77440 || shape.n == 48;
     auto test     = linear_suite::make_case("bf16", shape.n, shape.k, 0, ops::LinearPolicy::A16Only,
                                             linear_suite::Execution::Eager, "column-domain");
     test.policies = 7;
@@ -404,6 +408,30 @@ void run_bf16_extensions(Suite& suite) {
 }
 #endif
 
+// The 5120-row merger projection predicates the last tile of its 96-row schedules. The shared
+// geometry case samples 32 evenly spaced rows, so check the complete final tile separately.
+std::vector<std::int32_t> final_row_tile(std::int32_t rows) {
+    auto result = linear_common::evenly_spaced_indices(rows);
+    for (std::int32_t row = rows - 40; row < rows; ++row) result.push_back(row);
+    std::sort(result.begin(), result.end());
+    result.erase(std::unique(result.begin(), result.end()), result.end());
+    return result;
+}
+
+void run_bf16_merger_fc2_row_tail(Suite& suite) {
+    using namespace ninfer::test::linear;
+    constexpr std::int32_t n = 5120, k = 4608;
+    constexpr std::uint32_t seed = n + k + 431 + 4;
+    // Both the 65..96 and >512 token routes use 96-row tiles; 5120 = 53 * 96 + 32.
+    const std::array complete{Invocation{65}, Invocation{96}};
+    add_shape(suite, ninfer::QType::BF16, ActivationRecipe::TokenBlocks, make_bf16_weight,
+              {n, k, seed, Comparison::Full, true, complete});
+    const std::array bulk{Invocation{513}, Invocation{1024}, Invocation{2112}, Invocation{4096}};
+    ShapeCase tail{n, k, seed + 1, Comparison::Sampled, true, bulk};
+    tail.row_sampler = final_row_tile;
+    add_shape(suite, ninfer::QType::BF16, ActivationRecipe::TokenBlocks, make_bf16_weight, tail);
+}
+
 void run_bf16(Suite& suite) {
 
     struct ProjectionFixture {
@@ -417,6 +445,7 @@ void run_bf16(Suite& suite) {
     }
     { run_selector_linear(suite); }
     for (const auto& shape : kNewGeometries) { run_new_bf16_geometry(suite, shape); }
+    run_bf16_merger_fc2_row_tail(suite);
 #if NINFER_TARGET_SPARK
     run_bf16_extensions(suite);
 #endif

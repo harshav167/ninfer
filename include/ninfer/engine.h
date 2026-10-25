@@ -4,6 +4,7 @@
 
 #include <chrono>
 #include <memory>
+#include <span>
 #include <string_view>
 #include <vector>
 
@@ -80,6 +81,16 @@ public:
     // Returns log p(tokens[i] | tokens[0..i)) for i in [first_target,tokens.size()).
     [[nodiscard]] std::vector<float> score_tokens(std::vector<TokenId> tokens,
                                                   std::uint32_t first_target);
+
+    // Residual observation for offline calibration. Requires a CausalScoring Engine without a
+    // residual profile. The prepared prompt must be text-only; forced_suffix tokens (possibly
+    // empty) are appended to its tokens, and the observed position is the last token of the
+    // combined sequence. layers are non-empty, strictly ascending Main layer indices. Each call
+    // runs one complete prefill through the native Session. The result's prompt_token_ids are the
+    // complete combined sequence.
+    [[nodiscard]] ResidualCapture capture_residuals(PreparedPrompt prompt,
+                                                    std::span<const TokenId> forced_suffix,
+                                                    std::span<const std::uint32_t> layers);
 
     [[nodiscard]] std::uint32_t count_tokens(PromptInput input,
                                              const PreparationControl& control = {}) const;

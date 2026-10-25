@@ -88,11 +88,21 @@ struct ContextWork {
     std::vector<runtime::ResidencyId> releases;
 };
 
+// Offline observation of one input column of a score window. Only the last window of a
+// residual capture carries one.
+struct ResidualCaptureWork {
+    // Strictly ascending Main layers; the result carries one hidden-width row per layer.
+    std::vector<std::uint32_t> layers;
+    // Column inside ScoreWork::input.
+    std::uint32_t column = 0;
+};
+
 struct ScoreWork {
     ExecutionRow row;
     InputWindow input;
     std::vector<TokenId> targets;
     std::uint32_t first_column = 0;
+    std::optional<ResidualCaptureWork> capture;
 };
 
 struct Work {
@@ -123,6 +133,9 @@ struct NormalizeResult {};
 struct ScoreResult {
     std::uint32_t processed_tokens = 0;
     std::vector<float> logprobs;
+    // Layer-major exact FP32 widening of the observed BF16 residual; empty unless the work
+    // carried a capture.
+    std::vector<float> residuals;
 };
 
 struct Result {

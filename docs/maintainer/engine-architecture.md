@@ -178,6 +178,16 @@ Spark 不建立 Host State/KV cache，PLE 准备缓冲独立计费。
 共享权重不在执行时重新 packing。激活许可为 `A16Only={A16}`、`AllowA8={A16,A8}`、
 `AllowA4={A16,A8,A4}`，融合调用取交集。数学与精度验证遵循[Op 合同](op-development.md)。
 
+残差干预 profile 是启动期固定的可选输入（`EngineOptions::residual_profile_path`），不改变权重，
+也不是可变全局状态或请求级开关。模型 Startup 在读取权重前解析并验证它：schema、有限且归一化的
+方向、层索引，以及 artifact 容器 id、hidden 宽度和层数必须与已加载 Definition 完全一致，不匹配即启动失败。
+验证后的主机值保存在不可变 ModelProfile 中；rank 的 Resources 在持久区规划并一次性上传 FP32 方向/
+参考表，其字节计入规划容量。TextRun 在每个所选 Main 层的 FFN 残差加之后、DFlash 特征捕获之前调用
+`clipped_direction_removal`；prefill、decode、verify、Replay 以及 eager/Graph 共用这一处，
+因此同一实例的所有 lane、缓存和 checkpoint 共享同一个干预身份。更换 profile 必须创建新的 Engine。
+未选择 profile 时没有额外 launch 或设备内存。校准观测走 CausalScoring Engine：Session 把末尾 token 所在窗口
+交给 RankProgram，TextRun 的 `ResidualProbe` 在干预之前复制各层原始输出，Python 只后处理观测结果，不执行模型推理。
+
 ### 2.6 内存位置与执行环境
 
 Device 描述 CPU 或具体 CUDA ordinal；None 用于未绑定描述和容量规划。

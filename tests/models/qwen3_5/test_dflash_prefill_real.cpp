@@ -127,7 +127,7 @@ void run(const char* artifact, SpeculativeBackend backend) {
     auto planner = qwen::detail::make_sequence_planner_impl(parameters.profile, device, options);
     const auto minimum = planner->capacity_plan.minimum_capacity();
     auto plan          = qwen::detail::finalize_sequence_plan_impl(std::move(planner), minimum);
-    qwen::Resources resources(device, plan->persistent, plan->workspace);
+    qwen::Resources resources(device, plan->persistent, plan->workspace, nullptr);
 
     ContextPool pool(0, resources.context.size(), resources.context_records);
     const auto state_class = pool.record_class(0);

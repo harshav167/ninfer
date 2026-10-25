@@ -268,6 +268,56 @@ An optional proposal head supplies an indexed vocabulary subset for draft predic
 converts proposal rows to actual token IDs. Full target verification continues to use the full
 output head. Backend selection, draft width and proposal-head choice are fixed at startup.
 
+## Optional residual intervention
+
+An Engine may be started with one immutable residual-intervention profile (JSON v1, selected by
+`EngineOptions::residual_profile_path`). The profile names the exact artifact container id, the
+hidden width and layer count, and for each edited Text layer `l` two directions and references:
+a unit refusal direction `r` with `c_r`, and a unit-or-zero disclaimer direction `d` with `c_d`.
+After the layer's FFN residual add, and before DFlash feature capture, every token column `h` of the
+BF16 residual is replaced by
+
+```text
+h1 = h  - max(dot(h,  r) - c_r, 0) * r
+h2 = h1 - max(dot(h1, d) - c_d, 0) * d
+```
+
+Dot products and updates are FP32 with no intermediate BF16 rounding; one round-to-nearest-even
+produces the stored residual. A zero `d` leaves `h1` unchanged. The step is the
+[`clipped_direction_removal`](../../include/ninfer/ops/clipped_direction_removal.h) Op. It applies to
+every Main traversal of the Engine (prefill, decode, speculative verify, Replay, eager and Graph) and
+to nothing else: MTP and DFlash draft layers are unchanged, the DFlash target features and the
+following layers observe the edited residual, and Vision tokens are ordinary columns. Weights are
+never modified. Without a profile the Op is not launched and no table is allocated.
+
+Startup parses and validates the profile before weights are read: schema, finite FP32 values,
+unit directions, ascending layer indices, and equality of artifact id, hidden width and layer count
+with the loaded definition. Any mismatch fails the Engine. The validated host profile lives in
+`ModelProfile`; the rank's `Resources` plan two FP32 tables (`[H,2,K]` directions, `[2,K]`
+references) in the persistent arena, so their bytes are part of the planned capacity, and upload
+them once. `TextRun::finish_layer` applies the edit; all lanes, caches and checkpoints of the
+Engine therefore share one intervention identity, and a different profile requires a new Engine.
+
+JSON v1 has these exact fields; unknown keys are rejected except inside `provenance`:
+
+| Field | Contract |
+|---|---|
+| `schema_version` | Integer `1`. |
+| `artifact_id` | Exact 32-character lowercase hexadecimal artifact container id. |
+| `hidden_size`, `num_hidden_layers` | Positive integers matching the loaded model. |
+| `layers` | Nonempty array, strictly increasing `index` values within the model. |
+| `layers[].refusal_direction` | `hidden_size` finite FP32-representable numbers, unit L2 norm within `1e-3`. |
+| `layers[].disclaimer_direction` | Same shape and norm rule, or all zero to disable the second edit. |
+| `layers[].refusal_reference`, `layers[].disclaimer_reference` | Finite FP32-representable numbers. |
+| `provenance` | Optional metadata object; does not affect execution. |
+
+
+Calibration observes the unmodified model. A CausalScoring Engine without a profile prefills a
+prompt through the normal scoring Session and `TextRun` copies the raw layer-output residual of the
+last prompt token for the requested layers (`ResidualProbe`), before any intervention and before
+DFlash capture. See the [CLI guide](../cli.md#residual-intervention-and-calibration) for the
+tool and file formats.
+
 ## Vision and multimodal positions
 
 The current native processor uses 16×16 spatial patches, pairs of frames, and 2×2 spatial merge.
@@ -293,6 +343,9 @@ x = x + fc2(GELU_tanh(fc1(h) + bias)) + bias
 Attention segments separate media/frame grids. The merger normalizes, groups 2×2 patches into
 width 4608, and computes `fc2(GELU_exact(fc1(merged) + bias)) + bias`, producing Text-width columns.
 Those columns replace matching placeholder embeddings. Vision has no autoregressive state.
+For a 5120-wide Text backbone, the merger's second projection is `[5120,4608]`.
+Its BF16 representation is supported directly by the native Linear catalogue, including
+partial output-row tiles; enabling Vision does not require quantizing that projection.
 
 Frontend admission uses aggregate media bytes, pixels, patch/token budgets and Engine context
 capacity. The aggregate limit is 131,072 raw patches / 32,768 merged tokens; a single tower item

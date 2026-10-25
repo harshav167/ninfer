@@ -73,6 +73,7 @@ struct ComputeOperation {
     std::optional<Commit> commit;
     std::optional<Result> result;
     std::vector<float> scores;
+    std::vector<float> residuals;
     GpuExecutionObservation gpu;
     std::optional<Tensor> input_embeddings;
     std::unique_ptr<execution::TextRun> text;

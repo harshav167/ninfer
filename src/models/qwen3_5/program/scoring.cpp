@@ -13,6 +13,14 @@ void RankProgramImpl::launch_score(ComputeOperation& operation) {
         frame.score_targets.ne[0],
         static_cast<std::uint32_t>(work.targets.size()) - operation.score_cursor);
     if (!operation.score_count) {
+        if (work.capture) {
+            // Main finished before this window reached History, so the copy is ordered after the
+            // probe writes on the compute stream and before the readback event.
+            const Tensor probe =
+                frame.residual_probe.slice(1, 0, static_cast<int>(work.capture->layers.size()));
+            CUDA_CHECK(cudaMemcpyAsync(frame.host_residual_probe.data, probe.data, probe.bytes(),
+                                       cudaMemcpyDeviceToHost, device.stream()));
+        }
         gpu_timer.record_result();
         result_ready.record(device.stream());
         operation.stage = ComputeStage::Readback;

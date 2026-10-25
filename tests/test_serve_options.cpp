@@ -3,10 +3,12 @@
 #include "serve/openai_chat.h"
 #include "product/logging/configuration.h"
 
+#include <filesystem>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -141,6 +143,36 @@ void test_provenance() {
     }
 }
 
+std::string line_with(const std::string& text, std::string_view needle) {
+    const auto at = text.find(needle);
+    if (at == text.npos) return {};
+    const auto begin = text.rfind('\n', at);
+    const auto first = begin == text.npos ? 0 : begin + 1;
+    return text.substr(first, text.find('\n', at) - first);
+}
+
+void test_residual_profile() {
+    require(parse({"ninfer-serve", "model.ninfer"}).launch.engine.residual_profile_path.empty(),
+            "the server selected a residual profile by default");
+    const auto selected =
+        parse({"ninfer-serve", "model.ninfer", "--residual-profile", "profiles/arm.json"});
+    require(selected.launch.engine.residual_profile_path ==
+                std::filesystem::absolute("profiles/arm.json"),
+            "residual profile did not reach the Engine options");
+    const auto row = line_with(
+        ninfer::product::format_configuration(ninfer::product::configuration_view(selected)),
+        "residual_profile");
+    require(row.find("arm.json") != std::string::npos && row.find("[argv:2]") != std::string::npos,
+            "startup display lost the residual profile or its source");
+    for (const auto* spelling : {"--residual-profile=", "--residual-profile"}) {
+        std::vector<std::string> arguments{"ninfer-serve", "model.ninfer", spelling};
+        if (std::string_view(spelling).back() != '=') arguments.emplace_back();
+        require(parse(arguments).launch.engine.residual_profile_path.empty(),
+                "empty residual profile value was not accepted as no profile");
+    }
+    rejects([&] { parse({"ninfer-serve", "model.ninfer", "--residual-profile"}); });
+}
+
 } // namespace
 
 int main() {
@@ -148,6 +180,7 @@ int main() {
         test_resources_and_units();
         test_request_defaults();
         test_provenance();
+        test_residual_profile();
         std::cout << "ok\n";
         return 0;
     } catch (const std::exception& error) {

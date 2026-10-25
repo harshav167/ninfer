@@ -7,6 +7,8 @@ namespace ninfer::models::qwen4_exp {
 Startup::Startup(const artifact::Reader& definition_source, const artifact::Reader& rank_source,
                  const EngineOptions& options, Device device)
     : reader_(rank_source), definition_(read_definition(definition_source, load_options(options))) {
+    if (!options.residual_profile_path.empty())
+        throw std::invalid_argument("Qwen4Exp does not support residual intervention profiles");
     if (options.deployment) {
         const auto parallel = plan_parallel(*definition_, *options.deployment);
         if (parallel.ranks.size() != 1)

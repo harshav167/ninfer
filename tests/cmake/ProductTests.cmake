@@ -19,6 +19,16 @@ ninfer_add_test(ninfer_perplexity_evaluation_test
 target_include_directories(ninfer_perplexity_evaluation_test PRIVATE
   ${PROJECT_SOURCE_DIR}/apps/perplexity)
 
+ninfer_add_test(ninfer_residual_capture_test
+  NEEDS_SOURCE_DIR
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_residual_capture.cpp"
+          ${PROJECT_SOURCE_DIR}/apps/residual_capture/capture.cpp
+          ${PROJECT_SOURCE_DIR}/src/models/common/frontend/digest.cpp
+  LIBRARIES ninfer::json)
+
+target_include_directories(ninfer_residual_capture_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/apps/residual_capture)
+
 ninfer_add_test(ninfer_cli_options_test
   NEEDS_SOURCE_DIR
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_cli_options.cpp"

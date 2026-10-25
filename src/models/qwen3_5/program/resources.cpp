@@ -3,6 +3,7 @@
 #include "core/startup.h"
 #include "models/load_options.h"
 
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 
@@ -55,6 +56,16 @@ ResourceLayout plan_resources(const ResourceSpec& spec) {
             {draft.feature_rows, dimension(std::uint64_t(spec.frame.draft_window) + 1),
              dimension(spec.frame.batch_capacity)},
             kAlignment, "DFlash residency target features");
+    }
+    if (spec.intervention) {
+        const auto& edit = *spec.intervention;
+        if (edit.hidden <= 0 || edit.layers <= 0)
+            throw std::invalid_argument("Qwen3.5 residual intervention geometry is invalid");
+        out.intervention = ResidualInterventionLayout{
+            builder.add_tensor(DType::FP32, {edit.hidden, 2, edit.layers}, kAlignment,
+                               "residual intervention directions"),
+            builder.add_tensor(DType::FP32, {2, edit.layers}, kAlignment,
+                               "residual intervention references")};
     }
     out.frame = plan_frames(builder, spec.frame);
     if (!spec.frame.causal_scoring) {
@@ -113,7 +124,8 @@ PagedKVBatchLayerView DFlashPersistentState::full_batch_layer(std::uint32_t laye
 }
 
 Resources::Resources(DeviceContext& device, const ResourceLayout& layout,
-                     const WorkspaceSpec& workspace, const StartupObserver& observer)
+                     const WorkspaceSpec& workspace, const residual::Profile* profile,
+                     const StartupObserver& observer)
     : context_records(layout.context_records()), context(device.device(), layout.context_bytes),
       persistent(device.device(), layout.bytes),
       workspace_storage(device.device(), workspace.capacity),
@@ -140,6 +152,39 @@ Resources::Resources(DeviceContext& device, const ResourceLayout& layout,
         auto* local = state_images.dflash_local();
         if (!local) throw std::logic_error("DFlash StateImage has no local state");
         dflash.emplace(context.span(), backing, *layout.dflash, *local);
+    }
+    if (bool(layout.intervention) != bool(profile))
+        throw std::invalid_argument("Qwen3.5 residual intervention layout and profile disagree");
+    if (profile) {
+        const std::size_t hidden = profile->hidden_size;
+        const std::size_t count  = profile->layers.size();
+        const Tensor directions  = layout.intervention->directions.bind(backing);
+        const Tensor references  = layout.intervention->references.bind(backing);
+        if (!count || directions.ne[0] != static_cast<std::int32_t>(hidden) ||
+            directions.ne[2] != static_cast<std::int32_t>(count) ||
+            references.ne[1] != static_cast<std::int32_t>(count))
+            throw std::invalid_argument("Qwen3.5 residual intervention geometry disagrees");
+        std::vector<float> direction_values(hidden * 2 * count), reference_values(2 * count);
+        intervention_layers.reserve(count);
+        for (std::size_t slot = 0; slot < count; ++slot) {
+            const auto& edit = profile->layers[slot];
+            if (edit.refusal.size() != hidden || edit.disclaimer.size() != hidden)
+                throw std::invalid_argument("Qwen3.5 residual intervention direction is truncated");
+            std::copy(edit.refusal.begin(), edit.refusal.end(),
+                      direction_values.begin() + (2 * slot) * hidden);
+            std::copy(edit.disclaimer.begin(), edit.disclaimer.end(),
+                      direction_values.begin() + (2 * slot + 1) * hidden);
+            reference_values[2 * slot]     = edit.refusal_reference;
+            reference_values[2 * slot + 1] = edit.disclaimer_reference;
+            intervention_layers.push_back(edit.layer);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(directions.data, direction_values.data(), directions.bytes(),
+                                   cudaMemcpyHostToDevice, device.stream()));
+        CUDA_CHECK(cudaMemcpyAsync(references.data, reference_values.data(), references.bytes(),
+                                   cudaMemcpyHostToDevice, device.stream()));
+        CUDA_CHECK(cudaStreamSynchronize(device.stream()));
+        intervention.emplace(
+            execution::ResidualIntervention{intervention_layers, directions, references});
     }
     if (layout.token_counts) {
         token_counts = layout.token_counts->bind(backing);

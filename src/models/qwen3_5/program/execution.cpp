@@ -3,6 +3,8 @@
 #include "models/qwen3_5/execution/text.h"
 
 #include <algorithm>
+#include <bit>
+#include <cstdint>
 
 namespace ninfer::models::qwen3_5::detail {
 
@@ -158,6 +160,18 @@ void RankProgramImpl::progress() {
                 if (operation.score_cursor < score->targets.size()) {
                     launch_score(operation);
                     break;
+                }
+                if (score->capture) {
+                    // BF16 -> FP32 is the exact 16-bit left shift of the raw word.
+                    const auto count = score->capture->layers.size() *
+                                       static_cast<std::size_t>(resources.frame.spec.hidden);
+                    const auto* words =
+                        static_cast<const std::uint16_t*>(resources.frame.host_residual_probe.data);
+                    operation.residuals.resize(count);
+                    std::transform(words, words + count, operation.residuals.begin(),
+                                   [](std::uint16_t word) {
+                                       return std::bit_cast<float>(std::uint32_t(word) << 16);
+                                   });
                 }
             }
             publish_result(operation);

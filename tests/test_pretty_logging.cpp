@@ -1,5 +1,6 @@
 #include "product/logging/logging.h"
 #include "product/logging/startup_log.h"
+#include "product/logging/pretty_format.h"
 
 #include <spdlog/logger.h>
 
@@ -74,6 +75,20 @@ std::size_t line_count(std::string_view value) {
     return static_cast<std::size_t>(std::count(value.begin(), value.end(), '\n'));
 }
 
+std::string ready_output(const ninfer::LoadSummary& load) {
+    StderrCapture capture;
+    {
+        ninfer::product::LoggingRuntime logging(
+            {.logger_name  = "ninfer-serve",
+             .color        = ninfer::product::LogColorMode::Never,
+             .presentation = ninfer::product::LogPresentation::Service});
+        ninfer::product::StartupLogRenderer startup(logging);
+        startup.engine_ready(load);
+        logging.flush();
+    }
+    return capture.finish();
+}
+
 } // namespace
 
 int main() {
@@ -133,6 +148,7 @@ int main() {
                                .status     = ninfer::StartupStatus::Complete,
                                .elapsed_ns = 3'000'000'000});
             startup.engine_ready({.model_name           = "qwen3.6-27b",
+                                  .artifact_id          = "0123456789abcdef0123456789abcdef",
                                   .cuda_sync_mode       = "blocking",
                                   .weight_formats       = {"q4_g64_fp16", "q8_g32_fp16"},
                                   .host_to_device_bytes = 16ULL << 30});
@@ -141,16 +157,43 @@ int main() {
         startup_output = capture.finish();
     }
     failures += check(
-        line_count(startup_output) == 4 &&
+        line_count(startup_output) == 5 &&
             startup_output.find("starting engine") != std::string::npos &&
             startup_output.find("loading weights | 16.0 GiB") != std::string::npos &&
             startup_output.find("weights ready | 16.0 GiB | 2.0s | 8.00 GiB/s") !=
                 std::string::npos &&
             startup_output.find("engine ready | qwen3.6-27b | total 3.0s | weights 16.0 GiB") !=
                 std::string::npos &&
+            startup_output.find(
+                "artifact 0123456789abcdef0123456789abcdef | residual intervention OFF\n") !=
+                std::string::npos &&
             startup_output.find("CUDA sync blocking") != std::string::npos &&
             startup_output.find("CUDA initialized") == std::string::npos,
         "normal startup pretty output is noisy or incomplete");
+
+    ninfer::LoadSummary edited;
+    edited.model_name                         = "qwen3.6-27b";
+    edited.artifact_id                        = "fedcba9876543210fedcba9876543210";
+    edited.residual_intervention.enabled      = true;
+    edited.residual_intervention.profile_path = "/profiles/arm-a.json";
+    for (std::uint32_t layer = 27; layer <= 42; ++layer)
+        edited.residual_intervention.layers.push_back(layer);
+    const std::string edited_output = ready_output(edited);
+    failures +=
+        check(edited_output.find(
+                  "artifact fedcba9876543210fedcba9876543210 | residual intervention ON | "
+                  "profile /profiles/arm-a.json | layers 27..42 (16)\n") != std::string::npos,
+              "enabled residual intervention was not reported at startup");
+    edited.residual_intervention.layers = {3, 5, 6, 7, 40};
+    failures += check(ready_output(edited).find("layers 3,5..7,40 (5)\n") != std::string::npos,
+                      "non-contiguous residual layers were not reported as runs");
+    const std::array<std::uint32_t, 0> no_layers{};
+    const std::array<std::uint32_t, 1> one_layer{7};
+    const std::array<std::uint32_t, 4> two_runs{1, 2, 4, 9};
+    failures += check(ninfer::product::format_pretty_index_runs(no_layers).empty() &&
+                          ninfer::product::format_pretty_index_runs(one_layer) == "7" &&
+                          ninfer::product::format_pretty_index_runs(two_runs) == "1..2,4,9",
+                      "index run formatting changed");
 
     std::string tool_output;
     {

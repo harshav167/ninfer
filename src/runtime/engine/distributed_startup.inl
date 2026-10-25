@@ -49,6 +49,9 @@ build_distributed_model(const artifact::Reader& reader, EngineOptions& options,
     LoadSummary load;
     load.architecture        = models::architecture_name(setup.architecture());
     load.model_name          = setup.definition()->info().name;
+    load.artifact_id         = artifact::artifact_id_string(setup.definition()->artifact_id());
+    load.hidden_size         = setup.geometry().hidden_size;
+    load.num_hidden_layers   = setup.geometry().num_hidden_layers;
     load.prefill_signature   = setup.prefill_signature(options.prefill_chunk);
     load.artifact_bytes_read = setup.definition()->resource_stats().read_bytes;
     load.host_object_count   = setup.definition()->resource_stats().host_object_count;

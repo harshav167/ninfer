@@ -43,6 +43,9 @@ void validate(const FrameSpec& spec) {
         (spec.backend != SpeculativeBackend::None || spec.batch_capacity != 1)) {
         throw std::invalid_argument("Qwen3.5 scoring requires one non-speculative row");
     }
+    if (spec.residual_layers != 0 && !spec.causal_scoring) {
+        throw std::invalid_argument("Qwen3.5 residual capture storage requires causal scoring");
+    }
 }
 
 Tensor prefix(const Tensor& tensor, std::initializer_list<std::int32_t> shape) {
@@ -75,13 +78,18 @@ FrameLayout plan_frames(LayoutBuilder& builder, const FrameSpec& spec) {
     if (spec.causal_scoring) {
         out.score_targets  = add(builder, DType::I32, {kScoreTile}, "scoring target ids");
         out.score_logprobs = add(builder, DType::FP32, {kScoreTile}, "scoring log probabilities");
+        if (spec.residual_layers) {
+            out.residual_probe =
+                add(builder, DType::BF16, {spec.hidden, dimension(spec.residual_layers)},
+                    "residual capture target");
+        }
     } else {
         out.logits =
             add(builder, DType::BF16, {spec.output_rows, width, batch}, "execution target logits");
         out.target_argmax = add(builder, DType::I32, {width, batch}, "execution target argmax");
-        out.masks         = add(builder, DType::I32,
-                                {dimension((std::uint64_t(spec.public_tokens) + 31) / 32), width, batch},
-                                "execution grammar masks");
+        out.masks = add(builder, DType::I32,
+                        {dimension((std::uint64_t(spec.public_tokens) + 31) / 32), width, batch},
+                        "execution grammar masks");
     }
     if (spec.backend == SpeculativeBackend::Mtp) {
         auto& mtp         = out.mtp.emplace();
@@ -155,6 +163,11 @@ FrameLayout plan_frames(LayoutBuilder& builder, const FrameSpec& spec) {
     if (spec.causal_scoring) {
         out.host.score_logprobs =
             add(host, DType::FP32, {kScoreTile}, "Host score log probabilities");
+        if (spec.residual_layers) {
+            out.host.residual_probe =
+                add(host, DType::BF16, {spec.hidden, dimension(spec.residual_layers)},
+                    "Host residual capture readback");
+        }
     }
     out.host.bytes = host.finish(kAlignment, "Host execution frame");
     return out;
@@ -246,6 +259,7 @@ ExecutionFrame::ExecutionFrame(MemorySpan backing, const FrameLayout& layout)
     if (layout.masks) masks = layout.masks->bind(backing);
     if (layout.score_targets) score_targets = layout.score_targets->bind(backing);
     if (layout.score_logprobs) score_logprobs = layout.score_logprobs->bind(backing);
+    if (layout.residual_probe) residual_probe = layout.residual_probe->bind(backing);
     if (layout.mtp) mtp.emplace(backing, *layout.mtp);
     if (layout.dflash) dflash.emplace(backing, *layout.dflash);
 
@@ -271,6 +285,7 @@ ExecutionFrame::ExecutionFrame(MemorySpan backing, const FrameLayout& layout)
         host_step_valid_columns = layout.host.step_valid_columns->bind(host);
     }
     if (layout.host.score_logprobs) host_score_logprobs = layout.host.score_logprobs->bind(host);
+    if (layout.host.residual_probe) host_residual_probe = layout.host.residual_probe->bind(host);
 }
 
 void ExecutionFrame::validate_input_shape(std::int32_t width, std::int32_t batch) const {

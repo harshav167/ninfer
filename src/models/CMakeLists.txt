@@ -9,6 +9,7 @@ add_library(ninfer_model_loading STATIC
   common/parallel_weights.cpp
   common/weights.cpp
   common/moe/weights.cpp
+  common/residual/profile.cpp
   qwen4_exp/ple/parameters.cpp
   qwen4_exp/ple/disk/table.cpp)
 ninfer_internal_includes(ninfer_model_loading)
