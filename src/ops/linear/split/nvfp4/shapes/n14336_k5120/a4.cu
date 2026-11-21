@@ -1,3 +1,4 @@
+#include "ops/linear/common/low_rank_epilogue.cuh"
 #include "ops/linear/split/nvfp4/shapes/n14336_k5120/launch.h"
 #include "core/weight.h"
 #include "core/device.h"
@@ -23,40 +24,46 @@ constexpr bool uses_tma(std::int32_t tokens) { return tokens >= 512; }
 
 template <class Schedule>
 void launch_gemm(const Weight& weight, std::span<const Tensor> outputs, Nvfp4A4Workspace workspace,
-                 std::int32_t tokens, cudaStream_t stream) {
-    launch_nvfp4_a4_mma<Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows>>(
-        nvfp4_a4_operands(weight, workspace, tokens, Nvfp4ScaleLayout::RowMajor),
-        LinearBf16SegmentedOutput<6144, 1024, 6144, 1024>{
-            static_cast<__nv_bfloat16*>(outputs[0].data),
-            static_cast<__nv_bfloat16*>(outputs[1].data),
-            static_cast<__nv_bfloat16*>(outputs[2].data),
-            static_cast<__nv_bfloat16*>(outputs[3].data)},
-        LinearIdentityEpilogue{}, stream);
+                 std::int32_t tokens, cudaStream_t stream, const RankDeltas* delta) {
+    const auto run = [&](auto epilogue) {
+        launch_nvfp4_a4_mma<Nvfp4ScheduleInstance<Schedule, Geometry::kInputRows>>(
+            nvfp4_a4_operands(weight, workspace, tokens, Nvfp4ScaleLayout::RowMajor),
+            LinearBf16SegmentedOutput<6144, 1024, 6144, 1024>{
+                static_cast<__nv_bfloat16*>(outputs[0].data),
+                static_cast<__nv_bfloat16*>(outputs[1].data),
+                static_cast<__nv_bfloat16*>(outputs[2].data),
+                static_cast<__nv_bfloat16*>(outputs[3].data)},
+            epilogue, stream);
+    };
+    if (delta)
+        return run(
+            RankSplit<6144, 1024, 6144>{{(*delta)[0], (*delta)[1], (*delta)[2], (*delta)[3]}});
+    run(LinearIdentityEpilogue{});
 }
 
 } // namespace
 
 void launch_a4(const Tensor& x, const Weight& weight, std::span<const Tensor> outputs,
-               Nvfp4A4Workspace workspace, cudaStream_t stream) {
+               Nvfp4A4Workspace workspace, cudaStream_t stream, const RankDeltas* delta) {
     const std::int32_t tokens = x.ne[1];
     const auto layout =
         uses_tma(tokens) ? (tokens < 1024 ? Nvfp4ScaleLayout::Tiled128 : Nvfp4ScaleLayout::Tiled256)
                          : Nvfp4ScaleLayout::RowMajor;
     launch_nvfp4_a4_quantize(x, weight, workspace, layout, stream);
     if (uses_tma(tokens)) {
-        launch_a4_tma(nvfp4_a4_operands(weight, workspace, tokens, layout), outputs, stream);
+        launch_a4_tma(nvfp4_a4_operands(weight, workspace, tokens, layout), outputs, stream, delta);
     } else if (tokens <= 64) {
-        launch_gemm<M32N64>(weight, outputs, workspace, tokens, stream);
+        launch_gemm<M32N64>(weight, outputs, workspace, tokens, stream, delta);
     } else if (tokens <= 96) {
-        launch_gemm<M32N128>(weight, outputs, workspace, tokens, stream);
+        launch_gemm<M32N128>(weight, outputs, workspace, tokens, stream, delta);
     } else if (tokens <= 128) {
-        launch_gemm<M128N128Pipelined>(weight, outputs, workspace, tokens, stream);
+        launch_gemm<M128N128Pipelined>(weight, outputs, workspace, tokens, stream, delta);
     } else if (tokens <= 192) {
-        launch_gemm<M64N128>(weight, outputs, workspace, tokens, stream);
+        launch_gemm<M64N128>(weight, outputs, workspace, tokens, stream, delta);
     } else if (tokens <= 384) {
-        launch_gemm<M128N128Resident>(weight, outputs, workspace, tokens, stream);
+        launch_gemm<M128N128Resident>(weight, outputs, workspace, tokens, stream, delta);
     } else {
-        launch_gemm<M128N128Pipelined>(weight, outputs, workspace, tokens, stream);
+        launch_gemm<M128N128Pipelined>(weight, outputs, workspace, tokens, stream, delta);
     }
 }
 

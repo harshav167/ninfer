@@ -362,6 +362,9 @@ ParsedOptions parse(int argc, char** argv, EntryPoint entry,
         case Field::ChatTemplate:
             engine.chat_template_path = path();
             break;
+        case Field::Lora:
+            engine.lora_path = path();
+            break;
         case Field::Vision:
             engine.enable_vision = boolean();
             break;

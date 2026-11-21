@@ -23,12 +23,12 @@ std::size_t nvfp4_linear_add_workspace_capacity_bytes(std::int32_t rows, std::in
 }
 
 void nvfp4_linear_add_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
-                               MemoryArena& arena, cudaStream_t stream) {
+                               MemoryArena& arena, cudaStream_t stream, const RankDelta* delta) {
     const auto plan = select_plan(w.n, w.k, policy, x.ne[1]);
-    if (plan.a16) return plan.a16(x, w, out, stream);
+    if (plan.a16) return plan.a16(x, w, out, stream, delta);
     auto scope         = arena.scope();
     const auto scratch = allocate_nvfp4_a4_workspace(arena, x.ne[1], w.k);
     launch_nvfp4_a4_quantize(x, w, scratch, plan.scale_layout, stream);
-    plan.quantized(x, w, out, scratch, stream);
+    plan.quantized(x, w, out, scratch, stream, delta);
 }
 } // namespace ninfer::ops::detail

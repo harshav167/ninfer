@@ -57,6 +57,9 @@ Changes to the file take effect after restarting NInfer:
   --chat-template tools/chat_templates/qwen3_8.jinja --prompt "Hello"
 ```
 
+For dense Qwen3.8 generation, `--lora FILE` loads a resident V3 companion without
+changing the base weights. See [runtime LoRA import](weight-conversion.md#dense-qwen38-runtime-lora).
+
 ## Constrained output
 
 `--grammar-file FILE` constrains the answer with a GBNF grammar whose entry rule is `root`:

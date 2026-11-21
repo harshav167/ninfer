@@ -5,6 +5,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
+#include "ops/linear/common/low_rank.h"
 
 #include <cuda_runtime.h>
 
@@ -27,16 +28,18 @@ void launch_nvfp4_swiglu_n28672_k5120(const Tensor& x, const Weight& w, Tensor& 
                                                                        std::int32_t max_tokens);
 
 void launch_nvfp4_swiglu_decode(const Tensor& x, const Weight& weight, Tensor& out,
-                                cudaStream_t stream);
+                                cudaStream_t stream, const RankDeltas* = nullptr);
 void launch_nvfp4_swiglu_small_t(const Tensor& x, const Weight& weight, Tensor& out,
-                                 cudaStream_t stream);
+                                 cudaStream_t stream, const RankDeltas* = nullptr);
 void launch_nvfp4_swiglu_large_t(const Tensor& x, const Weight& weight, Tensor& out,
                                  cudaStream_t stream);
 void launch_nvfp4_swiglu_a4(const Tensor& x, const Weight& weight, Tensor& out,
-                            MemoryArena& workspace, cudaStream_t stream);
+                            MemoryArena& workspace, cudaStream_t stream,
+                            const RankDeltas* = nullptr);
 
 void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
-                                  LinearPolicy policy, MemoryArena& workspace, cudaStream_t stream);
+                                  LinearPolicy policy, MemoryArena& workspace, cudaStream_t stream,
+                                  const RankDeltas* = nullptr);
 
 #if NINFER_TARGET_SPARK
 std::size_t nvfp4_swiglu_n12288_k4096_capacity(LinearPolicy policy, int min_tokens, int max_tokens);

@@ -5,7 +5,12 @@
 #include "core/device.h"
 #include "ninfer/ops/projection_weights.h"
 
+namespace ninfer::models::qwen3_5 {
+struct LoraBlock;
+}
+
 namespace ninfer::models::qwen3_5::execution {
+
 
 struct DenseParameters {
     ops::SingleProjectionWeight gate_up;
@@ -16,8 +21,9 @@ enum class DenseMlpUse { Text, Mtp };
 
 [[nodiscard]] std::size_t dense_mlp_workspace_bytes(const DenseProfile& parameters,
                                                     std::int32_t first, std::int32_t last,
-                                                    DenseMlpUse use);
+                                                    DenseMlpUse use, bool has_lora = false);
 void dense_mlp(const Tensor& hidden, const DenseParameters& parameters, Tensor& residual,
-               DenseMlpUse use, MemoryArena& workspace, CudaExecutionView execution);
+               DenseMlpUse use, MemoryArena& workspace, CudaExecutionView execution,
+               const LoraBlock* lora = nullptr, float scale = 1.0f);
 
 } // namespace ninfer::models::qwen3_5::execution

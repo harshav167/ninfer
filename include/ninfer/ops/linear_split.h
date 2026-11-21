@@ -3,6 +3,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/projection_weights.h"
+#include "ninfer/ops/low_rank.h"
 
 #include "core/device.h"
 #include <span>
@@ -27,6 +28,13 @@ namespace ninfer::ops {
 void linear_split(const Tensor& x, const ProjectionWeights& weights,
                   std::span<const Tensor> outputs, MemoryArena& workspace,
                   CudaExecutionView execution);
+
+// Adds one FP32 low-rank update per segment in the epilogue, before rounding.
+// Registered FP8/NVFP4 form: [6144, 1024, 6144, 1024] x 5120.
+// Workspace: low_rank_workspace_bytes(T, distinct_A_count) plus aligned base workspace.
+void linear_split(const Tensor& x, const ProjectionWeights& weights,
+                  std::span<const Tensor> outputs, std::span<const LowRankFactors> updates,
+                  float scale, MemoryArena& workspace, CudaExecutionView execution);
 
 /** Single-parent A16 computation with no transient workspace. */
 void linear_split(const Tensor& x, const Weight& weight, std::span<const Tensor> outputs,

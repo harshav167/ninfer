@@ -5,7 +5,7 @@ namespace {
 template <class S, int T = 0, bool Exact = false>
 using Instance = Fp8ScheduleInstance<S, 6144, T, Exact>;
 
-LinearAddLaunch select_a16(int tokens) {
+decltype(Fp8LinearAddPlan::a16) select_a16(int tokens) {
     if (tokens == 1)
         return launch_fp8_add_gemv<
             Instance<Fp8A16GemvSchedule<8, 2, 8, 4, Fp8CodeCache::Default, 2, 2>>>;

@@ -13,6 +13,7 @@ constexpr FieldSpec kFields[] = {
     {Field::ModelPath, "model.path", "", "", "FILE", "Model artifact (.ninfer).", Scope::Common},
     {Field::ChatTemplate, "model.chat_template", "--chat-template", "", "FILE",
      "Chat template override; empty uses the artifact."},
+    {Field::Lora, "model.lora", "--lora", "", "FILE", "Resident Qwen LoRA companion (.ninfer)."},
     {Field::Vision, "model.vision", "--vision", "--no-vision", "", "Load Vision resources."},
     {Field::VisionMemoryBudget, "vision.memory_budget", "--vision-memory-budget", "", "SIZE",
      "Per-rank Vision activation and output-window budget (1GiB); excludes weights.",
@@ -397,6 +398,7 @@ FieldValue parse_field_value(Field field, const RawValue& value, bool command_li
     case Field::JsonSchemaFile:
         return text(value, true);
     case Field::ChatTemplate:
+    case Field::Lora:
     case Field::CostPresets:
     case Field::ApiKey:
     case Field::ModelId:

@@ -9,6 +9,7 @@
 #include "ops/linear/swiglu/nvfp4_mul/dispatch.h"
 #include "ops/linear/swiglu/dispatch.h"
 #include "ops/linear/common/operands.h"
+#include "ops/linear/common/low_rank.h"
 #include "ops/common/host/operands.h"
 
 #include <cstdint>
@@ -87,7 +88,9 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
 
 static void execute_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, float limit,
                            bool clamped, LinearPolicy policy, MemoryArena& ws,
-                           CudaExecutionView execution) {
+                           CudaExecutionView execution,
+                           const std::array<LowRankFactors, 2>* updates = nullptr,
+                           float scale                                  = 0.0f) {
     validate_policy(policy);
     if (x.device != execution.device() || out.device != execution.device() ||
         gate_up_weight.device != execution.device() || ws.device() != execution.device()) {
@@ -110,6 +113,22 @@ static void execute_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor
         !common::operand::aligned(out.data, 16))
         throw std::invalid_argument("linear_swiglu: x/out must be contiguous and 16-byte aligned");
 
+    if (updates) {
+        if (w.n != 34816 || w.k != 5120 ||
+            (w.qtype != QType::FP8_E4M3FN_ROW_BF16 && w.qtype != QType::NVFP4))
+            throw std::invalid_argument("linear_swiglu: unsupported low-rank geometry");
+        auto scope = ws.scope();
+        const std::array rows{w.n / 2, w.n / 2};
+        const auto deltas = detail::prepare_low_rank(x, *updates, rows, scale, ws, execution);
+        if (w.qtype == QType::FP8_E4M3FN_ROW_BF16) {
+            (void)common::validate_fp8_weight(w, "fp8 linear_swiglu");
+            return detail::fp8_linear_swiglu_dispatch(x, w, out, policy, ws, execution.stream(),
+                                                      &deltas);
+        }
+        (void)common::validate_nvfp4_weight(w, "nvfp4 linear_swiglu");
+        return detail::nvfp4_linear_swiglu_dispatch(x, w, out, policy, ws, execution.stream(),
+                                                    &deltas);
+    }
     if (w.qtype == QType::MXFP8 || w.qtype == QType::FP8_E4M3FN_BLOCK128X128_FP32 ||
         w.qtype == QType::NVFP4_MUL) {
         detail::validate_projection_operands(x, w, {&out, 1}, nullptr, execution, "linear_swiglu");
@@ -198,6 +217,12 @@ void linear_swiglu(const Tensor& x, const Weight& weight, Tensor& out, float lim
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, MemoryArena& ws,
                    CudaExecutionView execution) {
     linear_swiglu(x, gate_up_weight, out, LinearPolicy::A16Only, ws, execution);
+}
+
+void linear_swiglu(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
+                   const std::array<LowRankFactors, 2>& updates, float scale, MemoryArena& ws,
+                   CudaExecutionView execution) {
+    execute_swiglu(x, w, out, 0.0f, false, policy, ws, execution, &updates, scale);
 }
 
 } // namespace ninfer::ops

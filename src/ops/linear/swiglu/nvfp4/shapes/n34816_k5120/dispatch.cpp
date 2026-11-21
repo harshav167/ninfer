@@ -68,20 +68,20 @@ std::size_t nvfp4_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy,
 }
 
 void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
-                                  LinearPolicy policy, MemoryArena& workspace,
-                                  cudaStream_t stream) {
+                                  LinearPolicy policy, MemoryArena& workspace, cudaStream_t stream,
+                                  const RankDeltas* updates) {
     switch (select_route(policy, x.ne[1])) {
     case Nvfp4LinearSwiGluRoute::DecodeFusedA16:
-        launch_nvfp4_swiglu_decode(x, weight, out, stream);
+        launch_nvfp4_swiglu_decode(x, weight, out, stream, updates);
         return;
     case Nvfp4LinearSwiGluRoute::SmallTFusedA16:
-        launch_nvfp4_swiglu_small_t(x, weight, out, stream);
+        launch_nvfp4_swiglu_small_t(x, weight, out, stream, updates);
         return;
     case Nvfp4LinearSwiGluRoute::LargeTFusedA16:
         launch_nvfp4_swiglu_large_t(x, weight, out, stream);
         return;
     case Nvfp4LinearSwiGluRoute::FusedA4:
-        launch_nvfp4_swiglu_a4(x, weight, out, workspace, stream);
+        launch_nvfp4_swiglu_a4(x, weight, out, workspace, stream, updates);
         return;
     case Nvfp4LinearSwiGluRoute::TmaFusedA4: {
         auto scope                     = workspace.scope();
@@ -89,7 +89,7 @@ void nvfp4_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor&
         launch_nvfp4_a4_quantize(x, weight, scratch, Nvfp4ScaleLayout::Tiled256, stream);
         launch_nvfp4_swiglu_a4_tma(
             nvfp4_a4_operands(weight, scratch, x.ne[1], Nvfp4ScaleLayout::Tiled256),
-            static_cast<__nv_bfloat16*>(out.data), stream);
+            static_cast<__nv_bfloat16*>(out.data), stream, updates);
         return;
     }
     }

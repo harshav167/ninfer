@@ -140,7 +140,7 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
     const ops::CausalAttentionExecutionEnvelope text_envelope{1, plan.capacity};
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
-                           std::int32_t tokens) { (void)layout.alloc(dtype, {rows, tokens}); };
+                            std::int32_t tokens) { (void)layout.alloc(dtype, {rows, tokens}); };
     const auto scratch = [](WorkspaceLayoutBuilder& layout, std::size_t bytes) {
         if (bytes == 0) { return; }
         auto scope = layout.scope();
@@ -173,8 +173,15 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
                 if (const auto* attention =
                         std::get_if<execution::AttentionProfile>(&block.mixer)) {
                     (void)workspace::text_attention_projection(layout, config, last);
-                    scratch(layout, execution::attention_projection_workspace_bytes(*attention,
-                                                                                    first, last));
+                    const auto projection_bytes =
+                        execution::attention_projection_workspace_bytes(*attention, first, last);
+                    if (profile.has_lora) {
+                        auto projection = layout.scope();
+                        (void)layout.alloc_bytes(ops::low_rank_workspace_bytes(last, 3));
+                        scratch(layout, projection_bytes);
+                    } else {
+                        scratch(layout, projection_bytes);
+                    }
                     (void)workspace::text_attention_results(layout, config, last);
                     scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
                                         {dimension(config.attention->head_dim),
@@ -182,7 +189,12 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
                                          dimension(config.attention->num_key_value_heads)},
                                         plan.kv_storage, envelope, batch_size, min_width, max_width,
                                         plan.multiprocessor_count));
-                    add_scratch(layout, attention->output, first, last);
+                    {
+                        auto output = layout.scope();
+                        if (profile.has_lora)
+                            (void)layout.alloc_bytes(ops::low_rank_workspace_bytes(last, 1));
+                        add_scratch(layout, attention->output, first, last);
+                    }
                 } else {
                     const auto& gdn = std::get<execution::GdnProfile>(block.mixer);
                     (void)workspace::gdn_control(layout, config, last);
@@ -215,7 +227,8 @@ WorkspaceSpec build_workspace_plan(const SequencePlanImpl& plan) {
             (void)workspace::post_mixer_hidden(layout, config, last);
             if (const auto* dense = std::get_if<execution::DenseProfile>(&block.ffn)) {
                 scratch(layout, execution::dense_mlp_workspace_bytes(*dense, first, last,
-                                                                     execution::DenseMlpUse::Text));
+                                                                     execution::DenseMlpUse::Text,
+                                                                     profile.has_lora));
             } else {
                 const auto& p = std::get<execution::MoeLayerProfile>(block.ffn);
                 auto bytes =
@@ -725,9 +738,9 @@ finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl
         throw std::invalid_argument("Qwen3.5 sequence planner is empty");
     }
     (void)planner->capacity_plan.reservation_bytes(capacity);
-    auto plan                    = capacity.device_bytes == planner->minimum->context_bytes
-                                       ? std::move(planner->minimum)
-                                       : build_sequence_candidate(planner->inputs, capacity.device_bytes);
+    auto plan = capacity.device_bytes == planner->minimum->context_bytes
+                    ? std::move(planner->minimum)
+                    : build_sequence_candidate(planner->inputs, capacity.device_bytes);
     plan->context_metadata_bytes = planner->capacity_plan.control_bytes(capacity);
     return plan;
 }

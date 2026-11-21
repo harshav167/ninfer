@@ -50,6 +50,9 @@ if(NINFER_TARGET STREQUAL "dgx_spark")
   ninfer_linear_format_tests(swiglu bf16 mxfp8 fp8_block_fp32 nvfp4_mul)
 endif()
 
+ninfer_linear_suite(low_rank test.cpp)
+ninfer_linear_format_tests(low_rank fp8 nvfp4)
+
 ninfer_linear_suite(pair test.cpp)
 ninfer_linear_format_tests(pair q8)
 

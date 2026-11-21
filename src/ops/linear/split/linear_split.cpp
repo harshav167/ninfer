@@ -8,7 +8,8 @@ namespace {
 namespace split = detail::linear_split;
 
 void execute(const Tensor& x, split::Weights weights, std::span<const Tensor> outputs,
-             MemoryArena* workspace, CudaExecutionView execution) {
+             MemoryArena* workspace, CudaExecutionView execution,
+             std::span<const LowRankFactors> updates = {}, float scale = 0.0f) {
     const auto& shape = split::select_split_shape(
         {linear_profile({weights.first, weights.policy}),
          weights.second ? std::optional{linear_profile({*weights.second, weights.second_policy})}
@@ -16,6 +17,19 @@ void execute(const Tensor& x, split::Weights weights, std::span<const Tensor> ou
         outputs);
     split::validate_operands(x, weights, outputs, shape.segments, execution);
     const auto bytes = shape.capacity ? shape.capacity(weights.policy, x.ne[1], x.ne[1]) : 0;
+    if (!updates.empty()) {
+        if (!shape.adapted_launch || !workspace)
+            throw std::invalid_argument("linear_split: unsupported low-rank geometry");
+        auto scope = workspace->scope();
+        const auto delta =
+            detail::prepare_low_rank(x, updates, shape.segments, scale, *workspace, execution);
+        if (!bytes)
+            return shape.adapted_launch(x, weights, outputs, nullptr, execution.stream(), &delta);
+        const auto backing = workspace->alloc_bytes(bytes, 256);
+        split::validate_scratch(x, weights, outputs, backing);
+        MemoryArena local(backing);
+        return shape.adapted_launch(x, weights, outputs, &local, execution.stream(), &delta);
+    }
     if (!bytes) {
         shape.launch(x, weights, outputs, nullptr, execution.stream());
         return;
@@ -36,6 +50,14 @@ void linear_split(const Tensor& x, const ProjectionWeights& weights,
         throw std::invalid_argument("linear_split: workspace belongs to another device");
     }
     execute(x, split::describe_weights(weights), outputs, &workspace, execution);
+}
+
+void linear_split(const Tensor& x, const ProjectionWeights& weights,
+                  std::span<const Tensor> outputs, std::span<const LowRankFactors> updates,
+                  float scale, MemoryArena& workspace, CudaExecutionView execution) {
+    if (updates.size() != outputs.size())
+        throw std::invalid_argument("linear_split: low-rank factors must match output segments");
+    execute(x, split::describe_weights(weights), outputs, &workspace, execution, updates, scale);
 }
 
 void linear_split(const Tensor& x, const Weight& weight, std::span<const Tensor> outputs,

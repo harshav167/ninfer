@@ -26,9 +26,10 @@ Fp8LinearSwiGluRoute select_route(LinearPolicy policy, std::int32_t tokens) {
     return tokens >= 5 ? Fp8LinearSwiGluRoute::A8 : Fp8LinearSwiGluRoute::A16;
 }
 
-void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    if (x.ne[1] <= 4) return launch_fp8_swiglu_small_t(x, weight, out, stream);
-    launch_fp8_swiglu_matrix(x, weight, out, stream);
+void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream,
+                const RankDeltas* updates) {
+    if (x.ne[1] <= 4) return launch_fp8_swiglu_small_t(x, weight, out, stream, updates);
+    launch_fp8_swiglu_matrix(x, weight, out, stream, updates);
 }
 
 } // namespace
@@ -48,12 +49,13 @@ std::size_t fp8_linear_swiglu_workspace_capacity_bytes(LinearPolicy policy, std:
 }
 
 void fp8_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
-                                LinearPolicy policy, MemoryArena& workspace, cudaStream_t stream) {
+                                LinearPolicy policy, MemoryArena& workspace, cudaStream_t stream,
+                                const RankDeltas* updates) {
     if (select_route(policy, x.ne[1]) == Fp8LinearSwiGluRoute::A16) {
-        launch_a16(x, weight, out, stream);
+        launch_a16(x, weight, out, stream, updates);
         return;
     }
-    launch_fp8_swiglu_a8(x, weight, out, workspace, stream);
+    launch_fp8_swiglu_a8(x, weight, out, workspace, stream, updates);
 }
 
 } // namespace ninfer::ops::detail

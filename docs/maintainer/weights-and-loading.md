@@ -27,6 +27,9 @@ artifact 不保存一套可执行模型图。本文记录转换、存储与加�
 
 V3 的一个入口和可选续卷组成有序逻辑 payload。对象偏移属于这个地址空间，物理文件边界
 不改变对象的 codec 或身份。Reader 通过目录定位文件，调用者不从续卷名称猜参数位置。
+Dense Qwen runtime LoRA uses a separate V3 directory with only the `lora` component instead of
+`text`. It is not a standalone model. The loader binds its FP32 A/B tensors to the selected target
+artifact and budgets their resident backing before Graph preparation.
 
 Binding 描述逻辑参数与对象区域的关系，Use 描述它在某个输入位置的 activation permission
 和辅助值。同一权重可有不同用途；weight scale 属于权重表示，activation scale 属于使用位置。

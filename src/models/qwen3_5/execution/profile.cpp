@@ -125,7 +125,7 @@ private:
     const ModelDefinition& plan_;
 };
 
-std::shared_ptr<const ModelProfile> describe_model_impl(const ModelDefinition& plan) {
+std::shared_ptr<ModelProfile> describe_model_impl(const ModelDefinition& plan) {
     auto out                 = std::make_shared<ModelProfile>();
     out->config              = plan.config();
     out->options             = plan.options();
@@ -145,8 +145,10 @@ std::shared_ptr<const ModelProfile> describe_model_impl(const ModelDefinition& p
 
 } // namespace
 
-std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition& source) {
-    return describe_model_impl(source);
+std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition& source, bool has_lora) {
+    auto profile      = describe_model_impl(source);
+    profile->has_lora = has_lora;
+    return profile;
 }
 
 
