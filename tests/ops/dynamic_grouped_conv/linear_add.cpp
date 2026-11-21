@@ -179,7 +179,8 @@ std::vector<double> gather_actual(const void* device, std::int32_t width, std::i
     return result;
 }
 
-int run_profile(std::int32_t input_rows, std::span<const std::pair<int, int>> cases) {
+int run_profile(std::int32_t input_rows, std::span<const std::pair<int, int>> cases,
+                QType format = QType::Q8_G32_FP16) {
     const std::vector<float> activation = make_activation(input_rows);
     std::vector<std::uint16_t> activation_bits(activation.size());
     std::transform(activation.begin(), activation.end(), activation_bits.begin(), f32_to_bf16);
@@ -188,10 +189,15 @@ int run_profile(std::int32_t input_rows, std::span<const std::pair<int, int>> ca
     const std::vector<std::uint16_t> residual     = make_residual();
 
     quantized_weight::PatternedWeightOptions weight_options;
-    weight_options.row_split_scale = quantized_weight::RowSplitScalePattern::Tiny;
-    weight_options.row_split_codes = quantized_weight::RowSplitCodePattern::Hashed;
+    if (format == QType::NVFP4) {
+        weight_options.weight_scale_divisor = 0.125F;
+        weight_options.input_scale_divisor  = 3.5F;
+    } else {
+        weight_options.row_split_scale = quantized_weight::RowSplitScalePattern::Tiny;
+        weight_options.row_split_codes = quantized_weight::RowSplitCodePattern::Hashed;
+    }
     input_projection::DevicePackedWeight projection_weight(quantized_weight::make_patterned_weight(
-        QType::Q8_G32_FP16, kHidden, input_rows, 503U + static_cast<std::uint32_t>(input_rows),
+        format, kHidden, input_rows, 503U + static_cast<std::uint32_t>(input_rows),
         weight_options));
     const std::vector<double> projection =
         projection_oracle(projection_weight.host, activation, input_rows);
@@ -225,7 +231,7 @@ int run_profile(std::int32_t input_rows, std::span<const std::pair<int, int>> ca
         const auto verify     = [&](const std::string& label) {
             failures +=
                 verify_reduction(label, gather_actual(residual_device.data(), width, batch_size),
-                                     expected, kCriterion);
+                                 expected, kCriterion);
             failures += residual_device.verify_guards(label);
             failures += scratch.verify_guards(label + " workspace");
             if (workspace.used() != 0 || workspace.peak_used() != exact) {
@@ -305,5 +311,12 @@ void add_linear_conv_add_cases(ninfer::test::OpSuite& suite) {
             for (auto i : selected) cases.push_back(shapes[i]);
             return run_profile(input_rows, cases);
         });
+        suite.add("linear_conv_add/nvfp4/k" + std::to_string(input_rows),
+                  [input_rows] {
+                      const std::array<std::pair<int, int>, 5> shapes{
+                          {{2, 1}, {8, 1}, {9, 1}, {13, 5}, {16, 8}}};
+                      return run_profile(input_rows, shapes, QType::NVFP4);
+                  },
+                  {{"format", "nvfp4"}, {"execution", "graph"}});
     }
 }

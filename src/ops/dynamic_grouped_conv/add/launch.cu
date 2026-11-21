@@ -6,6 +6,7 @@
 #include "ops/linear/kernels/q8/q8_launch.h"
 #include "ops/linear/common/output.cuh"
 #include "ops/linear/kernels/q8/q8_sliced_k_launch.cuh"
+#include "ops/linear/projection/nvfp4/nvfp4_dispatch.h"
 #include <cuda_bf16.h>
 #include <array>
 #include <utility>
@@ -80,15 +81,19 @@ void launch(Plan plan, const Tensor& x, const Weight& weight, const Tensor& base
     const int tokens  = x.ne[1] * x.ne[2];
     const Tensor flat = x.view({x.ne[0], tokens});
     Tensor result     = projected.view({kHidden, tokens});
-    switch (plan.projection) {
-    case Projection::TiledMma: {
-        const auto& launchers = x.ne[0] == 4096 ? k4096 : k17408;
-        launchers[plan.tile_index](flat, weight, result, stream);
-        break;
-    }
-    case Projection::MmaK128:
-        launch_q8_a16_mma_r64x32_t64_k128_a1(flat, weight, result, stream);
-        break;
+    if (weight.qtype == QType::NVFP4) {
+        nvfp4_dispatch(flat, weight, result, LinearPolicy::A16Only, nullptr, stream);
+    } else {
+        switch (plan.projection) {
+        case Projection::TiledMma: {
+            const auto& launchers = x.ne[0] == 4096 ? k4096 : k17408;
+            launchers[plan.tile_index](flat, weight, result, stream);
+            break;
+        }
+        case Projection::MmaK128:
+            launch_q8_a16_mma_r64x32_t64_k128_a1(flat, weight, result, stream);
+            break;
+        }
     }
     common::for_each_token_slice(tokens, 1, [&](int offset, int count) {
         const dim3 grid((kHidden + 255) / 256, count);

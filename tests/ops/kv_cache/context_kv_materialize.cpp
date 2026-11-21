@@ -73,7 +73,7 @@ std::vector<float> make_context(int columns, std::uint32_t seed) {
         for (int row = 0; row < kHidden; ++row) {
             const std::uint32_t coordinate = static_cast<std::uint32_t>(row) * 29U +
                                              static_cast<std::uint32_t>(column) * 47U + seed * 13U;
-            const int centered = static_cast<int>(coordinate % 257U) - 128;
+            const int centered             = static_cast<int>(coordinate % 257U) - 128;
             result[static_cast<std::size_t>(column) * kHidden + row] =
                 bf16_to_f32(f32_to_bf16(static_cast<float>(centered) * (1.0F / 192.0F)));
         }
@@ -108,16 +108,21 @@ struct Fixture {
     std::array<ops::ContextKVMaterializeLayerView, kLayers> views;
     std::optional<tool::StateRecordFixture> records;
 
-    Fixture() {
+    explicit Fixture(QType format = QType::Q8_G32_FP16) {
         std::vector<Tensor> fields;
-        const quantized_weight::PatternedWeightOptions weight_options{
-            quantized_weight::RowSplitScalePattern::Tiny};
+        quantized_weight::PatternedWeightOptions weight_options;
+        if (format == QType::NVFP4) {
+            weight_options.weight_scale_divisor = 0.125F;
+            weight_options.input_scale_divisor  = 3.5F;
+        } else {
+            weight_options.row_split_scale = quantized_weight::RowSplitScalePattern::Tiny;
+        }
         for (int layer = 0; layer < kLayers; ++layer) {
             LayerStorage& target = storage[static_cast<std::size_t>(layer)];
             target.key_host      = quantized_weight::make_patterned_weight(
-                QType::Q8_G32_FP16, kRows, kHidden, 0x310U + 2U * layer, weight_options);
+                format, kRows, kHidden, 0x310U + 2U * layer, weight_options);
             target.value_host = quantized_weight::make_patterned_weight(
-                QType::Q8_G32_FP16, kRows, kHidden, 0x311U + 2U * layer, weight_options);
+                format, kRows, kHidden, 0x311U + 2U * layer, weight_options);
             target.decoded_key.resize(std::size_t(kRows) * kHidden);
             target.decoded_value_samples.resize(4 * kHidden);
             parallel_rows(kRows, std::uint64_t(kRows) * kHidden, [&](int first, int last) {
@@ -131,11 +136,13 @@ struct Fixture {
                 for (int k = 0; k < kHidden; ++k)
                     target.decoded_value_samples[i * kHidden + k] =
                         quantized_weight::logical_weight_fp64(target.value_host, value_rows[i], k);
-            constexpr std::size_t parent_codes = 6144ULL * kHidden;
-            target.parent_host.resize(parent_codes + 6144ULL * (kHidden / 32) * 2, 0x63);
+            const int code_divisor         = format == QType::NVFP4 ? 2 : 1;
+            const std::size_t parent_codes = 6144ULL * kHidden / code_divisor;
+            target.parent_host.resize(
+                parent_codes + 6144ULL * kHidden / 16 + (format == QType::NVFP4 ? 4 : 0), 0x63);
             const auto put = [&](const quantized_weight::PackedWeight& weight, int row) {
                 std::copy_n(weight.payload.data(), weight.code_plane_bytes,
-                            target.parent_host.data() + row * kHidden);
+                            target.parent_host.data() + row * kHidden / code_divisor);
                 std::copy_n(weight.payload.data() + weight.scale_plane_offset,
                             weight.scale_plane_bytes,
                             target.parent_host.data() + parent_codes + row * (kHidden / 32) * 2);
@@ -144,9 +151,9 @@ struct Fixture {
             put(target.value_host, 5120);
             target.parent_device = to_device(target.parent_host);
             const auto row_view  = [&](const quantized_weight::PackedWeight& weight, int row) {
-                auto result = weight.device_weight(target.parent_device.span());
-                result.qdata =
-                    static_cast<const std::uint8_t*>(target.parent_device.data()) + row * kHidden;
+                auto result   = weight.device_weight(target.parent_device.span());
+                result.qdata  = static_cast<const std::uint8_t*>(target.parent_device.data()) +
+                                row * kHidden / code_divisor;
                 result.scales = static_cast<const std::uint8_t*>(target.parent_device.data()) +
                                 parent_codes + row * (kHidden / 32) * 2;
                 result.payload_bytes = target.parent_host.size();
@@ -220,12 +227,12 @@ void append_key_oracle(const LayerStorage& layer, const float* input, int head, 
     }
     const double inverse = 1.0 / std::sqrt(square_sum / kHeadDim + kEpsilon);
     for (int pair = 0; pair < kHeadDim / 2; ++pair) {
-        const double first = raw[static_cast<std::size_t>(pair)] * inverse *
-                             layer.norm_host[static_cast<std::size_t>(pair)];
+        const double first  = raw[static_cast<std::size_t>(pair)] * inverse *
+                              layer.norm_host[static_cast<std::size_t>(pair)];
         const double second = raw[static_cast<std::size_t>(pair + kHeadDim / 2)] * inverse *
                               layer.norm_host[static_cast<std::size_t>(pair + kHeadDim / 2)];
-        const double angle = static_cast<double>(position) *
-                             std::pow(kTheta, -2.0 * static_cast<double>(pair) / kHeadDim);
+        const double angle  = static_cast<double>(position) *
+                              std::pow(kTheta, -2.0 * static_cast<double>(pair) / kHeadDim);
         const double cosine = std::cos(angle);
         const double sine   = std::sin(angle);
         expected.push_back(first * cosine - second * sine);
@@ -563,6 +570,25 @@ int main(int argc, char** argv) {
         }
         return failures;
     });
+    suite.add("context_materialize/nvfp4",
+              [] {
+                  Fixture fixture(QType::NVFP4);
+                  int failures = 0;
+                  for (int width : {1, 8, 17, 96, 128, 257, 2048}) {
+                      std::vector<int> positions(width);
+                      for (int i = 0; i < width; ++i) positions[i] = 262140 + i;
+                      fixture.reset_cache();
+                      failures += run_case(fixture, "NVFP4 W=" + std::to_string(width), width, 1,
+                                           {width}, {7}, positions, 0x709U);
+                  }
+                  fixture.reset_cache();
+                  failures += run_case(
+                      fixture, "NVFP4 partial counts", 8, 2, {0, 3}, {-1, 5},
+                      {-1, -1, -1, -1, -1, -1, -1, -1, 2047, 2048, 2049, -1, -1, -1, -1, -1},
+                      0x710U, true);
+                  return failures;
+              },
+              {{"format", "nvfp4"}, {"execution", "graph"}});
     suite.add(
         "context_materialize/capacity",
         [] {
