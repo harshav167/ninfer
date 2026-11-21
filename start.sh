@@ -2,7 +2,7 @@
 # Swift 1.5 candidate: shared FP8 KV/State arena on the RTX 5090.
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-MODEL="${MODEL:-/home/wade/local-ai/models/swift15-orcarouter-ninfer/swift-1.5-qwen3.8-27b-orcarouter-dflash2-nvfp4.ninfer}"
+MODEL="${MODEL:-/mnt/home/wade/models/swift15-uncensored-2beng2-ninfer/Swift_1_5_qwen3_8_27b_uncensored_nvfp4.ninfer}"
 SERVER="$ROOT/build/rtx5090-release/apps/ninfer-serve"
 # A single request can use this context; two lanes share the physical arena.
 CONTEXT="${CONTEXT:-232640}"
