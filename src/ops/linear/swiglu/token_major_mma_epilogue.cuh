@@ -23,9 +23,18 @@ struct SwiGluTokenMajorMmaRows {
     }
 };
 
-struct SwiGluTokenMajorMmaEpilogue {
-    __device__ __forceinline__ float apply_pair(int, int, float gate, float up) const {
+struct SwiGluTokenProduct {
+    __device__ __forceinline__ float operator()(int, int, float gate, float up) const {
         return common::silu(gate) * up;
+    }
+};
+
+template <class Product = SwiGluTokenProduct>
+struct SwiGluTokenMajorEpilogue {
+    Product product{};
+
+    __device__ __forceinline__ float apply_pair(int row, int token, float gate, float up) const {
+        return product(row, token, gate, up);
     }
 
     template <class Schedule>
@@ -64,12 +73,29 @@ struct SwiGluTokenMajorMmaEpilogue {
                 const int row    = wr * (S::kWarpRows / 2) + mr * 8 + 2 * (lane & 3);
                 const auto& gate = acc[mt][mr];
                 const auto& up   = acc[mt][mr + gate_fragments];
-                *reinterpret_cast<__nv_bfloat162*>(final_tile + token * stride + row) =
-                    __floats2bfloat162_rn(common::silu(gate[0]) * up[0],
-                                          common::silu(gate[1]) * up[1]);
-                *reinterpret_cast<__nv_bfloat162*>(final_tile + (token + 8) * stride + row) =
-                    __floats2bfloat162_rn(common::silu(gate[2]) * up[2],
-                                          common::silu(gate[3]) * up[3]);
+                if constexpr (requires { product.apply_pair(0, 0, float2{}, float2{}); }) {
+                    // Partial tiles do not have rank intermediates for inactive columns.
+                    const auto store = [&](int local_token, int i) {
+                        const int t = token_begin + local_token;
+                        if (Full || t < token_end) {
+                            const auto v = product.apply_pair(row_begin + row, t,
+                                                              make_float2(gate[i], gate[i + 1]),
+                                                              make_float2(up[i], up[i + 1]));
+                            *reinterpret_cast<__nv_bfloat162*>(final_tile + local_token * stride +
+                                                               row) =
+                                __floats2bfloat162_rn(v.x, v.y);
+                        }
+                    };
+                    store(token, 0);
+                    store(token + 8, 2);
+                } else {
+                    *reinterpret_cast<__nv_bfloat162*>(final_tile + token * stride + row) =
+                        __floats2bfloat162_rn(common::silu(gate[0]) * up[0],
+                                              common::silu(gate[1]) * up[1]);
+                    *reinterpret_cast<__nv_bfloat162*>(final_tile + (token + 8) * stride + row) =
+                        __floats2bfloat162_rn(common::silu(gate[2]) * up[2],
+                                              common::silu(gate[3]) * up[3]);
+                }
             }
         }
         synchronize();
@@ -82,4 +108,7 @@ struct SwiGluTokenMajorMmaEpilogue {
         }
     }
 };
+
+using SwiGluTokenMajorMmaEpilogue = SwiGluTokenMajorEpilogue<>;
+
 } // namespace ninfer::ops::detail

@@ -51,6 +51,7 @@ private:
     const artifact::Reader& reader_;
     std::shared_ptr<const ModelDefinition> definition_;
     Architecture architecture_;
+    std::optional<LoraLoad> lora_;
 };
 
 } // namespace ninfer::models::qwen3_5

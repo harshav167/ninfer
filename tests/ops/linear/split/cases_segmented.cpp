@@ -17,6 +17,15 @@ void add_segmented_cases(Suite& suite) {
     };
 
     std::vector<Fixture> fixtures{
+        {{5120,
+          {{QType::NVFP4,
+            6144,
+            389U,
+            {.weight_scale_divisor = 0.125F, .input_scale_divisor = 3.5F}}},
+          {4096, 1024, 1024},
+          {{0, 4096, 128}, {4096, 1024, 128}, {5120, 1024, 128}},
+          a16},
+         {1, 8, 9, 16, 17, 128}},
 #if NINFER_TARGET_SPARK
         {{2560,
           {{QType::BF16, 640, 331U}},

@@ -85,7 +85,12 @@ ConstructedModel construct_model(EngineOptions& options) {
     StartupPhaseScope inspect(options.startup_observer, StartupPhase::ArtifactInspect);
     artifact::Reader reader(options.artifact_path);
     inspect.complete();
-    switch (models::resolve_architecture(reader.directory())) {
+    const auto architecture = models::resolve_architecture(reader.directory());
+    if (!options.lora_path.empty() && (architecture != models::Architecture::Qwen3_5 ||
+                                       options.purpose != EnginePurpose::Generation)) {
+        throw std::invalid_argument("LoRA requires dense Qwen3.5-family generation");
+    }
+    switch (architecture) {
     case models::Architecture::Glm5Next: {
 #if NINFER_ENABLE_DISTRIBUTED
         if (options.deployment && options.deployment->ranks.size() > 1) {

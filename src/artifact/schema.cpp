@@ -247,8 +247,9 @@ void parse_objects(Directory& out, const Json& objects) {
 }
 
 void parse_components(Directory& out, const Json& values) {
-    if (!values.is_object() || !values.contains("text")) {
-        throw ArtifactError("components must contain text");
+    if (!values.is_object() ||
+        !(values.contains("text") || (values.size() == 1 && values.contains("lora")))) {
+        throw ArtifactError("components must contain text or an adapter-only lora component");
     }
     for (const auto& [name, value] : values.items()) {
         (void)require_id(Json(name), "component id");

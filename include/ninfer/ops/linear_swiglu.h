@@ -4,6 +4,9 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/low_rank.h"
+
+#include <array>
 
 #include "core/device.h"
 
@@ -64,5 +67,12 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, f
  */
 void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, const Tensor& bias, Tensor& out,
                    float limit, CudaExecutionView execution);
+
+// Adds the FP32 gate/up updates to the respective accumulators in the epilogue,
+// before SwiGLU. FP8/NVFP4 on the registered 34816x5120 geometry. Workspace is
+// low_rank_workspace_bytes(T, distinct_A_count) plus aligned base workspace.
+void linear_swiglu(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
+                   const std::array<LowRankFactors, 2>& updates, float scale, MemoryArena& ws,
+                   CudaExecutionView execution);
 
 } // namespace ninfer::ops

@@ -30,6 +30,13 @@ void run_nvfp4_a16(Suite& suite) {
               {5120, 6144, 705U, Comparison::Sampled, true, invocations});
     add_shape(suite, ninfer::QType::NVFP4, ActivationRecipe::TokenBlocks, make_nvfp4_weight,
               {5120, 17408, 707U, Comparison::Sampled, true, invocations});
+    const std::vector<Invocation> draft{
+        {1},  {8},   {9},    {16},
+        {17}, {128}, {2048}, {8, CallForm::Policy, ops::LinearPolicy::A16Only, true}};
+    add_shape(suite, QType::NVFP4, ActivationRecipe::Hashed, make_nvfp4_weight,
+              {5120, 25600, 709U, Comparison::Sampled, true, draft});
+    add_shape(suite, QType::NVFP4, ActivationRecipe::Hashed, make_nvfp4_weight,
+              {5120, 4096, 711U, Comparison::Sampled, true, draft});
     for (auto [n, k] : {std::pair{14336, 5120}, std::pair{16384, 5120}, std::pair{34816, 5120},
                         std::pair{5120, 6144}, std::pair{5120, 17408}}) {
         add_workspace_cases(suite, QType::NVFP4, n, k);

@@ -243,6 +243,7 @@ Parameters::Parameters(const ModelShard& source, std::shared_ptr<const ModelProf
     for (std::size_t i = 0; i < w.text.layers.size(); ++i) {
         text.layers.push_back(with_context("text/layers/" + std::to_string(i),
                                            [&] { return prepare.block(w.text.layers[i]); }));
+        if (model.lora()) text.layers.back().lora = &model.lora()->layers.at(i);
     }
     if (w.mtp) {
         mtp = with_context("mtp", [&] { return prepare.mtp(*w.mtp); });

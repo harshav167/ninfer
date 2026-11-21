@@ -19,6 +19,12 @@ inline void project_add(const Tensor& input, const LinearParameters& p, Tensor& 
     ops::linear_add(input, p.weight, residual, p.policy, workspace, execution);
 }
 
+inline void project_add(const Tensor& input, const LinearParameters& p, const LoraProjection& lora,
+                        float scale, Tensor& residual, MemoryArena& workspace,
+                        CudaExecutionView execution) {
+    ops::linear_add(input, p.weight, residual, p.policy, lora, scale, workspace, execution);
+}
+
 inline void project_swiglu(const Tensor& input, const LinearParameters& p, Tensor& output,
                            MemoryArena& workspace, CudaExecutionView execution) {
     auto scope = workspace.scope();

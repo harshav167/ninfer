@@ -1,5 +1,6 @@
 target_sources(ninfer_model_execution PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/startup.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/lora.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/planning.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/measurement.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/state/decoder_state.cpp"

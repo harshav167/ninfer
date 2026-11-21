@@ -5,12 +5,14 @@
 #include "models/qwen3_5/execution/attention.h"
 #include "models/qwen3_5/execution/dense_mlp.h"
 #include "models/qwen3_5/execution/gdn.h"
+#include "models/qwen3_5/execution/linear.h"
 #include "models/qwen3_5/execution/workspace.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/indexing.h"
 #include "ninfer/ops/linear_add.h"
+#include "ninfer/ops/linear_split.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/sigmoid_mul.h"
 
@@ -155,7 +157,15 @@ void TextRun::attention(const BlockParameters& block, std::uint32_t compact_laye
     Tensor gate  = projection.gate;
     Tensor key   = projection.key;
     Tensor value = projection.value;
-    attention_projection(normalized, p, query, gate, key, value, work, cuda);
+    if (block.lora) {
+        const auto& lora = *block.lora->attention;
+        const auto scale = view_.parameters.model.lora()->scale;
+        const std::array outputs{query, key, gate, value};
+        const std::array updates{lora.query, lora.key, lora.gate, lora.value};
+        ops::linear_split(normalized, p.projection, outputs, updates, scale, work, cuda);
+    } else {
+        attention_projection(normalized, p, query, gate, key, value, work, cuda);
+    }
     query = query.view({dim, heads, tokens});
     gate  = gate.view({dim, heads, tokens});
     key   = key.view({dim, kv, tokens});
@@ -177,8 +187,12 @@ void TextRun::attention(const BlockParameters& block, std::uint32_t compact_laye
         {dim, heads, kv}, static_cast<float>(1.0 / std::sqrt(double(attn.head_dim))),
         view_.cache.batch_layer_view(compact_layer), envelope_, work, ab, cuda);
     ops::sigmoid_mul(gate, a, cuda);
-    ops::linear_add(a.view({dimension(attn.query_width()), tokens}), p.output.weight, residual_,
-                    p.output.policy, work, cuda);
+    const auto gated = a.view({dimension(attn.query_width()), tokens});
+    if (block.lora)
+        project_add(gated, p.output, block.lora->attention->output,
+                    view_.parameters.model.lora()->scale, residual_, work, cuda);
+    else
+        project_add(gated, p.output, residual_, work, cuda);
 }
 
 void TextRun::gdn(const BlockParameters& block, std::uint32_t compact_layer) {
@@ -311,7 +325,8 @@ void TextRun::post_mixer(std::uint32_t layer, const moe::GpuCall* call) {
                  view_.execution);
     if (const auto* dense = std::get_if<DenseParameters>(&block.ffn)) {
         if (call) throw std::invalid_argument("GPU MoE body supplied for a dense layer");
-        dense_mlp(h, *dense, residual_, DenseMlpUse::Text, view_.workspace, view_.execution);
+        dense_mlp(h, *dense, residual_, DenseMlpUse::Text, view_.workspace, view_.execution,
+                  block.lora, block.lora ? view_.parameters.model.lora()->scale : 1.0f);
     } else if (call) {
         (*call)(h, residual_, view_.workspace, next_projection_hints(layer));
     } else {

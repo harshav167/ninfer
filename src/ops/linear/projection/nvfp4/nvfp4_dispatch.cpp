@@ -11,8 +11,8 @@ const std::array kShapes{
 #if NINFER_TARGET_SPARK
     &kNvfp4N12288K4096, &kNvfp4N4096K6144,
 #endif
-    &kNvfp4N14336K5120, &kNvfp4N16384K5120, &kNvfp4N34816K5120,
-    &kNvfp4N5120K6144,  &kNvfp4N5120K17408,
+    &kNvfp4N14336K5120, &kNvfp4N16384K5120, &kNvfp4N34816K5120, &kNvfp4N5120K6144,
+    &kNvfp4N5120K17408, &kNvfp4N5120K25600, &kNvfp4N5120K4096,
 };
 
 const Nvfp4LinearShape& resolve_shape(std::int32_t n, std::int32_t k, LinearPolicy policy) {

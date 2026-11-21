@@ -10,6 +10,7 @@ namespace ninfer::product::config_detail {
 enum class Field {
     ModelPath,
     ChatTemplate,
+    Lora,
     Vision,
     VisionMemoryBudget,
     Device,

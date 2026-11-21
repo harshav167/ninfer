@@ -4,6 +4,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
+#include "ops/linear/common/low_rank.h"
 
 #include <cuda_runtime.h>
 
@@ -19,13 +20,15 @@ namespace ninfer::ops::detail {
                                                                      std::int32_t max_tokens);
 
 void launch_fp8_swiglu_small_t(const Tensor& x, const Weight& weight, Tensor& out,
-                               cudaStream_t stream);
+                               cudaStream_t stream, const RankDeltas* = nullptr);
 
-void launch_fp8_swiglu_matrix(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_fp8_swiglu_matrix(const Tensor&, const Weight&, Tensor&, cudaStream_t,
+                              const RankDeltas* = nullptr);
 void launch_fp8_swiglu_a8(const Tensor& x, const Weight& weight, Tensor& out,
-                          MemoryArena& workspace, cudaStream_t stream);
+                          MemoryArena& workspace, cudaStream_t stream, const RankDeltas* = nullptr);
 
 void fp8_linear_swiglu_dispatch(const Tensor& x, const Weight& weight, Tensor& out,
-                                LinearPolicy policy, MemoryArena& workspace, cudaStream_t stream);
+                                LinearPolicy policy, MemoryArena& workspace, cudaStream_t stream,
+                                const RankDeltas* = nullptr);
 
 } // namespace ninfer::ops::detail

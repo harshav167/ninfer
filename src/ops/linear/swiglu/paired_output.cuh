@@ -29,12 +29,20 @@ struct BiasedClampedSwiGluProduct {
 };
 
 template <class Product>
-__device__ __forceinline__ float swiglu_product(const Product& product, int row, float gate,
-                                                float up) {
-    if constexpr (requires { product(row, gate, up); })
+__device__ __forceinline__ float swiglu_product(const Product& product, int row, int token,
+                                                float gate, float up) {
+    if constexpr (requires { product(row, token, gate, up); })
+        return product(row, token, gate, up);
+    else if constexpr (requires { product(row, gate, up); })
         return product(row, gate, up);
     else
         return product(gate, up);
+}
+
+template <class Product>
+__device__ __forceinline__ float swiglu_product(const Product& product, int row, float gate,
+                                                float up) {
+    return swiglu_product(product, row, 0, gate, up);
 }
 
 template <int RowsPerBranch, int IntermediateRows = 0>

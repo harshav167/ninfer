@@ -5,7 +5,7 @@ namespace {
 template <class S, int T = 0, bool Exact = false>
 using Instance = Nvfp4ScheduleInstance<S, 6144, T, Exact>;
 
-LinearAddLaunch select_a16(int tokens) {
+decltype(Nvfp4LinearAddPlan::a16) select_a16(int tokens) {
     if (tokens == 1)
         return launch_nvfp4_add_gemv<Instance<Nvfp4A16GemvSchedule<
             8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>>>;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "models/qwen3_5/definition.h"
+#include "models/qwen3_5/lora.h"
 
 namespace ninfer::models::qwen3_5 {
 
@@ -25,11 +26,14 @@ public:
 
     [[nodiscard]] std::span<const ExpertBankSource> expert_banks() const { return banks_; }
 
+    [[nodiscard]] const std::optional<LoraWeights>& lora() const { return lora_; }
+
     [[nodiscard]] const artifact::MaterializationStats& storage_stats() const {
         return backing_.stats();
     }
 
 private:
+    friend class Startup;
     friend std::unique_ptr<ModelShard> materialize_model(ResolvedLoadPlan&&, DeviceContext&,
                                                          const StartupObserver*);
     ModelShard(std::shared_ptr<const ModelDefinition>, artifact::MaterializedArtifact,
@@ -39,6 +43,7 @@ private:
     artifact::MaterializedArtifact backing_;
     std::vector<BoundWeight> bound_;
     std::vector<ExpertBankSource> banks_;
+    std::optional<LoraWeights> lora_;
 };
 
 } // namespace ninfer::models::qwen3_5

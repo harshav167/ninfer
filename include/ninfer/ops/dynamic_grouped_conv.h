@@ -77,10 +77,11 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
  *       + I(i>0) * (base_kernel[h,1,1] + finish_delta[g,1,i,b]) * z[h,i-1,b].
  *
  * Contiguous BF16 x [C,W,B], base_kernel [H,2,2] with axes [channel,tap,side],
- * finish_delta [G,2,W,B], and residual [H,W,B]. The projection weight is Q8_G32_FP16
- * RowSplit [H,C] without padding. W is in [2,16], B in [1,8]; tensor and weight-plane
- * bases are 16-byte aligned. Position zero has no previous contribution; the Op never
- * reads another request or an earlier round.
+ * finish_delta [G,2,W,B], and residual [H,W,B]. The projection weight is Q8_G32_FP16 RowSplit
+ * or block-scaled NVFP4 [H,C] without padding. Projection inputs remain BF16.
+ * W is in [2,16], B in [1,8]; tensor and weight-plane bases are 16-byte aligned.
+ * Position zero has no previous contribution; the Op never reads another request or an earlier
+ * round.
  *
  * Projected z is a private intermediate, with no observable cast boundary.
  *

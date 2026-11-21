@@ -106,15 +106,31 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy
     }
     if (w.qtype == QType::FP8_E4M3FN_ROW_BF16)
         return detail::fp8_linear_add_dispatch(x, w, residual, policy, workspace,
-                                               execution.stream());
+                                               execution.stream(), nullptr);
     if (w.qtype == QType::NVFP4)
         return detail::nvfp4_linear_add_dispatch(x, w, residual, policy, workspace,
-                                                 execution.stream());
+                                                 execution.stream(), nullptr);
     select_a16(w.qtype, w.n, w.k, x.ne[1])(x, w, residual, execution.stream());
 }
 
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual, MemoryArena& workspace,
                 CudaExecutionView execution) {
     linear_add(x, w, residual, LinearPolicy::A16Only, workspace, execution);
+}
+
+void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy policy,
+                const LowRankFactors& update, float scale, MemoryArena& ws,
+                CudaExecutionView execution) {
+    validate_policy(policy);
+    validate_operands(x, w, residual, execution);
+    if (w.qtype != QType::FP8_E4M3FN_ROW_BF16 && w.qtype != QType::NVFP4)
+        throw std::invalid_argument("linear_add: low-rank epilogue requires FP8 or NVFP4");
+    auto scope       = ws.scope();
+    const int rows   = w.n;
+    const auto delta = detail::prepare_low_rank(x, {&update, 1}, {&rows, 1}, scale, ws, execution);
+    if (w.qtype == QType::FP8_E4M3FN_ROW_BF16)
+        return detail::fp8_linear_add_dispatch(x, w, residual, policy, ws, execution.stream(),
+                                               &delta[0]);
+    detail::nvfp4_linear_add_dispatch(x, w, residual, policy, ws, execution.stream(), &delta[0]);
 }
 } // namespace ninfer::ops

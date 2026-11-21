@@ -6,15 +6,15 @@
 namespace ninfer::ops::detail::context_kv {
 namespace {
 
-template <int Rows, int Columns, int BlockK, int ColumnWarps>
+template <int Rows, int Columns, int BlockK, int ColumnWarps, bool Nvfp4 = false>
 void launch_mma(const Tensor& x, const Tensor& positions, const Tensor& counts,
                 const Tensor& offsets, DeviceLayers layers,
                 ContextKVMaterializeExecutionEnvelope envelope, const Tensor& scratch,
                 cudaStream_t stream) {
     constexpr int bytes   = sizeof(MaterializeStorage<Rows, Columns, BlockK>);
-    constexpr auto kernel = context_kv_mma_kernel<Rows, Columns, BlockK, ColumnWarps>;
+    constexpr auto kernel = context_kv_mma_kernel<Rows, Columns, BlockK, ColumnWarps, Nvfp4>;
     (void)common::prepare_shared<bytes, kernel, true>();
-    context_kv_mma_kernel<Rows, Columns, BlockK, ColumnWarps>
+    context_kv_mma_kernel<Rows, Columns, BlockK, ColumnWarps, Nvfp4>
         <<<dim3(1024 / Rows, (envelope.max_count * x.ne[2] + Columns - 1) / Columns, 10),
            Rows / 16 * ColumnWarps * 32, bytes, stream>>>(
             static_cast<const __nv_bfloat16*>(x.data), static_cast<const int*>(positions.data),
@@ -55,6 +55,8 @@ DeviceLayers make_device_layers(
             common::operand::state_field_base<__nv_bfloat16>(source.cache.k),
             common::operand::state_field_base<__half>(source.cache.v),
             static_cast<std::int32_t>(source.cache.padded_capacity),
+            1.0f / source.key_weight.weight_scale_divisor,
+            1.0f / source.value_weight.weight_scale_divisor,
         };
     }
     return result;
@@ -68,7 +70,17 @@ void launch_materialize(
     cudaStream_t stream) {
     const auto device_layers = make_device_layers(layers);
     const auto& offsets      = layers.front().cache.k.records.byte_offsets;
-    Projection(context, positions, counts, offsets, device_layers, envelope, key_scratch, stream);
+    if (layers.front().key_weight.qtype == QType::NVFP4) {
+        if constexpr (KeyPost)
+            launch_mma<64, 16, 128, 2, true>(context, positions, counts, offsets, device_layers,
+                                             envelope, key_scratch, stream);
+        else
+            launch_mma<128, 64, 128, 2, true>(context, positions, counts, offsets, device_layers,
+                                              envelope, key_scratch, stream);
+    } else {
+        Projection(context, positions, counts, offsets, device_layers, envelope, key_scratch,
+                   stream);
+    }
     if constexpr (KeyPost) {
         context_kv_key_post_kernel<<<dim3(envelope.max_count * context.ne[2], kLayers), 256, 0,
                                      stream>>>(

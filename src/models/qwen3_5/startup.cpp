@@ -19,11 +19,13 @@ Startup::Startup(const artifact::Reader& definition_source, const artifact::Read
             throw std::invalid_argument(
                 "Qwen3_5 model preparation supports one rank with TP=EP=DP=PP=ADP=1");
     }
-    profile       = execution::describe_model(*definition_);
+    if (!options.lora_path.empty()) lora_.emplace(options.lora_path, *definition_, device);
+    profile       = execution::describe_model(*definition_, lora_.has_value());
     auto resident = resolve_load(reader_, definition_, device);
-    placements_.push_back({WeightPlacement::Resident,
-                           resident.materialization().device_capacity_bytes,
-                           resident.materialization().host_capacity_bytes});
+    placements_.push_back(
+        {WeightPlacement::Resident,
+         resident.materialization().device_capacity_bytes + (lora_ ? lora_->device_bytes() : 0),
+         resident.materialization().host_capacity_bytes});
     if (architecture_ == Architecture::Qwen3_5Moe) {
         offload_ = detail::describe_moe_plan(*definition_, *profile, options.moe);
         if (offload_) {
@@ -54,7 +56,7 @@ Startup::plan(DeviceContext& device, const EngineOptions& options, WeightPlaceme
     const auto required_context  = policy.mode == ContextCapacityMode::Explicit
                                        ? runtime::ContextCapacity{policy.explicit_bytes}
                                        : capacity_plan.minimum_capacity();
-    const auto required_bytes    = capacity_plan.reservation_bytes(required_context) +
+    const auto required_bytes = capacity_plan.reservation_bytes(required_context) +
                                 (shared_memory ? capacity_plan.control_bytes(required_context) : 0);
     if (required_bytes > available) return std::nullopt;
     if (!host_experts) {
@@ -88,7 +90,9 @@ std::unique_ptr<ModelShard> Startup::materialize(DeviceContext& device, WeightPl
     auto resolved =
         resolve_load(reader_, definition_, device.device(),
                      placement == WeightPlacement::HostExperts ? Device::cpu() : device.device());
-    return materialize_model(std::move(resolved), device, &observer);
+    auto model = materialize_model(std::move(resolved), device, &observer);
+    if (lora_) model->lora_.emplace(lora_->materialize(device, observer));
+    return model;
 }
 
 qwen::Frontend Startup::frontend(const EngineOptions& options) const {

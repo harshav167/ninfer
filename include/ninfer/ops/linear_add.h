@@ -4,6 +4,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/low_rank.h"
 
 #include "core/device.h"
 
@@ -41,5 +42,12 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual, MemoryArena&
 
 void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy policy,
                 MemoryArena& ws, CudaExecutionView execution);
+
+// residual += Wx + scale * B(Ax), added in the epilogue with a single output
+// rounding. FP8/NVFP4. Workspace: low_rank_workspace_bytes(T, 1) followed by
+// the aligned base Op workspace.
+void linear_add(const Tensor& x, const Weight& w, Tensor& residual, LinearPolicy policy,
+                const LowRankFactors& update, float scale, MemoryArena& ws,
+                CudaExecutionView execution);
 
 } // namespace ninfer::ops

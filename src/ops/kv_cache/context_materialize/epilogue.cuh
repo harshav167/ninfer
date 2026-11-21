@@ -27,6 +27,8 @@ struct DeviceLayerView {
     __nv_bfloat16* cache_k;
     __half* cache_v;
     std::int32_t padded_capacity;
+    float key_alpha;
+    float value_alpha;
 };
 
 struct DeviceLayers {

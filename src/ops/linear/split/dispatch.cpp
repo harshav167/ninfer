@@ -59,7 +59,8 @@ const SplitShape& select(ProjectionProfile weights, const auto& rows) {
         return match(shapes, weights, rows);
     }
     case QType::NVFP4: {
-        const std::array shapes{&kNvfp4SplitN14336K5120, &kNvfp4SplitN16384K5120};
+        const std::array shapes{&kNvfp4SplitN14336K5120, &kNvfp4SplitN16384K5120,
+                                &kNvfp4SplitN6144K5120};
         return match(shapes, weights, rows);
     }
     default:

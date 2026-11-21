@@ -48,6 +48,7 @@ struct BlockParameters {
     std::variant<AttentionParameters, GdnParameters> mixer;
     FfnParameters ffn;
     ops::MoeExecutionHints projection_prefetch;
+    const LoraBlock* lora = nullptr;
 };
 
 struct TextParameters {

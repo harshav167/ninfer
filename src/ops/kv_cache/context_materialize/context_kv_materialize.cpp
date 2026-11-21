@@ -34,6 +34,12 @@ void require_tensor(const Tensor& tensor, DType dtype, std::int32_t n0, std::int
 
 void require_weight(const Weight& weight, const char* name, Device device) {
     common::operand::device(weight.device, device, "context_kv_materialize", name);
+    if (weight.qtype == QType::NVFP4) {
+        (void)common::validate_nvfp4_weight(weight, kOp);
+        if (weight.n != kKVSize || weight.k != kHidden)
+            throw std::invalid_argument(std::string(kOp) + ": invalid " + name + " geometry");
+        return;
+    }
     constexpr std::uint64_t kCodeBytes =
         static_cast<std::uint64_t>(kKVSize) * static_cast<std::uint64_t>(kHidden);
     constexpr std::uint64_t kScaleBytes =
@@ -158,6 +164,9 @@ void context_kv_materialize(
         const ContextKVMaterializeLayerView& layer = layers[index];
         require_weight(layer.key_weight, "key weight", execution.device());
         require_weight(layer.value_weight, "value weight", execution.device());
+        if (layer.key_weight.qtype != layers.front().key_weight.qtype ||
+            layer.value_weight.qtype != layers.front().key_weight.qtype)
+            throw std::invalid_argument("context_kv_materialize: projection formats must match");
         require_tensor(layer.key_norm_weight, DType::BF16, kHeadDim, 1, 1, 1, 4, "key norm weight",
                        execution.device());
         validate_cache(layer.cache, padded, batch, execution.device());

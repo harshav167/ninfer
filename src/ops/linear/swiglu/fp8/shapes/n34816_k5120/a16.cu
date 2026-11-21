@@ -9,6 +9,9 @@
 #include "ops/linear/kernels/fp8/fp8_a16_simt.cuh"
 #include "ops/linear/swiglu/paired_output.cuh"
 
+#include "ops/linear/common/low_rank_epilogue.cuh"
+#include "ops/linear/swiglu/product_epilogue.cuh"
+
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -19,30 +22,44 @@ constexpr int kIntermediate = Geometry::kOutputRows / 2;
 } // namespace
 
 void launch_fp8_swiglu_small_t(const Tensor& x, const Weight& weight, Tensor& out,
-                               cudaStream_t stream) {
+                               cudaStream_t stream, const RankDeltas* updates) {
     using Schedule =
         Fp8A16SimtSchedule<4, 2, 16, 4, 1, Fp8SimtActivationAccess::TokenPacked,
                            Fp8CodeCache::Default, 1, Fp8SimtBlockOrder::RowsContiguous, 1>;
-    using Rows = SwiGluBranchRows<Schedule::kRowsPerWarp / 2, kIntermediate>;
-    launch_fp8_a16_simt<Fp8ScheduleInstance<Schedule, Geometry::kInputRows, 4>>(
-        fp8_a16_operands(x, weight),
-        LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), kIntermediate},
-        SwiGluPairEpilogue{}, stream, Rows{});
+    using Rows     = SwiGluBranchRows<Schedule::kRowsPerWarp / 2, kIntermediate>;
+    const auto run = [&](auto epilogue) {
+        launch_fp8_a16_simt<Fp8ScheduleInstance<Schedule, Geometry::kInputRows, 4>>(
+            fp8_a16_operands(x, weight),
+            LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), kIntermediate}, epilogue,
+            stream, Rows{});
+    };
+    if (updates)
+        return run(BasicSwiGluPairEpilogue<RankSwiGluProduct>{{(*updates)[0], (*updates)[1]}});
+    run(SwiGluPairEpilogue{});
 }
 
 void launch_fp8_swiglu_matrix(const Tensor& x, const Weight& weight, Tensor& out,
-                              cudaStream_t stream) {
+                              cudaStream_t stream, const RankDeltas* updates) {
     const auto p = fp8_a16_operands(x, weight);
     const LinearBf16Output output{static_cast<__nv_bfloat16*>(out.data), weight.n / 2};
     const auto sliced = [&]<int T, int W, int Stages>() {
-        using S = Fp8ScheduleInstance<Fp8SlicedInstance<T, W, Stages>, 5120>;
-        launch_fp8_a16_sliced_k_mma<S>(p, output, SwiGluPairEpilogue{}, stream,
-                                       SwiGluRowMajorMmaRows<S>{});
+        using S        = Fp8ScheduleInstance<Fp8SlicedInstance<T, W, Stages>, 5120>;
+        const auto run = [&](auto epilogue) {
+            launch_fp8_a16_sliced_k_mma<S>(p, output, epilogue, stream, SwiGluRowMajorMmaRows<S>{});
+        };
+        if (updates)
+            return run(BasicSwiGluPairEpilogue<RankSwiGluProduct>{{(*updates)[0], (*updates)[1]}});
+        run(SwiGluPairEpilogue{});
     };
     const auto mma = [&]<class Schedule>() {
-        using S = Fp8ScheduleInstance<Schedule, 5120>;
-        launch_fp8_a16_mma<S>(p, output, SwiGluRowMajorMmaEpilogue{}, stream,
-                              SwiGluRowMajorMmaRows<S>{});
+        using S        = Fp8ScheduleInstance<Schedule, 5120>;
+        const auto run = [&](auto epilogue) {
+            launch_fp8_a16_mma<S>(p, output, epilogue, stream, SwiGluRowMajorMmaRows<S>{});
+        };
+        if (updates)
+            return run(
+                BasicSwiGluRowMajorMmaEpilogue<RankSwiGluProduct>{{(*updates)[0], (*updates)[1]}});
+        run(SwiGluRowMajorMmaEpilogue{});
     };
     if (x.ne[1] <= 8) return sliced.template operator()<8, 4, 1>();
     if (x.ne[1] <= 16) return sliced.template operator()<16, 4, 1>();

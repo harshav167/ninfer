@@ -155,6 +155,7 @@ struct EngineOptions {
     std::optional<DeploymentOptions> deployment;
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
+    std::filesystem::path lora_path;
     std::size_t grammar_cache_bytes = 256ULL * 1024 * 1024;
     EnginePurpose purpose           = EnginePurpose::Generation;
     int device                      = 0;

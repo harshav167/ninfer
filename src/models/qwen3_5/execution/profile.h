@@ -88,6 +88,7 @@ struct ModelProfile {
     models::LoadOptions options;
     std::uint32_t public_tokens;
     std::uint32_t control_token_limit = 0;
+    bool has_lora                     = false;
     TextProfile text;
     std::optional<MtpProfile> mtp;
     std::optional<qwen::VisionProfile> vision;
@@ -95,7 +96,8 @@ struct ModelProfile {
     std::optional<ProposalProfile> proposal;
 };
 
-[[nodiscard]] std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition&);
+[[nodiscard]] std::shared_ptr<const ModelProfile> describe_model(const ModelDefinition&,
+                                                                 bool has_lora = false);
 
 } // namespace execution
 } // namespace ninfer::models::qwen3_5

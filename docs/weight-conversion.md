@@ -70,6 +70,97 @@ as `--source dflash=PATH` or `--source dflash2=PATH`. An artifact may contain se
 components; the Engine loads only the ones selected at startup, including at most one speculative
 backend. Component availability and startup selection are independent.
 
+### Dense Qwen3.8 runtime LoRA
+
+Use the adapter importer with Python 3.11, NumPy and SafeTensors:
+
+```bash
+python3 -m tools.import_qwen_lora /path/to/peft-adapter \
+  /path/to/target.ninfer /path/to/adapter.ninfer
+```
+
+The importer repacks the FP32 A/B tensors without changing their values or writing
+to the target. The resulting V3 companion is tied to the target artifact ID.
+It expects a plain rank-32 PEFT adapter with the three dense MLP projections on
+every layer and Q/K/V/O on every full-attention layer, as in `Qwen3.8-27B-pi-adapted`.
+It splits the source Q projection's interleaved query and attention-gate rows
+using the target's head geometry.
+
+Pass `--lora /path/to/adapter.ninfer` alongside the target path in `ninfer` or
+`ninfer-serve` (TOML: `model.lora`). One adapter is resident for the process lifetime.
+The target uses it in prefill, decode and speculative verification; the draft
+weights are unchanged. The adapted target projections use the registered FP8 or
+NVFP4 Qwen3.8-27B geometries. Each adapted projection first computes the
+grouped rank intermediates $z = Ax$ (slices sharing A share z); the
+expansion $Bz$ runs inside the base projection's split, SwiGLU or residual
+epilogue, before final BF16 rounding. No output-width delta is materialized
+at any token count, and the memory plan adds only the adapter weights plus
+$O(\text{tokens} \times \text{rank})$ FP32 workspace.
+
+### Isolated Qwen3.8 GDN and DFlash2 NVFP4 conversion
+
+`python -m tools.quantize_qwen3_8` writes a new artifact from an existing Qwen3.8 artifact
+and the **original BF16 checkpoint of that same fine-tune**. It does not reconstruct BF16
+weights from the existing quantization, substitute base Qwen, or change the official recipe
+defaults. Every unselected object, including Vision, tokenizer/template, target output head
+and indexed proposal head, is copied byte-for-byte. Binding ranges and shared draft context
+K/V references are retained.
+
+GDN conversion selects only query/key/value/z and output projections, using damped GPTQ
+with input Gram matrices collected from the original BF16 text model. The fused input
+parent uses one weight divisor and one measured activation range. Small GDN control weights,
+convolution, norms and full-attention projections are unchanged. Calibration reads a text
+checkpoint lazily and offloads complete decoder layers, rather than loading all BF16 weights
+on the GPU or making another on-disk offload copy.
+
+```bash
+python -m tools.quantize_qwen3_8 calibrate \
+  --source /path/to/exact-finetune-bf16 \
+  --data /path/to/calibration.jsonl \
+  --samples 256 --sequence-length 2048 --gpu 0 \
+  --out /path/to/gdn-calibration
+
+python -m tools.quantize_qwen3_8 convert \
+  --baseline /path/to/current.ninfer \
+  --source /path/to/exact-finetune-bf16 \
+  --calibration /path/to/gdn-calibration \
+  --mode gdn --device cuda:0 \
+  --out /path/to/gdn-nvfp4.ninfer
+```
+
+Calibration JSONL rows contain `text` or `messages` with optional `tools`. Chat rendering keeps
+thinking enabled. Use representative calibration data disjoint from the quality evaluation.
+The manifest records source config/index identity, data hash, input ranges and token counts.
+The 48 GDN layers require approximately 12 GiB of Host Gram matrices, in addition to the
+bounded model working set; reserve host and device resources before calibration.
+
+DFlash2 conversion selects the feature projection and seven large projections per draft layer.
+It uses the existing stored-scale MSE encoder, one divisor per fused parent, and **A16Only**
+activation permission. The public activations remain BF16; this is not a claim of a W4A4
+draft execution path. Dynamic-convolution coefficient projections, norms and candidate-selector
+weights remain unchanged. The native split, context-KV and dynamic-convolution Ops consume
+the stored NVFP4 representation directly without load-time repacking or persistent dequantization.
+
+```bash
+python -m tools.quantize_qwen3_8 convert \
+  --baseline /path/to/current.ninfer \
+  --source /path/to/exact-finetune-bf16 \
+  --draft /path/to/original-dflash2-bf16 \
+  --mode draft --device cuda:0 \
+  --out /path/to/draft-nvfp4.ninfer
+```
+
+`--mode both` requires both the draft source and GDN calibration. Use the same original baseline
+for isolated GDN-only, draft-only and combined comparisons. Conversion refuses an existing output;
+it records changed-object byte sizes and provenance in `<output>.quantization.json`.
+CPU encoding is available with `--device cpu`; it does not make full-model calibration CPU-only.
+
+These representations require numerical and model-level qualification before deployment:
+independent Op oracles, held-out target NLL/tool/stopping/vision checks, and matched draft
+acceptance and sustained throughput measurements. Smaller weights alone do not establish a
+speedup. Keep context, KV precision/capacity, concurrency, thinking and cache conditions fixed,
+and report per-workload regressions rather than only aggregate gains.
+
 ### Qwen3.8-Flash-Next
 
 For Qwen3.8-Flash-Next, select the complete NVIDIA checkpoint for Main experts and MTP:

@@ -1,7 +1,8 @@
 #pragma once
 #include "ops/linear/kernels/nvfp4/nvfp4_operands.h"
+#include "ops/linear/common/low_rank.h"
 
 namespace ninfer::ops::detail {
 void launch_nvfp4_swiglu_a4_tma(const Nvfp4A4Operands& p, __nv_bfloat16* output,
-                                cudaStream_t stream);
+                                cudaStream_t stream, const RankDeltas* = nullptr);
 } // namespace ninfer::ops::detail
