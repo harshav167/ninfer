@@ -3,7 +3,7 @@
 set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 MODEL="${MODEL:-/mnt/home/wade/models/swift15-uncensored-2beng2-ninfer/Swift_1_5_qwen3_8_27b_uncensored_nvfp4.ninfer}"
-SERVER="$ROOT/build/rtx5090-release/apps/ninfer-serve"
+SERVER="${SERVER:-$ROOT/build/rtx5090-upstream/apps/ninfer-serve}"
 # A single request can use this context; two lanes share the physical arena.
 CONTEXT="${CONTEXT:-232640}"
 # Swift's native layout: 44 blocks of 195897344 bytes. This accommodates
